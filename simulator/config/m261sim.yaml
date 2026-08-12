@@ -1,0 +1,21 @@
+# M261 simulator configuration.
+#
+# AGENT-TASK §7 lists parameters the manufacturer has not confirmed as of
+# writing: each one is declared here with an allowed set of values, a
+# default, and an explicit `unconfirmed: true` marker — never hardcoded
+# into the Go source — so that once Stage 0 on-site testing confirms the
+# real value, only this file changes, not the code.
+#
+# Only modbus.byte_order is declared so far (Task 4, the only subsystem
+# that consumes a §7 parameter today). The remaining §7 parameters
+# (scaling.source, watchdog.mode/timeout_s, modes.priority,
+# setpoints.apply, battery.cell_address_layout, commands.allow_dangerous)
+# belong to the tasks that actually implement the code that reads them
+# (5–7) — declaring them here first, unused, would just be dead config
+# with an invented default nobody's enforcing yet.
+
+modbus:
+  byte_order:
+    value: big
+    allowed: [big, little, big_word_swap, little_word_swap]
+    unconfirmed: true

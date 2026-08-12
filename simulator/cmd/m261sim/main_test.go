@@ -11,24 +11,37 @@ import (
 	gomodbus "github.com/goburrow/modbus"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/config"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/iec104"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/modbustcp"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
-func TestParseByteOrder(t *testing.T) {
-	cases := map[string]m261points.ByteOrder{
-		"big": m261points.BigEndian, "little": m261points.LittleEndian,
-		"big_word_swap": m261points.BigEndianWordSwap, "little_word_swap": m261points.LittleEndianWordSwap,
+func TestResolveByteOrderDefaultsToConfigValue(t *testing.T) {
+	// No CLI override: whatever the loaded config says wins — this is the
+	// default/no-override half of the behavior the config file exists for.
+	order, resolved, err := resolveByteOrder(config.Default(), "")
+	if err != nil || order != m261points.BigEndian {
+		t.Fatalf("resolveByteOrder(Default(), \"\") = %v, %v; want BigEndian, nil", order, err)
 	}
-	for in, want := range cases {
-		got, err := parseByteOrder(in)
-		if err != nil || got != want {
-			t.Errorf("parseByteOrder(%q) = %v, %v; want %v, nil", in, got, err, want)
-		}
+	if resolved.Modbus.ByteOrder.Value != "big" {
+		t.Errorf("resolved config value = %q, want %q", resolved.Modbus.ByteOrder.Value, "big")
 	}
-	if _, err := parseByteOrder("nonsense"); err == nil {
-		t.Error("parseByteOrder(\"nonsense\") returned nil error")
+}
+
+func TestResolveByteOrderCLIOverridesConfig(t *testing.T) {
+	order, resolved, err := resolveByteOrder(config.Default(), "little_word_swap")
+	if err != nil || order != m261points.LittleEndianWordSwap {
+		t.Fatalf("resolveByteOrder(Default(), \"little_word_swap\") = %v, %v; want LittleEndianWordSwap, nil", order, err)
+	}
+	if resolved.Modbus.ByteOrder.Value != "little_word_swap" {
+		t.Errorf("resolved config value = %q, want %q", resolved.Modbus.ByteOrder.Value, "little_word_swap")
+	}
+}
+
+func TestResolveByteOrderRejectsInvalidOverride(t *testing.T) {
+	if _, _, err := resolveByteOrder(config.Default(), "nonsense"); err == nil {
+		t.Error("resolveByteOrder with an out-of-enum override returned nil error")
 	}
 }
 
