@@ -281,6 +281,70 @@ func TestUnknownIOAGetsNegativeConfirmation(t *testing.T) {
 	}
 }
 
+// --- Code-review finding: only the 148 EMS setpoints may be written via
+// an IEC-104 command — every alarm and telemetry point, on any device
+// including EMS itself, must reject a command with a negative
+// confirmation and leave the store untouched. ---
+
+func TestWriteRejectedForEMSTelemetry(t *testing.T) {
+	st := store.New()
+	key := m261points.PointKey{Device: "EMS", Slug: "desired_active_power_kw"}
+	st.Set(key, 11) // known value, to prove a rejected write doesn't touch it
+	_, addr := startServer(t, st)
+	c := dialRaw(t, addr)
+	c.startDT()
+
+	// EMS Desired Active Power (kW) is telemetry (RO), IOA 16389 — not a
+	// command point at all, despite belonging to EMS.
+	c.sendI(rawSetpointCommand(emsCommonAddr, 16389, 999))
+	ack := c.nextI()
+	if ack[2]&cotNegativeFlag == 0 {
+		t.Fatalf("expected the P/N (negative) bit set in COT 0x%02x writing to EMS telemetry", ack[2])
+	}
+	if v, ok := st.Get(key); !ok || v != 11 {
+		t.Fatalf("store value after rejected write = %v, %v; want unchanged 11, true", v, ok)
+	}
+}
+
+func TestWriteRejectedForNonEMSDevice(t *testing.T) {
+	st := store.New()
+	key := m261points.PointKey{Device: "PCS", Slug: "phase_a_voltage_v"}
+	st.Set(key, 231) // known value
+	_, addr := startServer(t, st)
+	c := dialRaw(t, addr)
+	c.startDT()
+
+	const pcsCommonAddr = 2
+	// PCS Phase A Voltage (V), IOA 16385 — a real point, but on PCS, not EMS.
+	c.sendI(rawSetpointCommand(pcsCommonAddr, 16385, 999))
+	ack := c.nextI()
+	if ack[2]&cotNegativeFlag == 0 {
+		t.Fatalf("expected the P/N (negative) bit set in COT 0x%02x writing to a PCS point", ack[2])
+	}
+	if v, ok := st.Get(key); !ok || v != 231 {
+		t.Fatalf("store value after rejected write = %v, %v; want unchanged 231, true", v, ok)
+	}
+}
+
+func TestWriteRejectedForEMSAlarm(t *testing.T) {
+	st := store.New()
+	key := m261points.PointKey{Device: "EMS", Slug: "manual_protection"}
+	st.Set(key, 0)
+	_, addr := startServer(t, st)
+	c := dialRaw(t, addr)
+	c.startDT()
+
+	// EMS Manual Protection is an alarm (IOA 1) — real, on EMS, still not writable.
+	c.sendI(rawSingleCommand(emsCommonAddr, 1, true))
+	ack := c.nextI()
+	if ack[2]&cotNegativeFlag == 0 {
+		t.Fatalf("expected the P/N (negative) bit set in COT 0x%02x writing to an EMS alarm", ack[2])
+	}
+	if v, ok := st.Get(key); !ok || v != 0 {
+		t.Fatalf("store value after rejected write = %v, %v; want unchanged 0, true", v, ok)
+	}
+}
+
 // --- Task 4 acceptance: spontaneous transmission on change ---
 
 func TestSpontaneousTransmissionOnChange(t *testing.T) {

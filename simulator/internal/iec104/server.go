@@ -252,6 +252,32 @@ func (s *Server) handleGeneralInterrogation(c *clientConn, hdr asduHeader, objs 
 // minimal-subset list), so guessing a per-point assignment would
 // be inventing a rule the manufacturer never documented. Accepting both
 // uniformly, by IOA, sidesteps the guess entirely.
+//
+// Both funnel through writePoint, which is the ONLY path a command may
+// reach the store through: it must resolve to an EMS setpoint specifically.
+// Every alarm and telemetry point (any device, including EMS's own) is
+// monitoring-only and must never be mutated by an inbound command — a
+// client is not entitled to overwrite simulated readings just because it
+// knows (or guesses) the IOA.
+
+// writePoint applies a command write, restricted to EMS setpoints — the
+// only 148 points a real IEC-104 command may ever legitimately target.
+// Returns false (and leaves the store untouched) for anything else:
+// unknown IOA, a point on another device, or a real EMS alarm/telemetry
+// point.
+func (s *Server) writePoint(commonAddr, ioa int, value float64) bool {
+	addr := store.IECAddr{CommonAddr: commonAddr, ObjAddr: ioa}
+	key, _, ok := s.store.GetByIEC(addr)
+	if !ok {
+		return false
+	}
+	meta, ok := m261points.Points[key]
+	if !ok || meta.Device != "EMS" || meta.Class != m261points.ClassSetpoint {
+		return false
+	}
+	_, ok = s.store.SetByIEC(addr, value)
+	return ok
+}
 
 func (s *Server) handleSingleCommand(c *clientConn, hdr asduHeader, objs []infoObject) {
 	if len(objs) != 1 {
@@ -261,9 +287,8 @@ func (s *Server) handleSingleCommand(c *clientConn, hdr asduHeader, objs []infoO
 	if objs[0].Data[0]&0x01 != 0 {
 		value = 1
 	}
-	_, ok := s.store.SetByIEC(store.IECAddr{CommonAddr: hdr.CommonAddr, ObjAddr: objs[0].IOA}, value)
 	cot := byte(cotActivationCon)
-	if !ok {
+	if !s.writePoint(hdr.CommonAddr, objs[0].IOA, value) {
 		cot = cotUnknownIOA | cotNegativeFlag
 	}
 	c.writeIFrame(buildCSCNA1(hdr.CommonAddr, objs[0].IOA, value != 0, cot)) //nolint:errcheck
@@ -274,9 +299,8 @@ func (s *Server) handleSetpointCommand(c *clientConn, hdr asduHeader, objs []inf
 		return
 	}
 	value := decodeFloat32(objs[0].Data[0:4])
-	_, ok := s.store.SetByIEC(store.IECAddr{CommonAddr: hdr.CommonAddr, ObjAddr: objs[0].IOA}, float64(value))
 	cot := byte(cotActivationCon)
-	if !ok {
+	if !s.writePoint(hdr.CommonAddr, objs[0].IOA, float64(value)) {
 		cot = cotUnknownIOA | cotNegativeFlag
 	}
 	c.writeIFrame(buildCSENC1(hdr.CommonAddr, objs[0].IOA, value, cot)) //nolint:errcheck
