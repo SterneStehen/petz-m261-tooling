@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Private project materials: official register maps, generated catalog data,
+# internal specifications, and agent instructions remain local only.
+/m261-registermap/
+/catalog/point_catalog.json
+/catalog/validation_report.md
+/docs/
+
+# Credentials and local runtime configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+secrets/
+.mypy_cache/
+.pytest_cache/
+
+# Go
+/simulator/**/*.exe
+/simulator/bin/
+
+# OS
+.DS_Store
+
+# NOTE: generated code in gen/ is intentionally tracked, not ignored.
+.venv/
