@@ -109,9 +109,7 @@ func (s *Server) broadcast(commonAddr int, asdu []byte) {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
 	for c := range s.conns {
-		if c.started.Load() {
-			c.writeIFrame(asdu) //nolint:errcheck // a slow/dead peer just misses this update; TCP handles the rest
-		}
+		c.sendIfStarted(asdu) //nolint:errcheck // a slow/dead peer just misses this update; TCP handles the rest
 	}
 }
 
@@ -136,10 +134,15 @@ type clientConn struct {
 	writeMu sync.Mutex
 	sendSeq uint16
 	recvSeq uint16
-	// started is read from spontaneousLoop's goroutine and written from
-	// this connection's own handleConn goroutine — atomic, not a plain
-	// bool (a data race here was caught by -race once a physics tick
-	// produced concurrent spontaneous traffic right around STARTDT).
+	// started is read by sendIfStarted and written by startDataTransfer/
+	// stopDataTransfer — atomic. It used to be checked and written
+	// independently of writeMu, which -race caught as a plain data race;
+	// fixing that (checking under writeMu, same as now) surfaced a second,
+	// deeper bug: writing STARTDT_CON and setting started=true were two
+	// separate critical sections, so a broadcast between them could
+	// observe started still false even though the client had already
+	// physically received the confirmation on the wire — a lost update,
+	// not merely a race the detector flags. See startDataTransfer.
 	started atomic.Bool
 }
 
@@ -158,11 +161,40 @@ func (c *clientConn) setRecvSeq(seq uint16) {
 func (c *clientConn) writeIFrame(asdu []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	return c.writeIFrameLocked(asdu)
+}
+
+// writeIFrameLocked is writeIFrame's body, factored out for callers that
+// already hold writeMu (sendIfStarted, startDataTransfer's kin) and must
+// not re-lock it.
+func (c *clientConn) writeIFrameLocked(asdu []byte) error {
 	if err := writeIFrame(c.nc, c.sendSeq, c.recvSeq, asdu); err != nil {
 		return err
 	}
 	c.sendSeq++
 	return nil
+}
+
+// sendIfStarted writes asdu as a spontaneous I-frame only if the
+// connection has completed STARTDT — checked under the same writeMu that
+// startDataTransfer/stopDataTransfer hold across their own write. Checking
+// started here without that lock (the original design, and the immediate
+// -race fix that just made the load/store atomic without changing where
+// they were checked) still left a window: a client could receive
+// STARTDT_CON and, believing it is now subscribed, trigger or observe a
+// store change before this connection's started flag was actually set,
+// and broadcast would then skip it — a permanently lost update, not
+// retried or caught up on until the next unrelated change or a general
+// interrogation. Sharing the lock makes "the client can have observed
+// CON" and "started is visible as true to every future lock holder" the
+// same instant, so that window no longer exists.
+func (c *clientConn) sendIfStarted(asdu []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if !c.started.Load() {
+		return nil
+	}
+	return c.writeIFrameLocked(asdu)
 }
 
 func (c *clientConn) writeSFrame() error {
@@ -175,6 +207,31 @@ func (c *clientConn) writeUFrame(u uType) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return writeUFrame(c.nc, u)
+}
+
+// startDataTransfer sends STARTDT_CON and marks the connection started as
+// one atomic critical section (see the comment on sendIfStarted for why
+// that atomicity is required, not just convenient).
+func (c *clientConn) startDataTransfer() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := writeUFrame(c.nc, uStartDTCon); err != nil {
+		return err
+	}
+	c.started.Store(true)
+	return nil
+}
+
+// stopDataTransfer is startDataTransfer's mirror: clearing started and
+// sending STOPDT_CON as one critical section means a concurrent broadcast
+// either completes fully before this (the peer may get one last frame,
+// which is fine — it hasn't confirmed the stop yet) or fully after (sees
+// started already false), never something in between.
+func (c *clientConn) stopDataTransfer() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.started.Store(false)
+	return writeUFrame(c.nc, uStopDTCon)
 }
 
 func (s *Server) handleConn(c *clientConn) {
@@ -195,21 +252,9 @@ func (s *Server) handleConn(c *clientConn) {
 		case formatU:
 			switch f.uType {
 			case uStartDTAct:
-				// Write STARTDT_CON *before* marking started — broadcast
-				// only sends to connections with started == true, so this
-				// order guarantees a client's own start confirmation can
-				// never be preceded by an unsolicited spontaneous I-frame
-				// racing in from spontaneousLoop on another goroutine
-				// (caught intermittently under -race once NewRunner began
-				// publishing a large initial burst of Changes: STARTDT_CON
-				// and a same-numbered spontaneous I-frame both take
-				// writeMu, and whichever wins first is what the client
-				// reads first).
-				c.writeUFrame(uStartDTCon) //nolint:errcheck
-				c.started.Store(true)
+				c.startDataTransfer() //nolint:errcheck
 			case uStopDTAct:
-				c.started.Store(false)
-				c.writeUFrame(uStopDTCon) //nolint:errcheck
+				c.stopDataTransfer() //nolint:errcheck
 			case uTestFRAct:
 				c.writeUFrame(uTestFRCon) //nolint:errcheck
 			}
