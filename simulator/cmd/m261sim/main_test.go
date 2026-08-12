@@ -11,9 +11,11 @@ import (
 	gomodbus "github.com/goburrow/modbus"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/config"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/iec104"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/modbustcp"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/physics"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
@@ -117,6 +119,99 @@ func TestBothServersShareOneStore(t *testing.T) {
 			t.Fatalf("Modbus readback = %v, want 63.5", got)
 		}
 	})
+}
+
+// TestPhysicsTickIsVisibleThroughBothProtocols is the review-requested
+// proof that the physics model actually drives what the running simulator
+// reports — before this, nothing ever called physics.Engine.Step from
+// main(), so m261sim served static zero values regardless of the physics
+// package's own (correct, well-tested) behavior in isolation. This wires
+// exactly what main() wires (store, both protocol servers, a
+// physics.Runner) and asserts the change through real protocol clients,
+// not by reading the store directly.
+func TestPhysicsTickIsVisibleThroughBothProtocols(t *testing.T) {
+	st := store.New()
+
+	mb := modbustcp.New(st, modbustcp.Config{Addr: "127.0.0.1:0", ByteOrder: m261points.BigEndian})
+	if err := mb.Start(); err != nil {
+		t.Fatalf("modbustcp Start: %v", err)
+	}
+	t.Cleanup(func() { mb.Close() })
+
+	iec := iec104.New(st, iec104.Config{Addr: "127.0.0.1:0"})
+	if err := iec.Start(); err != nil {
+		t.Fatalf("iec104 Start: %v", err)
+	}
+	t.Cleanup(func() { iec.Close() })
+
+	const startingSOC = 50.0
+	engine := physics.New(physics.DefaultParams(), startingSOC)
+	clk := clock.NewFake(time.Now())
+	runner := physics.NewRunner(engine, st, clk)
+
+	// A discharge request (+50 kW, positive per §4.5) so SoC and delivered
+	// power move in an unambiguous, checkable direction.
+	st.Set(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 50)
+
+	// Baseline, before any tick: heartbeat and delivered power both read
+	// their zero-value defaults through IEC-104, exactly like the reviewer
+	// observed against the unfixed binary.
+	c := dialRawIEC(t, iec.Addr().String())
+	c.startDT()
+	c.sendGeneralInterrogation(1) // EMS
+	heartbeatBefore, ok := c.waitForFloat(16400)
+	if !ok {
+		t.Fatal("EMS Periodic Heartbeat Indicator (16400) not found in the pre-tick interrogation")
+	}
+	if heartbeatBefore != 0 {
+		t.Fatalf("heartbeat before any tick = %v, want 0 (unstarted baseline)", heartbeatBefore)
+	}
+
+	clk.Advance(time.Second)
+	runner.Tick()
+
+	// Heartbeat and delivered power, via one IEC-104 general interrogation
+	// pass (16396 "Last Charge/Discharge Power" and 16400 "Heartbeat",
+	// looked up together since interrogation sends points in ascending IOA
+	// order and 16396 < 16400 — see waitForFloats).
+	c2 := dialRawIEC(t, iec.Addr().String())
+	c2.startDT()
+	c2.sendGeneralInterrogation(1)
+	after := c2.waitForFloats(16396, 16400)
+
+	heartbeatAfter, ok := after[16400]
+	if !ok || heartbeatAfter <= heartbeatBefore {
+		t.Fatalf("heartbeat after one tick = %v, %v; want > %v (moved off the pre-tick baseline)", heartbeatAfter, ok, heartbeatBefore)
+	}
+	deliveredPower, ok := after[16396] // EMS Last Charge/Discharge Power (kW)
+	if !ok || deliveredPower <= 0 {
+		t.Fatalf("delivered power after a +50kW discharge request = %v, %v; want > 0", deliveredPower, ok)
+	}
+
+	// SoC, via a real Modbus client reading BMS (Unit ID 34) — a
+	// completely different device and protocol than the IEC-104 checks
+	// above, proving the same physics tick reached both.
+	handler := gomodbus.NewTCPClientHandler(mb.Addr().String())
+	handler.SlaveId = 34 // BMS
+	handler.Timeout = 2 * time.Second
+	if err := handler.Connect(); err != nil {
+		t.Fatalf("modbus Connect: %v", err)
+	}
+	defer handler.Close()
+	client := gomodbus.NewClient(handler)
+
+	// BMS SOC (%): modbus_addr 30003, class 4 -> wire address 30003-30001=2
+	regs, err := client.ReadInputRegisters(2, 2)
+	if err != nil {
+		t.Fatalf("ReadInputRegisters: %v", err)
+	}
+	soc := math.Float32frombits(binary.BigEndian.Uint32(regs))
+	if soc >= startingSOC {
+		t.Fatalf("SoC via Modbus after a 1s discharge = %v, want < the starting %v", soc, startingSOC)
+	}
+	if soc <= 0 {
+		t.Fatalf("SoC via Modbus after a single 1s discharge tick = %v, want a small but positive drop from %v", soc, startingSOC)
+	}
 }
 
 // --- minimal, self-contained raw IEC-104 client for this integration test ---
@@ -226,20 +321,41 @@ func (c *rawIEC) expectActivationConfirmation() {
 }
 
 // waitForFloat drains I-frames (general interrogation response) until it
-// finds an M_ME_NC_1 for the given IOA, or the interrogation ends.
+// finds an M_ME_NC_1 for the given IOA, or the interrogation ends. General
+// interrogation sends points in ascending IOA order (server.go sorts by
+// IEC104Addr), and this only scans forward — looking up a smaller IOA
+// after a larger one on the same connection will never find it, since
+// it's already gone by. Use waitForFloats to look up more than one IOA
+// from a single interrogation pass without hitting that trap.
 func (c *rawIEC) waitForFloat(ioa int) (float32, bool) {
 	c.t.Helper()
-	for {
+	got := c.waitForFloats(ioa)
+	v, ok := got[ioa]
+	return v, ok
+}
+
+// waitForFloats scans one interrogation response for every requested IOA
+// in a single forward pass (order-independent from the caller's point of
+// view), stopping once all are found or the interrogation ends.
+func (c *rawIEC) waitForFloats(ioas ...int) map[int]float32 {
+	c.t.Helper()
+	want := make(map[int]bool, len(ioas))
+	for _, ioa := range ioas {
+		want[ioa] = true
+	}
+	got := make(map[int]float32, len(ioas))
+	for len(got) < len(want) {
 		asdu := c.nextI()
 		if asdu[0] == 100 {
 			if asdu[2] == 10 { // activation termination
-				return 0, false
+				return got
 			}
 			continue
 		}
 		gotIOA := int(asdu[6]) | int(asdu[7])<<8 | int(asdu[8])<<16
-		if asdu[0] == 13 && gotIOA == ioa { // M_ME_NC_1
-			return math.Float32frombits(binary.LittleEndian.Uint32(asdu[9:13])), true
+		if asdu[0] == 13 && want[gotIOA] { // M_ME_NC_1
+			got[gotIOA] = math.Float32frombits(binary.LittleEndian.Uint32(asdu[9:13]))
 		}
 	}
+	return got
 }

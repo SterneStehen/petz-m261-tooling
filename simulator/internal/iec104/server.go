@@ -5,6 +5,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
@@ -108,7 +109,7 @@ func (s *Server) broadcast(commonAddr int, asdu []byte) {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
 	for c := range s.conns {
-		if c.started {
+		if c.started.Load() {
 			c.writeIFrame(asdu) //nolint:errcheck // a slow/dead peer just misses this update; TCP handles the rest
 		}
 	}
@@ -135,7 +136,23 @@ type clientConn struct {
 	writeMu sync.Mutex
 	sendSeq uint16
 	recvSeq uint16
-	started bool
+	// started is read from spontaneousLoop's goroutine and written from
+	// this connection's own handleConn goroutine — atomic, not a plain
+	// bool (a data race here was caught by -race once a physics tick
+	// produced concurrent spontaneous traffic right around STARTDT).
+	started atomic.Bool
+}
+
+// setRecvSeq updates the connection's receive sequence number under the
+// same lock writeIFrame/writeSFrame read it with — recvSeq is written
+// from handleConn's goroutine but read from whichever goroutine sends the
+// next frame (which, for spontaneous transmission, is spontaneousLoop's,
+// not handleConn's), so both sides need the same lock, not just the
+// send-side bookkeeping.
+func (c *clientConn) setRecvSeq(seq uint16) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.recvSeq = seq
 }
 
 func (c *clientConn) writeIFrame(asdu []byte) error {
@@ -178,10 +195,10 @@ func (s *Server) handleConn(c *clientConn) {
 		case formatU:
 			switch f.uType {
 			case uStartDTAct:
-				c.started = true
+				c.started.Store(true)
 				c.writeUFrame(uStartDTCon) //nolint:errcheck
 			case uStopDTAct:
-				c.started = false
+				c.started.Store(false)
 				c.writeUFrame(uStopDTCon) //nolint:errcheck
 			case uTestFRAct:
 				c.writeUFrame(uTestFRCon) //nolint:errcheck
@@ -189,7 +206,7 @@ func (s *Server) handleConn(c *clientConn) {
 		case formatS:
 			// pure acknowledgement — nothing to retransmit, we don't buffer unacked I-frames
 		case formatI:
-			c.recvSeq = f.sendSeq + 1
+			c.setRecvSeq(f.sendSeq + 1)
 			c.writeSFrame() //nolint:errcheck // explicit ack every time, simpler than piggybacking correctly
 			s.handleASDU(c, f.asdu)
 		}

@@ -5,11 +5,14 @@ package main
 import (
 	"flag"
 	"log"
+	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/config"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/iec104"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/modbustcp"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/physics"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
@@ -35,6 +38,8 @@ func main() {
 		"modbus-byte-order", "",
 		"override modbus.byte_order from the config file: big|little|big_word_swap|little_word_swap",
 	)
+	initialSOC := flag.Float64("initial-soc", 50, "starting battery SoC, percent (0-100)")
+	stepInterval := flag.Duration("physics-step", time.Second, "physics model tick interval (AGENT-TASK §5: 1s default, configurable)")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -63,5 +68,10 @@ func main() {
 	}
 	log.Printf("iec104 listening on %s", iec.Addr())
 
-	select {} // servers run in background goroutines; block forever
+	engine := physics.New(physics.DefaultParams(), *initialSOC)
+	runner := physics.NewRunner(engine, st, clock.Real{})
+	go runner.Run(*stepInterval, nil)
+	log.Printf("physics model running at a %s step, starting SoC %.1f%%", *stepInterval, *initialSOC)
+
+	select {} // servers and the physics runner run in background goroutines; block forever
 }
