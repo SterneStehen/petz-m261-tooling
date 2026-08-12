@@ -1,0 +1,19 @@
+# Manual corrections layer for catalog/point_catalog.json — AGENT-TASK §1.2:
+# Point descriptions are generated; this file is the sole layer for manual
+# corrections.
+#
+# Applied LAST, after parsing + join, keyed by (device, slug). Any field of
+# the point record can be
+# overridden. Unknown (device, slug) keys make build_catalog.py fail rather
+# than silently ignore a typo.
+#
+# Example:
+#
+# points:
+#   EMS:
+#     set_active_power:
+#       scale: 0.1          # once §0 on-site testing confirms the real scale
+#     trip:
+#       dangerous: true      # already set automatically, shown here only as an example
+
+points: {}
