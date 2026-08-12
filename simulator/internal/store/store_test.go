@@ -1,0 +1,184 @@
+package store
+
+import (
+	"sync"
+	"testing"
+
+	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+)
+
+func TestNewPopulatesEveryPoint(t *testing.T) {
+	s := New()
+	snap := s.Snapshot()
+	if len(snap) != len(m261points.Points) {
+		t.Fatalf("Snapshot() has %d points, want %d", len(snap), len(m261points.Points))
+	}
+	for k, v := range snap {
+		if v != 0 {
+			t.Fatalf("point %v not zero-initialized: %v", k, v)
+		}
+	}
+}
+
+func TestGetSetByKey(t *testing.T) {
+	s := New()
+	key := m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}
+	if !s.Set(key, -55.5) {
+		t.Fatal("Set on a real key returned false")
+	}
+	v, ok := s.Get(key)
+	if !ok || v != -55.5 {
+		t.Fatalf("Get() = %v, %v; want -55.5, true", v, ok)
+	}
+}
+
+func TestSetUnknownKeyFails(t *testing.T) {
+	s := New()
+	if s.Set(m261points.PointKey{Device: "NOPE", Slug: "nope"}, 1) {
+		t.Fatal("Set on an unknown key returned true")
+	}
+}
+
+func TestIECAndModbusIndicesAgreeWithCatalog(t *testing.T) {
+	s := New()
+	for key, meta := range m261points.Points {
+		gotKey, _, ok := s.GetByIEC(IECAddr{CommonAddr: meta.DeviceAddr, ObjAddr: meta.IEC104Addr})
+		if !ok || gotKey != key {
+			t.Fatalf("GetByIEC(%d,%d) = %v, %v; want %v, true", meta.DeviceAddr, meta.IEC104Addr, gotKey, ok, key)
+		}
+		if meta.ModbusAddr != nil && meta.ModbusClass != nil {
+			addr := ModbusAddr{UnitID: meta.DeviceAddr, Class: *meta.ModbusClass, Address: *meta.ModbusAddr}
+			gotKey, _, ok := s.GetByModbus(addr)
+			if !ok || gotKey != key {
+				t.Fatalf("GetByModbus(%+v) = %v, %v; want %v, true", addr, gotKey, ok, key)
+			}
+		}
+	}
+}
+
+func TestWriteViaModbusVisibleViaIEC(t *testing.T) {
+	// Task 4 acceptance: "a setpoint write via Modbus is visible reading via
+	// IEC-104 and vice versa." A setpoint's WO address isn't itself polled
+	// in real IEC-104 — the readback point is what a client actually reads.
+	s := New()
+	meta, ok := m261points.Points[m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}]
+	if !ok {
+		t.Fatal("fixture point missing from catalog")
+	}
+	if meta.ModbusAddr == nil || meta.ModbusClass == nil || meta.ReadbackIEC104Addr == nil {
+		t.Fatal("fixture point unexpectedly missing modbus/readback addressing")
+	}
+
+	mbAddr := ModbusAddr{UnitID: meta.DeviceAddr, Class: *meta.ModbusClass, Address: *meta.ModbusAddr}
+	if _, ok := s.SetByModbus(mbAddr, -42); !ok {
+		t.Fatal("SetByModbus failed")
+	}
+
+	rbAddr := IECAddr{CommonAddr: meta.DeviceAddr, ObjAddr: *meta.ReadbackIEC104Addr}
+	_, v, ok := s.GetByIEC(rbAddr)
+	if !ok || v != -42 {
+		t.Fatalf("readback via IEC-104 = %v, %v; want -42, true", v, ok)
+	}
+
+	// And the reverse direction: write via IEC-104 (its own WO address),
+	// read back via Modbus.
+	iecAddr := IECAddr{CommonAddr: meta.DeviceAddr, ObjAddr: meta.IEC104Addr}
+	if _, ok := s.SetByIEC(iecAddr, 17); !ok {
+		t.Fatal("SetByIEC failed")
+	}
+	_, v, ok = s.GetByModbus(mbAddr)
+	if !ok || v != 17 {
+		t.Fatalf("readback via Modbus = %v, %v; want 17, true", v, ok)
+	}
+}
+
+func TestSubscribeReceivesChanges(t *testing.T) {
+	s := New()
+	ch, unsubscribe := s.Subscribe()
+	defer unsubscribe()
+
+	key := m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}
+	s.Set(key, 99)
+
+	select {
+	case c := <-ch:
+		if c.Key != key || c.Value != 99 {
+			t.Fatalf("got Change %+v, want {%v 99}", c, key)
+		}
+	default:
+		t.Fatal("expected a Change on the subscription channel, got none")
+	}
+}
+
+func TestUnsubscribeStopsDelivery(t *testing.T) {
+	s := New()
+	ch, unsubscribe := s.Subscribe()
+	unsubscribe()
+
+	key := m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}
+	s.Set(key, 1) // must not panic or block despite the channel being closed/removed
+
+	if _, ok := <-ch; ok {
+		t.Fatal("expected the channel to be closed after unsubscribe")
+	}
+}
+
+func TestSlowSubscriberIsDroppedNotBlocked(t *testing.T) {
+	s := New()
+	ch, unsubscribe := s.Subscribe()
+	defer unsubscribe()
+
+	key := m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}
+	// Fill the subscriber's buffer without ever reading it.
+	for i := 0; i < subscriberBufferSize+10; i++ {
+		s.Set(key, float64(i)) // must never block, even though nothing drains ch
+	}
+	if len(ch) != subscriberBufferSize {
+		t.Fatalf("channel buffered len = %d, want %d (full but not blocked)", len(ch), subscriberBufferSize)
+	}
+}
+
+func TestConcurrentReadWriteIsRaceFree(t *testing.T) {
+	s := New()
+	key := m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			s.Set(key, float64(i))
+		}(i)
+		go func() {
+			defer wg.Done()
+			s.Get(key)
+			s.Snapshot()
+		}()
+	}
+	wg.Wait()
+}
+
+func TestSnapshotDeviceScopesToOneDevice(t *testing.T) {
+	s := New()
+	snap := s.SnapshotDevice(1) // EMS
+	if len(snap) == 0 {
+		t.Fatal("SnapshotDevice(1) is empty")
+	}
+	for k := range snap {
+		if k.Device != "EMS" {
+			t.Fatalf("SnapshotDevice(1) included non-EMS point %v", k)
+		}
+	}
+	if len(snap) != countDevice("EMS") {
+		t.Fatalf("SnapshotDevice(1) has %d points, want %d", len(snap), countDevice("EMS"))
+	}
+}
+
+func countDevice(device string) int {
+	n := 0
+	for k := range m261points.Points {
+		if k.Device == device {
+			n++
+		}
+	}
+	return n
+}

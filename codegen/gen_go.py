@@ -174,6 +174,25 @@ func EncodeF32(v float32, order ByteOrder) []byte {{
 	return reorder([]byte{{byte(bits >> 24), byte(bits >> 16), byte(bits >> 8), byte(bits)}}, order)
 }}
 
+// DecodeI32/EncodeI32: not a catalog DataType (no point's own data_type is
+// ever "I32" — only U8/I16/F32 appear, see catalog/point_catalog.json).
+// This is a wire-level primitive for Modbus specifically: per §2.2, Modbus
+// packs every non-alarm point into a fixed 2-register (4-byte) slot, which
+// widens an IEC-104-native I16 point up to I32 on the wire (confirmed
+// empirically against the real register map, Task 2 validation). Kept
+// here alongside the other native-width codecs rather than in
+// simulator/internal/modbustcp so every protocol implementation shares
+// one reorder()-backed definition of what each byte order means.
+func DecodeI32(b []byte, order ByteOrder) int32 {{
+	r := reorder(b, order)
+	return int32(uint32(r[0])<<24 | uint32(r[1])<<16 | uint32(r[2])<<8 | uint32(r[3]))
+}}
+
+func EncodeI32(v int32, order ByteOrder) []byte {{
+	u := uint32(v)
+	return reorder([]byte{{byte(u >> 24), byte(u >> 16), byte(u >> 8), byte(u)}}, order)
+}}
+
 // --- scale-aware generic codec ------------------------------------------
 //
 // scale is applied as: logical = raw * scale (decode) / raw = logical /
@@ -254,6 +273,17 @@ func TestRoundTripF32(t *testing.T) {{
 			got := DecodeF32(EncodeF32(v, order), order)
 			if got != v {{
 				t.Errorf("order=%v: EncodeF32/DecodeF32(%v) = %v, want %v", order, v, got, v)
+			}}
+		}}
+	}}
+}}
+
+func TestRoundTripI32(t *testing.T) {{
+	for _, order := range allByteOrders {{
+		for _, v := range []int32{{0, 1, -1, 2147483647, -2147483648, 40001, -40001}} {{
+			got := DecodeI32(EncodeI32(v, order), order)
+			if got != v {{
+				t.Errorf("order=%v: EncodeI32/DecodeI32(%d) = %d, want %d", order, v, got, v)
 			}}
 		}}
 	}}

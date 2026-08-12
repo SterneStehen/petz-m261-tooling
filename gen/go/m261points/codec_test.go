@@ -42,6 +42,17 @@ func TestRoundTripF32(t *testing.T) {
 	}
 }
 
+func TestRoundTripI32(t *testing.T) {
+	for _, order := range allByteOrders {
+		for _, v := range []int32{0, 1, -1, 2147483647, -2147483648, 40001, -40001} {
+			got := DecodeI32(EncodeI32(v, order), order)
+			if got != v {
+				t.Errorf("order=%v: EncodeI32/DecodeI32(%d) = %d, want %d", order, v, got, v)
+			}
+		}
+	}
+}
+
 func TestRoundTripValueWithScale(t *testing.T) {
 	cases := []struct {
 		dt    DataType
