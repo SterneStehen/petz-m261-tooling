@@ -195,8 +195,18 @@ func (s *Server) handleConn(c *clientConn) {
 		case formatU:
 			switch f.uType {
 			case uStartDTAct:
-				c.started.Store(true)
+				// Write STARTDT_CON *before* marking started — broadcast
+				// only sends to connections with started == true, so this
+				// order guarantees a client's own start confirmation can
+				// never be preceded by an unsolicited spontaneous I-frame
+				// racing in from spontaneousLoop on another goroutine
+				// (caught intermittently under -race once NewRunner began
+				// publishing a large initial burst of Changes: STARTDT_CON
+				// and a same-numbered spontaneous I-frame both take
+				// writeMu, and whichever wins first is what the client
+				// reads first).
 				c.writeUFrame(uStartDTCon) //nolint:errcheck
+				c.started.Store(true)
 			case uStopDTAct:
 				c.started.Store(false)
 				c.writeUFrame(uStopDTCon) //nolint:errcheck

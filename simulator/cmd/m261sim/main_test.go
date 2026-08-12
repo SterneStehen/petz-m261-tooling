@@ -214,6 +214,204 @@ func TestPhysicsTickIsVisibleThroughBothProtocols(t *testing.T) {
 	}
 }
 
+// TestMeterDirectionInvertedIsAppliedEachTick is the code-review-requested
+// protocol-level proof that "Energy Storage Meter Power Direction" (§4.4)
+// is actually read and applied — previously the runner never read that
+// setpoint at all, so inverting it through a real Modbus write had no
+// effect on which accumulator discharge energy went into.
+func TestMeterDirectionInvertedIsAppliedEachTick(t *testing.T) {
+	st := store.New()
+
+	mb := modbustcp.New(st, modbustcp.Config{Addr: "127.0.0.1:0", ByteOrder: m261points.BigEndian})
+	if err := mb.Start(); err != nil {
+		t.Fatalf("modbustcp Start: %v", err)
+	}
+	t.Cleanup(func() { mb.Close() })
+
+	engine := physics.New(physics.DefaultParams(), 50)
+	clk := clock.NewFake(time.Now())
+	runner := physics.NewRunner(engine, st, clk)
+
+	handler := gomodbus.NewTCPClientHandler(mb.Addr().String())
+	handler.SlaveId = 1 // EMS
+	handler.Timeout = 2 * time.Second
+	if err := handler.Connect(); err != nil {
+		t.Fatalf("modbus Connect: %v", err)
+	}
+	defer handler.Close()
+	client := gomodbus.NewClient(handler)
+
+	// Energy Storage Meter Power Direction = 1 (inverted): modbus_addr
+	// 40079 -> wire address 40079-40001=78.
+	dirBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(dirBuf, 1)
+	if _, err := client.WriteMultipleRegisters(78, 2, dirBuf); err != nil {
+		t.Fatalf("write energy_storage_meter_power_direction: %v", err)
+	}
+
+	// Set Active Power = +10 kW (discharge): wire address 40153-40001=152.
+	powerBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(powerBuf, math.Float32bits(10))
+	if _, err := client.WriteMultipleRegisters(152, 2, powerBuf); err != nil {
+		t.Fatalf("write set_active_power_kw: %v", err)
+	}
+
+	clk.Advance(time.Second)
+	runner.Tick()
+
+	readF32 := func(wireAddr uint16) float32 {
+		t.Helper()
+		regs, err := client.ReadInputRegisters(wireAddr, 2)
+		if err != nil {
+			t.Fatalf("ReadInputRegisters(%d): %v", wireAddr, err)
+		}
+		return math.Float32frombits(binary.BigEndian.Uint32(regs))
+	}
+	// Total Forward/Reverse Energy: modbus 30043/30045 -> wire 42/44.
+	forward := readF32(42)
+	reverse := readF32(44)
+
+	if reverse <= 0 {
+		t.Errorf("reverse energy = %v after a discharge with direction inverted, want > 0", reverse)
+	}
+	if forward != 0 {
+		t.Errorf("forward energy = %v after a discharge with direction inverted, want 0 (all of it should land in reverse instead)", forward)
+	}
+}
+
+// TestPCSMeterDeviceIsPopulatedThroughModbus is the code-review-requested
+// proof that the dedicated "Energy Storage Meter" device (PCS_METER, Unit
+// ID 163, §4.1) is no longer left entirely static while EMS/PCS report
+// real values — read through Unit ID 163 specifically, as asked.
+func TestPCSMeterDeviceIsPopulatedThroughModbus(t *testing.T) {
+	st := store.New()
+
+	mb := modbustcp.New(st, modbustcp.Config{Addr: "127.0.0.1:0", ByteOrder: m261points.BigEndian})
+	if err := mb.Start(); err != nil {
+		t.Fatalf("modbustcp Start: %v", err)
+	}
+	t.Cleanup(func() { mb.Close() })
+
+	engine := physics.New(physics.DefaultParams(), 50)
+	clk := clock.NewFake(time.Now())
+	runner := physics.NewRunner(engine, st, clk)
+	st.Set(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 20) // discharge
+	clk.Advance(time.Second)
+	runner.Tick()
+
+	handler := gomodbus.NewTCPClientHandler(mb.Addr().String())
+	handler.SlaveId = 163 // PCS_METER ("Energy Storage Meter"), §4.1
+	handler.Timeout = 2 * time.Second
+	if err := handler.Connect(); err != nil {
+		t.Fatalf("modbus Connect: %v", err)
+	}
+	defer handler.Close()
+	client := gomodbus.NewClient(handler)
+
+	readF32 := func(wireAddr uint16) float32 {
+		t.Helper()
+		regs, err := client.ReadInputRegisters(wireAddr, 2)
+		if err != nil {
+			t.Fatalf("ReadInputRegisters(%d): %v", wireAddr, err)
+		}
+		return math.Float32frombits(binary.BigEndian.Uint32(regs))
+	}
+	// online_status's catalog data_type is I16, widened to I32 on the wire
+	// (§2.2) — unlike the F32 points above, reading it as a float would
+	// reinterpret the integer 1's raw bits as ~1e-45.
+	readI32 := func(wireAddr uint16) int32 {
+		t.Helper()
+		regs, err := client.ReadInputRegisters(wireAddr, 2)
+		if err != nil {
+			t.Fatalf("ReadInputRegisters(%d): %v", wireAddr, err)
+		}
+		return int32(binary.BigEndian.Uint32(regs))
+	}
+
+	if v := readF32(0); v <= 0 { // phase_a_voltage_v: modbus 30001 -> wire 0
+		t.Errorf("PCS_METER phase_a_voltage_v = %v, want > 0", v)
+	}
+	if p := readF32(12); p <= 0 { // total_active_power_kw: modbus 30013 -> wire 12
+		t.Errorf("PCS_METER total_active_power_kw = %v after a discharge, want > 0", p)
+	}
+	if e := readF32(44); e <= 0 { // forward_active_total_energy_kwh: modbus 30045 -> wire 44
+		t.Errorf("PCS_METER forward_active_total_energy_kwh = %v, want > 0", e)
+	}
+	if o := readI32(60); o != 1 { // online_status: modbus 30061 -> wire 60
+		t.Errorf("PCS_METER online_status = %v, want 1", o)
+	}
+}
+
+// TestInitialStateIsPublishedBeforeFirstTick is the code-review-requested
+// proof that a client connecting before the first Tick fires sees the
+// engine's configured initial state, not the store's zero defaults — the
+// window between server startup and the first tick isn't always
+// negligible (physics-step is configurable), and clients reading zero
+// SoC/voltage/offline status in that window would be reading a physically
+// impossible state.
+func TestInitialStateIsPublishedBeforeFirstTick(t *testing.T) {
+	st := store.New()
+
+	mb := modbustcp.New(st, modbustcp.Config{Addr: "127.0.0.1:0", ByteOrder: m261points.BigEndian})
+	if err := mb.Start(); err != nil {
+		t.Fatalf("modbustcp Start: %v", err)
+	}
+	t.Cleanup(func() { mb.Close() })
+
+	const configuredSOC = 73.0
+	engine := physics.New(physics.DefaultParams(), configuredSOC)
+	// NewRunner only — deliberately never call Tick, matching a client
+	// that connects in the gap before the first real tick.
+	physics.NewRunner(engine, st, clock.NewFake(time.Now()))
+
+	handlerBMS := gomodbus.NewTCPClientHandler(mb.Addr().String())
+	handlerBMS.SlaveId = 34 // BMS
+	handlerBMS.Timeout = 2 * time.Second
+	if err := handlerBMS.Connect(); err != nil {
+		t.Fatalf("modbus Connect (BMS): %v", err)
+	}
+	defer handlerBMS.Close()
+	bms := gomodbus.NewClient(handlerBMS)
+
+	readF32 := func(client gomodbus.Client, wireAddr uint16) float32 {
+		t.Helper()
+		regs, err := client.ReadInputRegisters(wireAddr, 2)
+		if err != nil {
+			t.Fatalf("ReadInputRegisters(%d): %v", wireAddr, err)
+		}
+		return math.Float32frombits(binary.BigEndian.Uint32(regs))
+	}
+
+	// BMS SOC (%): modbus 30003 -> wire 2.
+	if soc := readF32(bms, 2); soc != configuredSOC {
+		t.Errorf("SoC before any Tick = %v, want the configured initial %v, not a zero default", soc, configuredSOC)
+	}
+	// BMS Battery Total Voltage (V): modbus 30007 -> wire 6 — must already
+	// be on the LFP curve for configuredSOC, never 0.
+	if v := readF32(bms, 6); v < 676 || v > 936 {
+		t.Errorf("battery_total_voltage_v before any Tick = %v, want within [676, 936] (the curve's value at %v%% SoC), not 0", v, configuredSOC)
+	}
+
+	handlerEMS := gomodbus.NewTCPClientHandler(mb.Addr().String())
+	handlerEMS.SlaveId = 1 // EMS
+	handlerEMS.Timeout = 2 * time.Second
+	if err := handlerEMS.Connect(); err != nil {
+		t.Fatalf("modbus Connect (EMS): %v", err)
+	}
+	defer handlerEMS.Close()
+	ems := gomodbus.NewClient(handlerEMS)
+
+	// EMS Online Status: modbus 30051 -> wire 50. data_type I16, widened to
+	// I32 on the wire (§2.2) — not F32 like soc/voltage above.
+	regs, err := ems.ReadInputRegisters(50, 2)
+	if err != nil {
+		t.Fatalf("ReadInputRegisters(50): %v", err)
+	}
+	if online := int32(binary.BigEndian.Uint32(regs)); online != 1 {
+		t.Errorf("online_status before any Tick = %v, want 1, not offline", online)
+	}
+}
+
 // --- minimal, self-contained raw IEC-104 client for this integration test ---
 
 type rawIEC struct {
@@ -337,8 +535,20 @@ func (c *rawIEC) waitForFloat(ioa int) (float32, bool) {
 // waitForFloats scans one interrogation response for every requested IOA
 // in a single forward pass (order-independent from the caller's point of
 // view), stopping once all are found or the interrogation ends.
+//
+// It only accepts frames with COT 20 (interrogated-by-station). The server
+// broadcasts spontaneous updates (COT 3) on this same connection whenever
+// the store changes elsewhere, and those can legitimately interleave with
+// a general-interrogation response in flight — a real client parsing "the
+// answer to my interrogation" has to make the same distinction, or it can
+// pick up a stale value a spontaneous frame delivered before the
+// interrogated one for the same IOA arrived (observed intermittently once
+// physics.NewRunner started publishing a large initial burst of Changes:
+// a leftover queued spontaneous frame for an IOA could be read as if it
+// were that IOA's interrogation answer).
 func (c *rawIEC) waitForFloats(ioas ...int) map[int]float32 {
 	c.t.Helper()
+	const cotInterrogatedByStation = 20
 	want := make(map[int]bool, len(ioas))
 	for _, ioa := range ioas {
 		want[ioa] = true
@@ -351,6 +561,9 @@ func (c *rawIEC) waitForFloats(ioas ...int) map[int]float32 {
 				return got
 			}
 			continue
+		}
+		if asdu[2] != cotInterrogatedByStation {
+			continue // e.g. a spontaneous update (COT 3) interleaved with the GI response
 		}
 		gotIOA := int(asdu[6]) | int(asdu[7])<<8 | int(asdu[8])<<16
 		if asdu[0] == 13 && want[gotIOA] { // M_ME_NC_1

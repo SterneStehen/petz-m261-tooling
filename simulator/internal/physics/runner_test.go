@@ -92,6 +92,32 @@ func TestTickWritesPCSElectricals(t *testing.T) {
 	}
 }
 
+// TestTickWritesPCSMeterDevice is the code-review-requested fix: the
+// dedicated "Energy Storage Meter" device (PCS_METER, Unit ID 163, §4.1)
+// was left entirely static while EMS/PCS reported real values. Unit-level
+// complement to cmd/m261sim.TestPCSMeterDeviceIsPopulatedThroughModbus.
+func TestTickWritesPCSMeterDevice(t *testing.T) {
+	st := store.New()
+	st.Set(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 20) // discharge
+	clk := clock.NewFake(time.Now())
+	r := NewRunner(New(DefaultParams(), 50), st, clk)
+	clk.Advance(time.Second)
+	r.Tick()
+
+	if v := get(t, st, "PCS_METER", "phase_a_voltage_v"); v <= 0 {
+		t.Errorf("PCS_METER phase_a_voltage_v = %v, want > 0", v)
+	}
+	if p := get(t, st, "PCS_METER", "total_active_power_kw"); p <= 0 {
+		t.Errorf("PCS_METER total_active_power_kw = %v after a discharge, want > 0", p)
+	}
+	if e := get(t, st, "PCS_METER", "forward_active_total_energy_kwh"); e <= 0 {
+		t.Errorf("PCS_METER forward_active_total_energy_kwh = %v, want > 0", e)
+	}
+	if o := get(t, st, "PCS_METER", "online_status"); o != 1 {
+		t.Errorf("PCS_METER online_status = %v, want 1", o)
+	}
+}
+
 func TestTickAccumulatesEnergyMeter(t *testing.T) {
 	st := store.New()
 	st.Set(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 10) // discharge
@@ -103,6 +129,41 @@ func TestTickAccumulatesEnergyMeter(t *testing.T) {
 	}
 	if e := get(t, st, "EMS", "total_forward_energy_kwh"); e <= 0 {
 		t.Errorf("total_forward_energy_kwh = %v after discharging for 5s, want > 0", e)
+	}
+}
+
+// TestTickReadsMeterDirectionFromStoreEveryTick is the code-review-
+// requested fix: Tick previously never read "Energy Storage Meter Power
+// Direction" at all, so the setpoint had no effect. Unit-level complement
+// to cmd/m261sim.TestMeterDirectionInvertedIsAppliedEachTick, which proves
+// the same thing through a real Modbus client.
+func TestTickReadsMeterDirectionFromStoreEveryTick(t *testing.T) {
+	st := store.New()
+	st.Set(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 10) // discharge
+	st.Set(m261points.PointKey{Device: "EMS", Slug: "energy_storage_meter_power_direction"}, 1)
+	clk := clock.NewFake(time.Now())
+	r := NewRunner(New(DefaultParams(), 50), st, clk)
+	clk.Advance(time.Second)
+	r.Tick()
+
+	if e := get(t, st, "EMS", "total_reverse_energy_kwh"); e <= 0 {
+		t.Errorf("total_reverse_energy_kwh = %v after a discharge with direction inverted, want > 0", e)
+	}
+	if e := get(t, st, "EMS", "total_forward_energy_kwh"); e != 0 {
+		t.Errorf("total_forward_energy_kwh = %v after a discharge with direction inverted, want 0", e)
+	}
+
+	// Flip it back mid-run and confirm the NEXT tick honors the change —
+	// direction is read fresh every Tick, not cached from construction.
+	st.Set(m261points.PointKey{Device: "EMS", Slug: "energy_storage_meter_power_direction"}, 0)
+	reverseBefore := get(t, st, "EMS", "total_reverse_energy_kwh")
+	clk.Advance(time.Second)
+	r.Tick()
+	if e := get(t, st, "EMS", "total_forward_energy_kwh"); e <= 0 {
+		t.Errorf("total_forward_energy_kwh = %v after direction reverted to normal, want > 0", e)
+	}
+	if e := get(t, st, "EMS", "total_reverse_energy_kwh"); e != reverseBefore {
+		t.Errorf("total_reverse_energy_kwh changed to %v after direction reverted, want it to stay at %v", e, reverseBefore)
 	}
 }
 
@@ -126,5 +187,46 @@ func TestRunCallsTickOnRealCadenceUntilStopped(t *testing.T) {
 
 	if hb := get(t, st, "EMS", "ems_periodic_heartbeat_indicator"); hb < 2 {
 		t.Errorf("heartbeat = %v after ~55ms at a 10ms cadence, want at least 2 ticks to have fired", hb)
+	}
+}
+
+// TestRunDoesNotPanicOnNonPositiveInterval is the code-review-requested
+// fix for time.NewTicker's panic on a zero/negative duration — main.go
+// validates -physics-step before calling Run, but Run itself must not be
+// fragile to a caller that doesn't.
+func TestRunDoesNotPanicOnNonPositiveInterval(t *testing.T) {
+	for _, interval := range []time.Duration{0, -time.Second} {
+		r := NewRunner(New(DefaultParams(), 50), store.New(), clock.Real{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			r.Run(interval, nil) // must return immediately, not panic or hang
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Errorf("Run(%v, nil) did not return", interval)
+		}
+	}
+}
+
+// TestNewRunnerPublishesInitialStateImmediately is the code-review-
+// requested fix: before this, the store held zero values until the first
+// Tick, so a client connecting in that window saw an impossible state
+// (zero SoC, zero voltage, offline). See also
+// cmd/m261sim.TestInitialStateIsPublishedBeforeFirstTick for the same
+// assertion through a real protocol client.
+func TestNewRunnerPublishesInitialStateImmediately(t *testing.T) {
+	st := store.New()
+	NewRunner(New(DefaultParams(), 73), st, clock.NewFake(time.Now())) // no Tick call
+
+	if soc := get(t, st, "BMS", "soc"); soc != 73 {
+		t.Errorf("BMS soc immediately after NewRunner = %v, want the configured initial 73", soc)
+	}
+	if v := get(t, st, "BMS", "battery_total_voltage_v"); v < 676 || v > 936 {
+		t.Errorf("battery_total_voltage_v immediately after NewRunner = %v, want within [676, 936], not 0", v)
+	}
+	if online := get(t, st, "EMS", "online_status"); online != 1 {
+		t.Errorf("online_status immediately after NewRunner = %v, want 1", online)
 	}
 }

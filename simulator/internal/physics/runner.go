@@ -2,6 +2,7 @@ package physics
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
@@ -30,10 +31,16 @@ type Runner struct {
 	last   time.Time
 }
 
-// NewRunner builds a Runner. clk.Now() at construction time is the
-// baseline for the first Tick's dt.
+// NewRunner builds a Runner and immediately publishes the engine's
+// current (constructed) state to the store — a client connecting before
+// the first Tick fires (the default step is 1s, but is configurable, so
+// this window is not always negligible) must see the configured initial
+// SoC/voltage/online status, not zero values nothing has written yet.
+// clk.Now() at construction time is the baseline for the first Tick's dt.
 func NewRunner(engine *Engine, st *store.Store, clk clock.Clock) *Runner {
-	return &Runner{engine: engine, store: st, clock: clk, last: clk.Now()}
+	r := &Runner{engine: engine, store: st, clock: clk, last: clk.Now()}
+	r.writeState()
+	return r
 }
 
 // Tick advances the model by the time elapsed (per the injected clock,
@@ -54,6 +61,12 @@ func (r *Runner) Tick() {
 func (r *Runner) step(dt time.Duration) {
 	requestedPower, _ := r.store.Get(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"})
 	requestedReactive, _ := r.store.Get(m261points.PointKey{Device: "EMS", Slug: "set_reactive_power_kvar"})
+	// Energy Storage Meter Power Direction (§4.4/Task 5 item 7): read every
+	// step, not just once at startup, since it's a live setpoint a client
+	// can change at any time.
+	direction, _ := r.store.Get(m261points.PointKey{Device: "EMS", Slug: "energy_storage_meter_power_direction"})
+	r.engine.SetMeterDirectionInverted(direction != 0)
+
 	r.engine.Step(dt, requestedPower, requestedReactive)
 	r.writeState()
 }
@@ -64,7 +77,15 @@ func (r *Runner) step(dt time.Duration) {
 // clock — it's the outermost driving loop, not business logic, matching
 // how simulator/internal/clock.Real is meant to be used. Tests call Tick
 // directly against a fake clock instead of calling Run.
+//
+// A non-positive stepInterval is a no-op rather than the panic
+// time.NewTicker would raise — main.go validates this upfront and fails
+// fast with a clear message before starting anything, but Run doesn't
+// assume every caller does that.
 func (r *Runner) Run(stepInterval time.Duration, stop <-chan struct{}) {
+	if stepInterval <= 0 {
+		return
+	}
 	ticker := time.NewTicker(stepInterval)
 	defer ticker.Stop()
 	for {
@@ -140,4 +161,44 @@ func (r *Runner) writeState() {
 	r.set("PCS", "total_power_factor", s.PowerFactor)
 	r.set("PCS", "total_active_power_kw", s.ActualPowerKW)
 	r.set("PCS", "total_reactive_power_kvar", s.ReactivePowerKvar)
+
+	// PCS_METER ("Energy Storage Meter", device_addr/Unit ID 163) — a
+	// separate physical meter from PCS's own internal monitoring, but
+	// wired to read the same AC connection point, so it gets the same
+	// electricals rather than being left static (code review: an entire
+	// device reporting all-zero while EMS/PCS show real values is
+	// contradictory, not merely incomplete). Per-phase figures assume the
+	// same balanced-3-phase split used for PCS above.
+	apparentKVA := math.Hypot(s.ActualPowerKW, s.ReactivePowerKvar)
+	r.set("PCS_METER", "phase_a_voltage_v", s.PhaseVoltagesV[0])
+	r.set("PCS_METER", "phase_b_voltage_v", s.PhaseVoltagesV[1])
+	r.set("PCS_METER", "phase_c_voltage_v", s.PhaseVoltagesV[2])
+	r.set("PCS_METER", "phase_a_current_a", s.PhaseCurrentsA[0])
+	r.set("PCS_METER", "phase_b_current_a", s.PhaseCurrentsA[1])
+	r.set("PCS_METER", "phase_c_current_a", s.PhaseCurrentsA[2])
+	r.set("PCS_METER", "total_active_power_kw", s.ActualPowerKW)
+	r.set("PCS_METER", "phase_a_active_power_kw", s.ActualPowerKW/3)
+	r.set("PCS_METER", "phase_b_active_power_kw", s.ActualPowerKW/3)
+	r.set("PCS_METER", "phase_c_active_power_kw", s.ActualPowerKW/3)
+	r.set("PCS_METER", "total_reactive_power_kvar", s.ReactivePowerKvar)
+	r.set("PCS_METER", "phase_a_reactive_power_kvar", s.ReactivePowerKvar/3)
+	r.set("PCS_METER", "phase_b_reactive_power_kvar", s.ReactivePowerKvar/3)
+	r.set("PCS_METER", "phase_c_reactive_power_kvar", s.ReactivePowerKvar/3)
+	r.set("PCS_METER", "total_apparent_power_kva", apparentKVA)
+	r.set("PCS_METER", "phase_a_apparent_power_kva", apparentKVA/3)
+	r.set("PCS_METER", "phase_b_apparent_power_kva", apparentKVA/3)
+	r.set("PCS_METER", "phase_c_apparent_power_kva", apparentKVA/3)
+	r.set("PCS_METER", "total_power_factor", s.PowerFactor)
+	r.set("PCS_METER", "phase_a_power_factor", s.PowerFactor)
+	r.set("PCS_METER", "phase_b_power_factor", s.PowerFactor)
+	r.set("PCS_METER", "phase_c_power_factor", s.PowerFactor)
+	r.set("PCS_METER", "forward_active_total_energy_kwh", s.TotalForwardEnergyKWh)
+	r.set("PCS_METER", "reverse_active_total_energy_kwh", s.TotalReverseEnergyKWh)
+	r.set("PCS_METER", "phase_a_forward_active_energy_kwh", s.TotalForwardEnergyKWh/3)
+	r.set("PCS_METER", "phase_b_forward_active_energy_kwh", s.TotalForwardEnergyKWh/3)
+	r.set("PCS_METER", "phase_c_forward_active_energy_kwh", s.TotalForwardEnergyKWh/3)
+	r.set("PCS_METER", "phase_a_reverse_active_energy_kwh", s.TotalReverseEnergyKWh/3)
+	r.set("PCS_METER", "phase_b_reverse_active_energy_kwh", s.TotalReverseEnergyKWh/3)
+	r.set("PCS_METER", "phase_c_reverse_active_energy_kwh", s.TotalReverseEnergyKWh/3)
+	r.set("PCS_METER", "online_status", boolToFloat(s.Online))
 }

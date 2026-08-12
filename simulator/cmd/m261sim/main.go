@@ -50,8 +50,22 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if *stepInterval <= 0 {
+		// time.NewTicker panics on a non-positive duration; fail with a
+		// clear message before anything is listening, rather than crash
+		// the process the first time the physics runner starts.
+		log.Fatalf("-physics-step must be positive, got %s", *stepInterval)
+	}
 
 	st := store.New()
+
+	// Build and publish the physics model BEFORE either protocol listener
+	// opens: a client connecting in the window before the first Tick fires
+	// (physics-step defaults to 1s but is configurable, so that window
+	// isn't always negligible) must see the configured initial SoC/
+	// voltage/online status, not the store's zero defaults.
+	engine := physics.New(physics.DefaultParams(), *initialSOC)
+	runner := physics.NewRunner(engine, st, clock.Real{})
 
 	mb := modbustcp.New(st, modbustcp.Config{Addr: *modbusAddr, ByteOrder: order})
 	if err := mb.Start(); err != nil {
@@ -68,8 +82,6 @@ func main() {
 	}
 	log.Printf("iec104 listening on %s", iec.Addr())
 
-	engine := physics.New(physics.DefaultParams(), *initialSOC)
-	runner := physics.NewRunner(engine, st, clock.Real{})
 	go runner.Run(*stepInterval, nil)
 	log.Printf("physics model running at a %s step, starting SoC %.1f%%", *stepInterval, *initialSOC)
 
