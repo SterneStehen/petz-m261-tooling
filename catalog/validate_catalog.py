@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from catalog.build_catalog import build_points
-from catalog.parsing import parse_iec104, parse_modbus, split_subtables
+from catalog.parsing import parse_iec104, parse_modbus, parse_tag, split_subtables
 from catalog.xlsx_reader import read_sheet_rows
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -81,7 +81,8 @@ _EXPECTED_TOTAL_3_2 = 1365  # §3.2: Modbus/TAG representation, no readback dupl
 _EXPECTED_EMS_3_2 = 205
 
 
-def check_control_figures(records: list[dict]) -> CheckResult:
+def check_control_figures(records: list[dict], registermap_dir: Path) -> CheckResult:
+    # §3.1: catalog vs. its own IEC-104-anchored bookkeeping.
     counts = Counter((r["device"], r["class"]) for r in records)
     failures = [
         f"{dev}/{cls}: expected {expected}, got {counts.get((dev, cls), 0)}"
@@ -98,17 +99,55 @@ def check_control_figures(records: list[dict]) -> CheckResult:
     )
     if ems_readback != 148:
         failures.append(f"EMS readback-duplicate range 16411-16558: expected 148 points, got {ems_readback}")
-    total_3_2 = total - ems_readback
-    if total_3_2 != _EXPECTED_TOTAL_3_2:
-        failures.append(f"total (§3.2, excl. EMS readback duplicates): expected {_EXPECTED_TOTAL_3_2}, got {total_3_2}")
-    ems_total_3_2 = sum(1 for r in records if r["device"] == "EMS") - ems_readback
-    if ems_total_3_2 != _EXPECTED_EMS_3_2:
-        failures.append(f"EMS total (§3.2, excl. readback duplicates): expected {_EXPECTED_EMS_3_2}, got {ems_total_3_2}")
+
+    # §3.2: code-review finding — the check above only ever re-derives its
+    # own "1365" from the catalog's own total (1513 - 148), which passes
+    # unconditionally regardless of what the Modbus/TAG files actually
+    # contain. §3.2 is a claim about the SOURCE FILES, so verify it against
+    # them directly: parse Modbus and TAG independently of the catalog/join
+    # pipeline and count their real rows.
+    dropped_modbus_junk: list[tuple[str, int, str]] = []
+    modbus_rows = parse_modbus(registermap_dir / "M261_points_Modbus.xlsx", dropped=dropped_modbus_junk)
+    tag_rows = parse_tag(registermap_dir / "M261_points_TAG.xlsx")
+
+    # parse_modbus already filters the 2 known "Parameter Names:" template
+    # artifacts (not real points, see Task 1) — add them back in here so
+    # this check counts what §3.2's "1365 content rows" actually counted:
+    # every row shaped like a point, artifacts included.
+    modbus_raw_total = len(modbus_rows) + len(dropped_modbus_junk)
+    tag_raw_total = len(tag_rows)
+    if modbus_raw_total != _EXPECTED_TOTAL_3_2:
+        failures.append(
+            f"Modbus file raw row count (§3.2): expected {_EXPECTED_TOTAL_3_2}, got {modbus_raw_total} "
+            f"({len(modbus_rows)} genuine + {len(dropped_modbus_junk)} known template artifact(s))"
+        )
+    if tag_raw_total != _EXPECTED_TOTAL_3_2:
+        failures.append(f"TAG file raw row count (§3.2): expected {_EXPECTED_TOTAL_3_2}, got {tag_raw_total}")
+
+    modbus_ems = sum(1 for r in modbus_rows if r.device == "EMS") + sum(1 for d, _, _ in dropped_modbus_junk if d == "EMS")
+    tag_ems = sum(1 for r in tag_rows if r.device == "EMS")
+    if modbus_ems != _EXPECTED_EMS_3_2:
+        failures.append(f"Modbus EMS raw row count (§3.2): expected {_EXPECTED_EMS_3_2}, got {modbus_ems}")
+    if tag_ems != _EXPECTED_EMS_3_2:
+        failures.append(f"TAG EMS raw row count (§3.2): expected {_EXPECTED_EMS_3_2}, got {tag_ems}")
+
+    # Not a failure, just making the arithmetic legible: catalog total minus
+    # readback duplicates (1513-148=1365) equals the RAW §3.2 figures above,
+    # but the catalog's own Modbus-sourced point count is 1363, not 1365 —
+    # 2 fewer, exactly the 2 template artifacts, which correctly never
+    # became catalog points (see "Points not found in all three files").
+    detail_note = (
+        f"catalog total {total} - {ems_readback} EMS readback duplicates = {total - ems_readback} "
+        f"(matches the raw §3.2 figures above); Modbus file raw rows = {modbus_raw_total} "
+        f"({len(dropped_modbus_junk)} of which are template artifacts, not real points, so only "
+        f"{len(modbus_rows)} genuine Modbus points actually feed the catalog); TAG file raw rows = {tag_raw_total}."
+    )
 
     return CheckResult(
         "Control figures §3.1/§3.2", CRITICAL, not failures,
-        f"{total} records" if not failures else f"{len(failures)} mismatch(es)",
-        failures,
+        f"{total} catalog records; {modbus_raw_total} raw Modbus rows; {tag_raw_total} raw TAG rows" if not failures else f"{len(failures)} mismatch(es)",
+        failures, detail_note,
+        manufacturer_question=False,
     )
 
 
@@ -474,7 +513,7 @@ def check_dry_contact_address(registermap_dir: Path) -> CheckResult:
 def run_checks(catalog_path: Path, registermap_dir: Path) -> list[CheckResult]:
     records = load_catalog(catalog_path)
     return [
-        check_control_figures(records),
+        check_control_figures(records, registermap_dir),
         check_anchors(records),
         check_setpoint_formula(records),
         check_tag_count_matches_ro_count(records),
@@ -503,7 +542,7 @@ def render_report(results: list[CheckResult], catalog_path: Path) -> str:
     lines.append("## Summary")
     lines.append("")
     lines.append(f"- Critical checks: {len(critical) - len(failed_critical)}/{len(critical)} passed")
-    lines.append(f"- Warnings raised: {sum(1 for r in warnings if r.details)}/{len(warnings)}")
+    lines.append(f"- Warnings raised: {sum(1 for r in warnings if r.details or r.note)}/{len(warnings)}")
     lines.append(f"- **Overall: {'FAIL' if failed_critical else 'PASS'}**")
     lines.append("")
 
@@ -514,6 +553,9 @@ def render_report(results: list[CheckResult], catalog_path: Path) -> str:
         lines.append(f"### {status} — {r.name}")
         lines.append("")
         lines.append(r.summary)
+        if r.note:
+            lines.append("")
+            lines.append(r.note)
         if r.details:
             lines.append("")
             for d in r.details:
@@ -523,7 +565,7 @@ def render_report(results: list[CheckResult], catalog_path: Path) -> str:
     lines.append("## Warnings")
     lines.append("")
     for r in warnings:
-        marker = "⚠️" if r.details else "—"
+        marker = "⚠️" if (r.details or r.note) else "—"
         lines.append(f"### {marker} {r.name}")
         lines.append("")
         lines.append(r.summary)

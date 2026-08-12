@@ -46,12 +46,16 @@ def _rec(**overrides) -> dict:
 
 
 @pytest.fixture(scope="module")
-def catalog_path(tmp_path_factory) -> Path:
+def catalog_records() -> list[dict]:
+    return build_catalog(REGISTERMAP, OVERRIDES)
+
+
+@pytest.fixture(scope="module")
+def catalog_path(catalog_records, tmp_path_factory) -> Path:
     import json
 
-    records = build_catalog(REGISTERMAP, OVERRIDES)
     path = tmp_path_factory.mktemp("validate") / "point_catalog.json"
-    path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(catalog_records, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 
@@ -112,6 +116,23 @@ def test_known_warning_counts_on_real_catalog(catalog_path):
 # --------------------------------------------------------------------------
 
 
+def test_warnings_raised_count_includes_note_only_warnings():
+    """Code-review finding: a warning that only sets `note` (no itemized
+    `details`, e.g. Dry Contact or 260-cell coverage) genuinely raised
+    something and must count towards 'Warnings raised' and get the ⚠️
+    marker — not be silently treated the same as a warning that found
+    nothing at all."""
+    note_only = CheckResult("Note only", "warning", True, "found something", [], "an actual finding")
+    itemized = CheckResult("Itemized", "warning", True, "2 items", ["a", "b"])
+    clean = CheckResult("Clean", "warning", True, "nothing to report")
+
+    report = render_report([note_only, itemized, clean], Path("point_catalog.json"))
+    assert "Warnings raised: 2/3" in report
+    assert "⚠️ Note only" in report
+    assert "⚠️ Itemized" in report
+    assert "— Clean" in report
+
+
 def test_manufacturer_questions_exclude_internal_calibration_remarks(tmp_path):
     internal = CheckResult(
         "Internal remark", "warning", True, "0 (see note)", ["detail"], "an internal note",
@@ -133,9 +154,42 @@ def test_manufacturer_questions_exclude_internal_calibration_remarks(tmp_path):
 
 def test_control_figures_fails_on_wrong_count():
     records = [_rec(device="EMS", **{"class": "alarm"}, iec104_addr=i) for i in range(1, 31)]  # 30, not 31
-    result = check_control_figures(records)
+    result = check_control_figures(records, REGISTERMAP)
     assert not result.passed
     assert any("EMS/alarm" in d for d in result.details)
+
+
+def test_control_figures_checks_real_modbus_file_not_just_catalog_arithmetic(catalog_records, monkeypatch):
+    """Code-review finding: the §3.2 half of this check used to only
+    re-derive '1365' from the catalog's own total (1513-148), which passes
+    unconditionally no matter what the Modbus/TAG files actually contain.
+    A real, independent parse of both files must be part of the check."""
+    import catalog.validate_catalog as vc
+
+    real_parse_modbus = vc.parse_modbus
+
+    def truncated_modbus(path, dropped=None):
+        rows = real_parse_modbus(path, dropped=dropped)
+        return rows[:-1]  # drop one real, genuine row — not a template artifact
+
+    monkeypatch.setattr(vc, "parse_modbus", truncated_modbus)
+    result = vc.check_control_figures(catalog_records, REGISTERMAP)
+    assert not result.passed
+    assert any("Modbus file raw row count" in d for d in result.details)
+
+
+def test_control_figures_checks_real_tag_file_not_just_catalog_arithmetic(catalog_records, monkeypatch):
+    import catalog.validate_catalog as vc
+
+    real_parse_tag = vc.parse_tag
+
+    def truncated_tag(path):
+        return real_parse_tag(path)[:-1]  # drop one real row
+
+    monkeypatch.setattr(vc, "parse_tag", truncated_tag)
+    result = vc.check_control_figures(catalog_records, REGISTERMAP)
+    assert not result.passed
+    assert any("TAG file raw row count" in d for d in result.details)
 
 
 def test_anchors_fails_on_wrong_tag():
