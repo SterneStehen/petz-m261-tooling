@@ -113,6 +113,19 @@ def test_trip_and_clear_protection_are_dangerous():
     assert by_addr[25093]["dangerous"] is False  # Set Operating Mode, control
 
 
+def test_all_148_setpoints_keep_range_null(records):
+    """AGENT-TASK §6 item 1: the real register map confirms no numeric
+    range for any point — catalog/overrides.yaml (the only legitimate
+    source for a non-null range) stays empty, so every one of the 148
+    setpoints must still be range:null. See tests/test_range_propagation.py
+    for proof the mechanism itself works, using isolated temporary
+    overrides."""
+    setpoints = [r for r in records if r["class"] == "setpoint"]
+    assert len(setpoints) == 148
+    non_null = [r["slug"] for r in setpoints if r["range"] is not None]
+    assert non_null == [], f"invented range(s) found for: {non_null}"
+
+
 def test_build_is_idempotent(tmp_path):
     out1 = tmp_path / "run1.json"
     out2 = tmp_path / "run2.json"

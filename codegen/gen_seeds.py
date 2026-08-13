@@ -62,11 +62,13 @@ def setpoint_record(r: dict) -> dict:
         "data_type": r["data_type"],
         "scale": r["scale"],
         "enum": r["enum"],
-        # No min/max is present anywhere in the register map (only enum
-        # constraints, handled above) — null rather than an invented
-        # number, same "unconfirmed stays null/config" rule as severity
-        # above and AGENT-TASK §1.4 generally.
-        "range": None,
+        # AGENT-TASK §6 item 1: null, or {"min": <number|null>, "max":
+        # <number|null>} with at least one bound set — sourced from
+        # catalog/point_catalog.json's own "range" field (itself always
+        # null for the real map; only catalog/overrides.yaml can set one,
+        # once Stage 0 confirms it). Read through, not reinvented here —
+        # this used to be hardcoded None regardless of the catalog record.
+        "range": r["range"],
         "dangerous": r["dangerous"],
     }
 

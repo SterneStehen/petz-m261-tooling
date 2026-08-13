@@ -12,12 +12,32 @@ import (
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/config"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/iec104"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/modbustcp"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/physics"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
+
+// newRemoteCommandsProcessor builds a commands.Processor on st/clk (Task
+// 6) and puts it in Remote mode (Set Operating Mode = 2) — the tests that
+// use this predate Task 6 and are exercising the physics/protocol
+// plumbing (does a requested power reach the engine and come back out
+// through both protocols), not mode arbitration itself, which has its own
+// dedicated coverage in simulator/internal/commands and in this file's
+// Task 6 acceptance tests below.
+func newRemoteCommandsProcessor(t *testing.T, st *store.Store, clk clock.Clock) *commands.Processor {
+	t.Helper()
+	p, err := commands.NewProcessor(st, clk, commands.DefaultConfig())
+	if err != nil {
+		t.Fatalf("commands.NewProcessor: %v", err)
+	}
+	if err := p.Write(m261points.PointKey{Device: "EMS", Slug: "set_operating_mode"}, 2); err != nil {
+		t.Fatalf("Write(set_operating_mode, 2): %v", err)
+	}
+	return p
+}
 
 func TestResolveByteOrderDefaultsToConfigValue(t *testing.T) {
 	// No CLI override: whatever the loaded config says wins — this is the
@@ -147,11 +167,14 @@ func TestPhysicsTickIsVisibleThroughBothProtocols(t *testing.T) {
 	const startingSOC = 50.0
 	engine := physics.New(physics.DefaultParams(), startingSOC)
 	clk := clock.NewFake(time.Now())
-	runner := physics.NewRunner(engine, st, clk)
+	cmds := newRemoteCommandsProcessor(t, st, clk)
+	runner := physics.NewRunner(engine, st, clk, cmds)
 
 	// A discharge request (+50 kW, positive per §4.5) so SoC and delivered
 	// power move in an unambiguous, checkable direction.
-	st.Set(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 50)
+	if err := cmds.Write(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 50); err != nil {
+		t.Fatal(err)
+	}
 
 	// Baseline, before any tick: heartbeat and delivered power both read
 	// their zero-value defaults through IEC-104, exactly like the reviewer
@@ -221,16 +244,17 @@ func TestPhysicsTickIsVisibleThroughBothProtocols(t *testing.T) {
 // effect on which accumulator discharge energy went into.
 func TestMeterDirectionInvertedIsAppliedEachTick(t *testing.T) {
 	st := store.New()
+	clk := clock.NewFake(time.Now())
+	cmds := newRemoteCommandsProcessor(t, st, clk)
 
-	mb := modbustcp.New(st, modbustcp.Config{Addr: "127.0.0.1:0", ByteOrder: m261points.BigEndian})
+	mb := modbustcp.New(st, modbustcp.Config{Addr: "127.0.0.1:0", ByteOrder: m261points.BigEndian, Commands: cmds})
 	if err := mb.Start(); err != nil {
 		t.Fatalf("modbustcp Start: %v", err)
 	}
 	t.Cleanup(func() { mb.Close() })
 
 	engine := physics.New(physics.DefaultParams(), 50)
-	clk := clock.NewFake(time.Now())
-	runner := physics.NewRunner(engine, st, clk)
+	runner := physics.NewRunner(engine, st, clk, cmds)
 
 	handler := gomodbus.NewTCPClientHandler(mb.Addr().String())
 	handler.SlaveId = 1 // EMS
@@ -294,8 +318,11 @@ func TestPCSMeterDeviceIsPopulatedThroughModbus(t *testing.T) {
 
 	engine := physics.New(physics.DefaultParams(), 50)
 	clk := clock.NewFake(time.Now())
-	runner := physics.NewRunner(engine, st, clk)
-	st.Set(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 20) // discharge
+	cmds := newRemoteCommandsProcessor(t, st, clk)
+	runner := physics.NewRunner(engine, st, clk, cmds)
+	if err := cmds.Write(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 20); err != nil { // discharge
+		t.Fatal(err)
+	}
 	clk.Advance(time.Second)
 	runner.Tick()
 
@@ -360,9 +387,10 @@ func TestInitialStateIsPublishedBeforeFirstTick(t *testing.T) {
 
 	const configuredSOC = 73.0
 	engine := physics.New(physics.DefaultParams(), configuredSOC)
+	clk := clock.NewFake(time.Now())
 	// NewRunner only — deliberately never call Tick, matching a client
 	// that connects in the gap before the first real tick.
-	physics.NewRunner(engine, st, clock.NewFake(time.Now()))
+	physics.NewRunner(engine, st, clk, newRemoteCommandsProcessor(t, st, clk))
 
 	handlerBMS := gomodbus.NewTCPClientHandler(mb.Addr().String())
 	handlerBMS.SlaveId = 34 // BMS
@@ -409,6 +437,247 @@ func TestInitialStateIsPublishedBeforeFirstTick(t *testing.T) {
 	}
 	if online := int32(binary.BigEndian.Uint32(regs)); online != 1 {
 		t.Errorf("online_status before any Tick = %v, want 1, not offline", online)
+	}
+}
+
+// newAllowDangerousCommandsProcessor is newRemoteCommandsProcessor's twin
+// with allow_dangerous=true — used only by
+// TestAll148SetpointsWriteAndReadbackThroughBothProtocols below, which
+// must be able to write Trip/Clear Protection too (the only two of the
+// 148 flagged Dangerous:true) to genuinely cover all 148, not 146 plus a
+// separate carve-out.
+func newAllowDangerousCommandsProcessor(t *testing.T, st *store.Store, clk clock.Clock) *commands.Processor {
+	t.Helper()
+	cfg := commands.DefaultConfig()
+	cfg.AllowDangerous = true
+	p, err := commands.NewProcessor(st, clk, cfg)
+	if err != nil {
+		t.Fatalf("commands.NewProcessor: %v", err)
+	}
+	if err := p.Write(m261points.PointKey{Device: "EMS", Slug: "set_operating_mode"}, 2); err != nil {
+		t.Fatalf("Write(set_operating_mode, 2): %v", err)
+	}
+	return p
+}
+
+// float32Eq compares two engineering values by their canonical
+// float32-representable form. Every IEC-104 monitored value (M_ME_NC_1)
+// and every Modbus F32-typed register pair round-trips through a real
+// float32 on the wire (§2.2) — exact float64 equality is the wrong
+// comparison once a value has actually gone over either protocol.
+func float32Eq(a, b float64) bool {
+	return float32(a) == float32(b)
+}
+
+// representativeValue picks one valid, in-range engineering value for
+// meta: deterministic, and safe for every one of the 148 real setpoints
+// (none of which has a business range today — AGENT-TASK §6 item 1). 7.1
+// is deliberately not exactly float32-representable, so a test asserting
+// equality against an F32 point's round-tripped value is forced to use
+// float32Eq rather than get away with exact float64 comparison by luck.
+func representativeValue(meta m261points.PointMeta) float64 {
+	if meta.Enum != nil {
+		min, first := 0, true
+		for k := range meta.Enum {
+			if first || k < min {
+				min, first = k, false
+			}
+		}
+		return float64(min)
+	}
+	if meta.DataType == m261points.DataTypeF32 {
+		return 7.1
+	}
+	return 7
+}
+
+type setpointExpectation struct {
+	meta        m261points.PointMeta
+	value       float64
+	wireAddr    uint16
+	readbackIOA int
+}
+
+func all148SetpointExpectations(t *testing.T) []setpointExpectation {
+	t.Helper()
+	var out []setpointExpectation
+	for _, meta := range m261points.Points {
+		if meta.Device != "EMS" || meta.Class != m261points.ClassSetpoint {
+			continue
+		}
+		out = append(out, setpointExpectation{
+			meta:        meta,
+			value:       representativeValue(meta),
+			wireAddr:    uint16(*meta.ModbusAddr - 40001),
+			readbackIOA: *meta.ReadbackIEC104Addr,
+		})
+	}
+	if len(out) != 148 {
+		t.Fatalf("found %d EMS setpoints in the catalog, want 148", len(out))
+	}
+	return out
+}
+
+// TestAll148SetpointsWriteAndReadbackThroughBothProtocols is Task 6's
+// "readback works for all 148 points", exercised through real protocol
+// clients rather than the store directly
+// (simulator/internal/commands.TestWriteReadbackForEvery148Setpoint is the
+// store-level equivalent): every one of the 148 EMS setpoints is written
+// via a real Modbus client, then confirmed both via a Modbus read-back at
+// the same address and via a single IEC-104 general interrogation pass
+// reading every one of the 148 readback IOAs at once — a real client
+// wouldn't run 148 separate interrogations any more than this test does.
+func TestAll148SetpointsWriteAndReadbackThroughBothProtocols(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	cmds := newAllowDangerousCommandsProcessor(t, st, clk)
+
+	mb := modbustcp.New(st, modbustcp.Config{Addr: "127.0.0.1:0", ByteOrder: m261points.BigEndian, Commands: cmds})
+	if err := mb.Start(); err != nil {
+		t.Fatalf("modbustcp Start: %v", err)
+	}
+	t.Cleanup(func() { mb.Close() })
+
+	iec := iec104.New(st, iec104.Config{Addr: "127.0.0.1:0", Commands: cmds})
+	if err := iec.Start(); err != nil {
+		t.Fatalf("iec104 Start: %v", err)
+	}
+	t.Cleanup(func() { iec.Close() })
+
+	handler := gomodbus.NewTCPClientHandler(mb.Addr().String())
+	handler.SlaveId = 1 // EMS
+	handler.Timeout = 10 * time.Second
+	if err := handler.Connect(); err != nil {
+		t.Fatalf("modbus Connect: %v", err)
+	}
+	defer handler.Close()
+	client := gomodbus.NewClient(handler)
+
+	setpoints := all148SetpointExpectations(t)
+
+	for _, sp := range setpoints {
+		buf := make([]byte, 4)
+		if sp.meta.DataType == m261points.DataTypeF32 {
+			binary.BigEndian.PutUint32(buf, math.Float32bits(float32(sp.value)))
+		} else {
+			binary.BigEndian.PutUint32(buf, uint32(int32(sp.value)))
+		}
+		if _, err := client.WriteMultipleRegisters(sp.wireAddr, 2, buf); err != nil {
+			t.Fatalf("write %s/%s (wire %d): %v", sp.meta.Device, sp.meta.Slug, sp.wireAddr, err)
+		}
+	}
+
+	for _, sp := range setpoints {
+		regs, err := client.ReadHoldingRegisters(sp.wireAddr, 2)
+		if err != nil {
+			t.Fatalf("read %s/%s (wire %d): %v", sp.meta.Device, sp.meta.Slug, sp.wireAddr, err)
+		}
+		if sp.meta.DataType == m261points.DataTypeF32 {
+			got := float64(math.Float32frombits(binary.BigEndian.Uint32(regs)))
+			if !float32Eq(got, sp.value) {
+				t.Errorf("%s/%s Modbus read-back = %v, want %v (canonical float32)", sp.meta.Device, sp.meta.Slug, got, sp.value)
+			}
+		} else if got := int32(binary.BigEndian.Uint32(regs)); got != int32(sp.value) {
+			t.Errorf("%s/%s Modbus read-back = %v, want %v", sp.meta.Device, sp.meta.Slug, got, int32(sp.value))
+		}
+	}
+
+	c := dialRawIEC(t, iec.Addr().String())
+	c.startDT()
+	c.sendGeneralInterrogation(1) // EMS
+	ioas := make([]int, len(setpoints))
+	for i, sp := range setpoints {
+		ioas[i] = sp.readbackIOA
+	}
+	got := c.waitForFloats(ioas...)
+	if len(got) != len(setpoints) {
+		t.Fatalf("general interrogation returned %d/%d readback IOAs", len(got), len(setpoints))
+	}
+	for _, sp := range setpoints {
+		gotVal := float64(got[sp.readbackIOA])
+		if !float32Eq(gotVal, sp.value) {
+			t.Errorf("%s/%s readback via IEC-104 (IOA %d) = %v, want %v (canonical float32)", sp.meta.Device, sp.meta.Slug, sp.readbackIOA, gotVal, sp.value)
+		}
+	}
+}
+
+// TestRejectedWriteDoesNotChangeSetpointOrReadbackThroughBothProtocols
+// proves an invalid write is fully rejected end-to-end through each real
+// protocol, not just at the commands.Processor unit level
+// (simulator/internal/commands already covers that in isolation) — the
+// setpoint and its readback both stay at their prior value.
+func TestRejectedWriteDoesNotChangeSetpointOrReadbackThroughBothProtocols(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	cmds := newRemoteCommandsProcessor(t, st, clk)
+
+	mb := modbustcp.New(st, modbustcp.Config{Addr: "127.0.0.1:0", ByteOrder: m261points.BigEndian, Commands: cmds})
+	if err := mb.Start(); err != nil {
+		t.Fatalf("modbustcp Start: %v", err)
+	}
+	t.Cleanup(func() { mb.Close() })
+
+	iec := iec104.New(st, iec104.Config{Addr: "127.0.0.1:0", Commands: cmds})
+	if err := iec.Start(); err != nil {
+		t.Fatalf("iec104 Start: %v", err)
+	}
+	t.Cleanup(func() { iec.Close() })
+
+	handler := gomodbus.NewTCPClientHandler(mb.Addr().String())
+	handler.SlaveId = 1
+	handler.Timeout = 2 * time.Second
+	if err := handler.Connect(); err != nil {
+		t.Fatalf("modbus Connect: %v", err)
+	}
+	defer handler.Close()
+	client := gomodbus.NewClient(handler)
+
+	// Baseline, valid write via Modbus: Set Operating Mode = 1 (Auto
+	// Strategy), wire 40009-40001=8.
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, 1)
+	if _, err := client.WriteMultipleRegisters(8, 2, buf); err != nil {
+		t.Fatalf("baseline write: %v", err)
+	}
+
+	// Modbus: an out-of-enum value (5 — only 0/1/2 are valid) must be
+	// rejected as a Modbus exception, and must not move the stored value.
+	badBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(badBuf, 5)
+	if _, err := client.WriteMultipleRegisters(8, 2, badBuf); err == nil {
+		t.Error("Modbus write of an out-of-enum set_operating_mode value did not return an error")
+	}
+	regs, err := client.ReadHoldingRegisters(8, 2)
+	if err != nil {
+		t.Fatalf("ReadHoldingRegisters: %v", err)
+	}
+	if got := int32(binary.BigEndian.Uint32(regs)); got != 1 {
+		t.Errorf("set_operating_mode after a rejected Modbus write = %v, want unchanged 1", got)
+	}
+
+	// IEC-104: the same rejection, through a real, independent raw client.
+	c := dialRawIEC(t, iec.Addr().String())
+	c.startDT()
+	c.sendSetpointCommand(1, 25093, 5) // Set Operating Mode, IOA 25093
+	found := false
+	for i := 0; i < 50; i++ {
+		asdu := c.nextI()
+		if asdu[0] == 50 { // C_SE_NC_1
+			if asdu[2]&0x40 == 0 { // negative (P/N) flag must be set
+				t.Errorf("expected a negative confirmation for an out-of-enum IEC-104 write, got cot=%d", asdu[2])
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("no C_SE_NC_1 confirmation observed after 50 frames")
+	}
+
+	c.sendGeneralInterrogation(1)
+	after, ok := c.waitForFloat(16415) // set_operating_mode's readback IOA
+	if !ok || after != 1 {
+		t.Errorf("set_operating_mode readback after a rejected IEC-104 write = %v, %v; want 1, true (unchanged)", after, ok)
 	}
 }
 

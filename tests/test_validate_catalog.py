@@ -16,6 +16,7 @@ from catalog.validate_catalog import (
     check_control_figures,
     check_key_points_present,
     check_no_address_collisions,
+    check_range_shape_valid,
     check_setpoint_formula,
     check_strategy_periods,
     check_tag_count_matches_ro_count,
@@ -216,6 +217,22 @@ def test_tag_count_mismatch_fails():
     result = check_tag_count_matches_ro_count(records)
     assert not result.passed
     assert "EMS" in result.details[0]
+
+
+def test_range_shape_valid_passes_on_null_and_well_formed_ranges():
+    records = [
+        _rec(device="EMS", slug="a", range=None),
+        _rec(device="EMS", slug="b", range={"min": 0, "max": 100}),
+    ]
+    result = check_range_shape_valid(records)
+    assert result.passed
+
+
+def test_range_shape_valid_fails_on_malformed_range():
+    records = [_rec(device="EMS", slug="a", range={"min": None, "max": None})]
+    result = check_range_shape_valid(records)
+    assert not result.passed
+    assert any("EMS/a" in d for d in result.details)
 
 
 def test_key_points_present_fails_when_trip_missing():

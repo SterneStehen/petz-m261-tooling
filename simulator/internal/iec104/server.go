@@ -1,6 +1,7 @@
 package iec104
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -8,11 +9,21 @@ import (
 	"sync/atomic"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
 type Config struct {
 	Addr string // e.g. "127.0.0.1:2404" or ":2404"
+
+	// Commands, if non-nil, routes every setpoint write through Task 6's
+	// validation/mode-arbitration/dangerous-gating layer instead of
+	// writing the store directly. nil falls back to the pre-Task-6
+	// behavior (write straight through, scoped only to EMS setpoints) —
+	// used by protocol-level tests in this package that predate Task 6
+	// and aren't exercising its concerns. main.go always wires a real
+	// *commands.Processor; production writes are never validation-free.
+	Commands *commands.Processor
 }
 
 // Server is an IEC-104 server backed by a shared store.Store. Any point
@@ -332,23 +343,49 @@ func (s *Server) handleGeneralInterrogation(c *clientConn, hdr asduHeader, objs 
 // client is not entitled to overwrite simulated readings just because it
 // knows (or guesses) the IOA.
 
-// writePoint applies a command write, restricted to EMS setpoints — the
-// only 148 points a real IEC-104 command may ever legitimately target.
-// Returns false (and leaves the store untouched) for anything else:
-// unknown IOA, a point on another device, or a real EMS alarm/telemetry
-// point.
-func (s *Server) writePoint(commonAddr, ioa int, value float64) bool {
+// errUnknownIOA is writePoint's sentinel for "no legitimately writable
+// point at this address" (unresolvable IOA, wrong device, or wrong
+// class) — distinct from a commands.Processor rejection (a real point,
+// but an invalid/dangerous value), so the caller can pick the
+// standard-appropriate cause of transmission (cotUnknownIOA vs a negative
+// activation confirmation).
+var errUnknownIOA = errors.New("iec104: no writable EMS setpoint at this address")
+
+// writePoint resolves (commonAddr, ioa) to a point, restricted to EMS
+// setpoints — the only 148 points a real IEC-104 command may ever
+// legitimately target — and forwards to Task 6's commands.Processor for
+// validation/mode-arbitration/dangerous-gating and the actual store write.
+func (s *Server) writePoint(commonAddr, ioa int, value float64) error {
 	addr := store.IECAddr{CommonAddr: commonAddr, ObjAddr: ioa}
 	key, _, ok := s.store.GetByIEC(addr)
 	if !ok {
-		return false
+		return errUnknownIOA
 	}
 	meta, ok := m261points.Points[key]
 	if !ok || meta.Device != "EMS" || meta.Class != m261points.ClassSetpoint {
-		return false
+		return errUnknownIOA
 	}
-	_, ok = s.store.SetByIEC(addr, value)
-	return ok
+	if s.cfg.Commands != nil {
+		return s.cfg.Commands.Write(key, value)
+	}
+	if _, ok := s.store.SetByIEC(addr, value); !ok {
+		return errUnknownIOA
+	}
+	return nil
+}
+
+// negativeCOT maps a writePoint error to the standard-appropriate cause of
+// transmission for a negative activation confirmation: an address that
+// resolves to nothing writable is "unknown IOA" (cause 47); a real,
+// resolvable point rejected by the commands layer (bad enum/range value,
+// or a dangerous command without allow_dangerous) is a negative activation
+// confirmation on the same cause the successful case would use (cause 7),
+// per the standard's own convention for "known point, rejected value".
+func negativeCOT(err error) byte {
+	if errors.Is(err, errUnknownIOA) {
+		return cotUnknownIOA | cotNegativeFlag
+	}
+	return cotActivationCon | cotNegativeFlag
 }
 
 func (s *Server) handleSingleCommand(c *clientConn, hdr asduHeader, objs []infoObject) {
@@ -360,8 +397,8 @@ func (s *Server) handleSingleCommand(c *clientConn, hdr asduHeader, objs []infoO
 		value = 1
 	}
 	cot := byte(cotActivationCon)
-	if !s.writePoint(hdr.CommonAddr, objs[0].IOA, value) {
-		cot = cotUnknownIOA | cotNegativeFlag
+	if err := s.writePoint(hdr.CommonAddr, objs[0].IOA, value); err != nil {
+		cot = negativeCOT(err)
 	}
 	c.writeIFrame(buildCSCNA1(hdr.CommonAddr, objs[0].IOA, value != 0, cot)) //nolint:errcheck
 }
@@ -372,8 +409,8 @@ func (s *Server) handleSetpointCommand(c *clientConn, hdr asduHeader, objs []inf
 	}
 	value := decodeFloat32(objs[0].Data[0:4])
 	cot := byte(cotActivationCon)
-	if !s.writePoint(hdr.CommonAddr, objs[0].IOA, float64(value)) {
-		cot = cotUnknownIOA | cotNegativeFlag
+	if err := s.writePoint(hdr.CommonAddr, objs[0].IOA, float64(value)); err != nil {
+		cot = negativeCOT(err)
 	}
 	c.writeIFrame(buildCSENC1(hdr.CommonAddr, objs[0].IOA, value, cot)) //nolint:errcheck
 }

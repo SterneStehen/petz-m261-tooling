@@ -6,6 +6,7 @@ import (
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
@@ -18,10 +19,30 @@ func get(t *testing.T, st *store.Store, device, slug string) float64 {
 	return v
 }
 
+// newTestProcessor builds a commands.Processor on st/clk and immediately
+// puts it in Remote mode (Set Operating Mode = 2). These tests pre-date
+// Task 6's mode arbitration and are exercising the engine/store plumbing
+// (does a requested power reach the store, does energy accumulate, and so
+// on) — Remote mode is what makes "write Set Active Power" behave exactly
+// like it did before commands.Processor existed. Mode arbitration itself
+// (Manual/Auto Strategy/limits/watchdog/priority) has its own dedicated
+// coverage in simulator/internal/commands.
+func newTestProcessor(t *testing.T, st *store.Store, clk clock.Clock) *commands.Processor {
+	t.Helper()
+	p, err := commands.NewProcessor(st, clk, commands.DefaultConfig())
+	if err != nil {
+		t.Fatalf("commands.NewProcessor: %v", err)
+	}
+	if err := p.Write(m261points.PointKey{Device: "EMS", Slug: "set_operating_mode"}, 2); err != nil {
+		t.Fatalf("Write(set_operating_mode, 2): %v", err)
+	}
+	return p
+}
+
 func TestTickDoesNothingWithoutElapsedTime(t *testing.T) {
 	st := store.New()
 	clk := clock.NewFake(time.Now())
-	r := NewRunner(New(DefaultParams(), 50), st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, newTestProcessor(t, st, clk))
 	r.Tick() // clock hasn't moved since NewRunner — must be a no-op
 	if hb := get(t, st, "EMS", "ems_periodic_heartbeat_indicator"); hb != 0 {
 		t.Errorf("heartbeat = %v after a zero-dt Tick, want 0 (no-op)", hb)
@@ -30,9 +51,12 @@ func TestTickDoesNothingWithoutElapsedTime(t *testing.T) {
 
 func TestTickWritesSoCPowerAndHeartbeatToStore(t *testing.T) {
 	st := store.New()
-	st.Set(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, -50) // request charge
 	clk := clock.NewFake(time.Now())
-	r := NewRunner(New(DefaultParams(), 50), st, clk)
+	cmds := newTestProcessor(t, st, clk)
+	if err := cmds.Write(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, -50); err != nil { // request charge
+		t.Fatal(err)
+	}
+	r := NewRunner(New(DefaultParams(), 50), st, clk, cmds)
 
 	clk.Advance(time.Second)
 	r.Tick()
@@ -58,7 +82,7 @@ func TestTickWritesSoCPowerAndHeartbeatToStore(t *testing.T) {
 func TestTickWritesAllCellVoltagesAndTemperatures(t *testing.T) {
 	st := store.New()
 	clk := clock.NewFake(time.Now())
-	r := NewRunner(New(DefaultParams(), 50), st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, newTestProcessor(t, st, clk))
 	clk.Advance(time.Second)
 	r.Tick()
 
@@ -78,9 +102,12 @@ func TestTickWritesAllCellVoltagesAndTemperatures(t *testing.T) {
 
 func TestTickWritesPCSElectricals(t *testing.T) {
 	st := store.New()
-	st.Set(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 50) // discharge
 	clk := clock.NewFake(time.Now())
-	r := NewRunner(New(DefaultParams(), 50), st, clk)
+	cmds := newTestProcessor(t, st, clk)
+	if err := cmds.Write(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 50); err != nil { // discharge
+		t.Fatal(err)
+	}
+	r := NewRunner(New(DefaultParams(), 50), st, clk, cmds)
 	clk.Advance(time.Second)
 	r.Tick()
 
@@ -98,9 +125,12 @@ func TestTickWritesPCSElectricals(t *testing.T) {
 // complement to cmd/m261sim.TestPCSMeterDeviceIsPopulatedThroughModbus.
 func TestTickWritesPCSMeterDevice(t *testing.T) {
 	st := store.New()
-	st.Set(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 20) // discharge
 	clk := clock.NewFake(time.Now())
-	r := NewRunner(New(DefaultParams(), 50), st, clk)
+	cmds := newTestProcessor(t, st, clk)
+	if err := cmds.Write(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 20); err != nil { // discharge
+		t.Fatal(err)
+	}
+	r := NewRunner(New(DefaultParams(), 50), st, clk, cmds)
 	clk.Advance(time.Second)
 	r.Tick()
 
@@ -120,9 +150,12 @@ func TestTickWritesPCSMeterDevice(t *testing.T) {
 
 func TestTickAccumulatesEnergyMeter(t *testing.T) {
 	st := store.New()
-	st.Set(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 10) // discharge
 	clk := clock.NewFake(time.Now())
-	r := NewRunner(New(DefaultParams(), 50), st, clk)
+	cmds := newTestProcessor(t, st, clk)
+	if err := cmds.Write(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 10); err != nil { // discharge
+		t.Fatal(err)
+	}
+	r := NewRunner(New(DefaultParams(), 50), st, clk, cmds)
 	for i := 0; i < 5; i++ {
 		clk.Advance(time.Second)
 		r.Tick()
@@ -139,10 +172,13 @@ func TestTickAccumulatesEnergyMeter(t *testing.T) {
 // the same thing through a real Modbus client.
 func TestTickReadsMeterDirectionFromStoreEveryTick(t *testing.T) {
 	st := store.New()
-	st.Set(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 10) // discharge
-	st.Set(m261points.PointKey{Device: "EMS", Slug: "energy_storage_meter_power_direction"}, 1)
 	clk := clock.NewFake(time.Now())
-	r := NewRunner(New(DefaultParams(), 50), st, clk)
+	cmds := newTestProcessor(t, st, clk)
+	if err := cmds.Write(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 10); err != nil { // discharge
+		t.Fatal(err)
+	}
+	st.Set(m261points.PointKey{Device: "EMS", Slug: "energy_storage_meter_power_direction"}, 1)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, cmds)
 	clk.Advance(time.Second)
 	r.Tick()
 
@@ -169,7 +205,8 @@ func TestTickReadsMeterDirectionFromStoreEveryTick(t *testing.T) {
 
 func TestRunCallsTickOnRealCadenceUntilStopped(t *testing.T) {
 	st := store.New()
-	r := NewRunner(New(DefaultParams(), 50), st, clock.Real{})
+	clk := clock.Real{}
+	r := NewRunner(New(DefaultParams(), 50), st, clk, newTestProcessor(t, st, clk))
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -196,7 +233,9 @@ func TestRunCallsTickOnRealCadenceUntilStopped(t *testing.T) {
 // fragile to a caller that doesn't.
 func TestRunDoesNotPanicOnNonPositiveInterval(t *testing.T) {
 	for _, interval := range []time.Duration{0, -time.Second} {
-		r := NewRunner(New(DefaultParams(), 50), store.New(), clock.Real{})
+		st := store.New()
+		clk := clock.Real{}
+		r := NewRunner(New(DefaultParams(), 50), st, clk, newTestProcessor(t, st, clk))
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -218,7 +257,8 @@ func TestRunDoesNotPanicOnNonPositiveInterval(t *testing.T) {
 // assertion through a real protocol client.
 func TestNewRunnerPublishesInitialStateImmediately(t *testing.T) {
 	st := store.New()
-	NewRunner(New(DefaultParams(), 73), st, clock.NewFake(time.Now())) // no Tick call
+	clk := clock.NewFake(time.Now())
+	NewRunner(New(DefaultParams(), 73), st, clk, newTestProcessor(t, st, clk)) // no Tick call
 
 	if soc := get(t, st, "BMS", "soc"); soc != 73 {
 		t.Errorf("BMS soc immediately after NewRunner = %v, want the configured initial 73", soc)

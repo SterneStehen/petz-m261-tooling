@@ -130,9 +130,10 @@ func (s *Server) handleReadRegisters(unitID byte, pdu []byte, class int) []byte 
 // on whichever points the addressed registers belong to — this handles a
 // single-register FC06 write to one half of a 2-register point (a
 // read-modify-write of that half) as well as an aligned 2-register FC16
-// write (a full new value) uniformly. No range/enum validation and no
-// `dangerous` gating here — that's Task 6 (commands), layered on top of
-// the same store.
+// write (a full new value) uniformly. Every touched point is validated
+// through Task 6's commands.Processor (range/enum, dangerous-gating,
+// mode-arbitration side effects) before anything is committed to the
+// store — see applyRegisterWrites.
 
 func (s *Server) handleWriteSingleRegister(unitID byte, pdu []byte) []byte {
 	if len(pdu) != 5 {
@@ -172,8 +173,15 @@ func (s *Server) handleWriteMultipleRegisters(unitID byte, pdu []byte) []byte {
 }
 
 // applyRegisterWrites returns 0 on success or a Modbus exception code.
+//
+// Every point an FC06/FC16 request touches is decoded and validated
+// (s.cfg.Commands.Validate) before any of them are committed — a
+// multi-register FC16 write spanning more than one catalog point must not
+// partially apply if a later point in the request fails validation, so
+// commit only happens once every touched point has already passed.
 func (s *Server) applyRegisterWrites(unit int, start uint16, regs [][]byte) byte {
 	touched := make(map[m261points.PointKey][]byte)
+	order := make([]m261points.PointKey, 0, len(regs)/2+1)
 	for i, val2 := range regs {
 		addr := start + uint16(i)
 		slot, ok := s.slots[regSlotKey{unit: unit, class: 3, addr: addr}]
@@ -186,12 +194,28 @@ func (s *Server) applyRegisterWrites(unit int, start uint16, regs [][]byte) byte
 			cur, _ := s.store.Get(slot.key)
 			buf = append([]byte(nil), encodeRegisterPair(cur, meta, s.cfg.ByteOrder)...)
 			touched[slot.key] = buf
+			order = append(order, slot.key)
 		}
 		buf[slot.which*2], buf[slot.which*2+1] = val2[0], val2[1]
 	}
-	for key, buf := range touched {
+
+	decoded := make(map[m261points.PointKey]float64, len(order))
+	for _, key := range order {
 		meta := m261points.Points[key]
-		s.store.Set(key, decodeRegisterPair(buf, meta, s.cfg.ByteOrder))
+		val := decodeRegisterPair(touched[key], meta, s.cfg.ByteOrder)
+		if s.cfg.Commands != nil {
+			if err := s.cfg.Commands.Validate(key, val); err != nil {
+				return excIllegalDataValue
+			}
+		}
+		decoded[key] = val
+	}
+	for _, key := range order {
+		if s.cfg.Commands != nil {
+			s.cfg.Commands.Write(key, decoded[key]) //nolint:errcheck // already validated above; Write can only fail Validate's own check
+		} else {
+			s.store.Set(key, decoded[key])
+		}
 	}
 	return 0
 }

@@ -6,7 +6,7 @@ truth and catalog/overrides.yaml for manual corrections.
 """
 from __future__ import annotations
 
-from .models import PointKey, PointMeta
+from .models import PointKey, PointMeta, Range
 from .points import POINTS
 
-__all__ = ["PointKey", "PointMeta", "POINTS"]
+__all__ = ["PointKey", "PointMeta", "Range", "POINTS"]

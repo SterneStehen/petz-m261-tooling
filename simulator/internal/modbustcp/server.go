@@ -23,6 +23,7 @@ import (
 	"sync"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
@@ -31,6 +32,14 @@ import (
 type Config struct {
 	Addr      string // e.g. "127.0.0.1:502" or ":502"
 	ByteOrder m261points.ByteOrder
+
+	// Commands, if non-nil, routes every setpoint write through Task 6's
+	// validation/mode-arbitration/dangerous-gating layer instead of
+	// writing the store directly. nil falls back to the pre-Task-6
+	// behavior (write straight through) — used by protocol-level tests in
+	// this package that predate Task 6. main.go always wires a real
+	// *commands.Processor.
+	Commands *commands.Processor
 }
 
 // Server is a Modbus TCP server backed by a shared store.Store. Multiple

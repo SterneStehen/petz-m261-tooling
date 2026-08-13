@@ -32,15 +32,86 @@ func (p EnumParam) validate(name string) error {
 	return fmt.Errorf("config: %s = %q is not one of %v", name, p.Value, p.Allowed)
 }
 
+// IntParam is a config value with no enum constraint (§7's watchdog.timeout_s
+// is documented as a plain integer, not a set of allowed strings).
+type IntParam struct {
+	Value       int  `yaml:"value"`
+	Unconfirmed bool `yaml:"unconfirmed"`
+}
+
+// BoolParam is a plain boolean §7 parameter (commands.allow_dangerous).
+type BoolParam struct {
+	Value       bool `yaml:"value"`
+	Unconfirmed bool `yaml:"unconfirmed"`
+}
+
+// PriorityParam is modes.priority (§7): an explicit order over exactly the
+// three mode drivers named in the table — a permutation of "remote",
+// "demand_control", "load_tracking", not an open-ended string list.
+type PriorityParam struct {
+	Value       []string `yaml:"value"`
+	Unconfirmed bool     `yaml:"unconfirmed"`
+}
+
+var modePriorityNames = []string{"remote", "demand_control", "load_tracking"}
+
+func (p PriorityParam) validate(name string) error {
+	want := make(map[string]bool, len(modePriorityNames))
+	for _, n := range modePriorityNames {
+		want[n] = true
+	}
+	if len(p.Value) != len(modePriorityNames) {
+		return fmt.Errorf("config: %s must list exactly %v, got %v", name, modePriorityNames, p.Value)
+	}
+	seen := make(map[string]bool, len(p.Value))
+	for _, v := range p.Value {
+		if !want[v] {
+			return fmt.Errorf("config: %s contains %q, want one of %v", name, v, modePriorityNames)
+		}
+		if seen[v] {
+			return fmt.Errorf("config: %s lists %q more than once", name, v)
+		}
+		seen[v] = true
+	}
+	return nil
+}
+
 type ModbusConfig struct {
 	ByteOrder EnumParam `yaml:"byte_order"`
 }
 
-type Config struct {
-	Modbus ModbusConfig `yaml:"modbus"`
+// WatchdogConfig is §7's watchdog.mode/watchdog.timeout_s — Task 6 item 5:
+// three modes because the real EMS's actual watchdog behavior on a stale
+// remote setpoint isn't confirmed.
+type WatchdogConfig struct {
+	Mode     EnumParam `yaml:"mode"`
+	TimeoutS IntParam  `yaml:"timeout_s"`
 }
 
-// Default returns the §7 default: modbus.byte_order = big, unconfirmed.
+// ModesConfig is §7's modes.priority — Task 6 item 6: which mode wins when
+// Remote, Demand Control, and Load Tracking are simultaneously enabled,
+// unspecified by the register map.
+type ModesConfig struct {
+	Priority PriorityParam `yaml:"priority"`
+}
+
+// CommandsConfig is §7's commands.allow_dangerous — Task 6 item 7: Trip
+// (and Clear Protection, also flagged dangerous per Task 1 item 8) are
+// rejected unless explicitly allowed.
+type CommandsConfig struct {
+	AllowDangerous BoolParam `yaml:"allow_dangerous"`
+}
+
+type Config struct {
+	Modbus   ModbusConfig   `yaml:"modbus"`
+	Watchdog WatchdogConfig `yaml:"watchdog"`
+	Modes    ModesConfig    `yaml:"modes"`
+	Commands CommandsConfig `yaml:"commands"`
+}
+
+// Default returns every §7 parameter declared so far at its documented
+// default, all marked unconfirmed (the table itself says none of these are
+// confirmed by the manufacturer as of writing).
 func Default() Config {
 	return Config{
 		Modbus: ModbusConfig{
@@ -49,6 +120,20 @@ func Default() Config {
 				Allowed:     []string{"big", "little", "big_word_swap", "little_word_swap"},
 				Unconfirmed: true,
 			},
+		},
+		Watchdog: WatchdogConfig{
+			Mode: EnumParam{
+				Value:       "zero_after",
+				Allowed:     []string{"hold", "zero_after", "safe_state_after"},
+				Unconfirmed: true,
+			},
+			TimeoutS: IntParam{Value: 60, Unconfirmed: true},
+		},
+		Modes: ModesConfig{
+			Priority: PriorityParam{Value: append([]string(nil), modePriorityNames...), Unconfirmed: true},
+		},
+		Commands: CommandsConfig{
+			AllowDangerous: BoolParam{Value: false, Unconfirmed: true},
 		},
 	}
 }
@@ -78,6 +163,15 @@ func Load(path string) (Config, error) {
 
 func (c Config) Validate() error {
 	if err := c.Modbus.ByteOrder.validate("modbus.byte_order"); err != nil {
+		return err
+	}
+	if err := c.Watchdog.Mode.validate("watchdog.mode"); err != nil {
+		return err
+	}
+	if c.Watchdog.TimeoutS.Value <= 0 {
+		return fmt.Errorf("config: watchdog.timeout_s = %d, must be positive", c.Watchdog.TimeoutS.Value)
+	}
+	if err := c.Modes.Priority.validate("modes.priority"); err != nil {
 		return err
 	}
 	return nil

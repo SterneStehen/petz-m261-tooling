@@ -7,28 +7,30 @@ import (
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
-// Runner is the minimal glue between an Engine and the shared store,
-// added per code review: without it, m261sim served static zero values —
-// nothing ever called Engine.Step, so the physics model had no effect on
-// what IEC-104/Modbus TCP actually reported.
+// Runner is the glue between an Engine and the shared store, added per
+// code review: without it, m261sim served static zero values — nothing
+// ever called Engine.Step, so the physics model had no effect on what
+// IEC-104/Modbus TCP actually reported.
 //
-// Each Tick reads the raw EMS "Set Active Power"/"Set Reactive Power"
-// setpoints, steps the engine, and writes the derived state to every
-// documented catalog point it corresponds to. It does no mode
-// arbitration, no Power On/Off gating, and no BMS-limit-vs-EMS-setpoint
-// reconciliation beyond what Engine.Step itself already clips to what's
-// physically possible — Task 6's commands package owns that layer and is
-// expected to sit in front of this (validating/arbitrating the setpoint
-// before it reaches the store, or calling Engine.Step directly with its
-// own resolved power instead of going through Tick's raw setpoint read).
+// Each Tick asks commands (Task 6) for the active/reactive power to
+// dispatch this step — mode arbitration (Manual/Auto Strategy/Remote),
+// Strategy Period schedule execution, EMS-level limits, watchdog, and
+// Power On/Off/Trip gating all happen there, against the engine's own
+// current BMS headroom (State().MaxChargeableKW/MaxDischargeableKW) —
+// then steps the engine with that resolved power and writes the result to
+// every documented catalog point it corresponds to. Engine.Step itself
+// remains responsible only for clipping to what's physically possible
+// right now (SoC headroom, thermal derating), per its own doc comment.
 type Runner struct {
-	engine *Engine
-	store  *store.Store
-	clock  clock.Clock
-	last   time.Time
+	engine   *Engine
+	store    *store.Store
+	clock    clock.Clock
+	commands *commands.Processor
+	last     time.Time
 }
 
 // NewRunner builds a Runner and immediately publishes the engine's
@@ -37,8 +39,10 @@ type Runner struct {
 // this window is not always negligible) must see the configured initial
 // SoC/voltage/online status, not zero values nothing has written yet.
 // clk.Now() at construction time is the baseline for the first Tick's dt.
-func NewRunner(engine *Engine, st *store.Store, clk clock.Clock) *Runner {
-	r := &Runner{engine: engine, store: st, clock: clk, last: clk.Now()}
+// cmds must be non-nil — commands.NewProcessor(st, clk, ...) with the same
+// store and clock this Runner uses.
+func NewRunner(engine *Engine, st *store.Store, clk clock.Clock, cmds *commands.Processor) *Runner {
+	r := &Runner{engine: engine, store: st, clock: clk, commands: cmds, last: clk.Now()}
 	r.writeState()
 	return r
 }
@@ -59,15 +63,19 @@ func (r *Runner) Tick() {
 }
 
 func (r *Runner) step(dt time.Duration) {
-	requestedPower, _ := r.store.Get(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"})
-	requestedReactive, _ := r.store.Get(m261points.PointKey{Device: "EMS", Slug: "set_reactive_power_kvar"})
+	state := r.engine.State() // this tick's starting BMS headroom/SoC, before Step
+	activePower, reactivePower := r.commands.ResolvePower(
+		r.clock.Now(), state.MaxChargeableKW, state.MaxDischargeableKW, state.SoCPercent,
+		state.ChargeProhibited, state.DischargeProhibited,
+	)
+
 	// Energy Storage Meter Power Direction (§4.4/Task 5 item 7): read every
 	// step, not just once at startup, since it's a live setpoint a client
 	// can change at any time.
 	direction, _ := r.store.Get(m261points.PointKey{Device: "EMS", Slug: "energy_storage_meter_power_direction"})
 	r.engine.SetMeterDirectionInverted(direction != 0)
 
-	r.engine.Step(dt, requestedPower, requestedReactive)
+	r.engine.Step(dt, activePower, reactivePower)
 	r.writeState()
 }
 

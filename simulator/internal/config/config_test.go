@@ -108,6 +108,105 @@ func TestRealConfigFileLoadsAndValidates(t *testing.T) {
 	}
 }
 
+// TestDefaultDeclaresAllTask6Parameters covers the §7 parameters Task 6
+// added: watchdog.mode/timeout_s, modes.priority, commands.allow_dangerous
+// — each must default per the table and be marked unconfirmed.
+func TestDefaultDeclaresAllTask6Parameters(t *testing.T) {
+	cfg := Default()
+
+	if cfg.Watchdog.Mode.Value != "zero_after" || !cfg.Watchdog.Mode.Unconfirmed {
+		t.Errorf("watchdog.mode = %+v, want value=zero_after unconfirmed=true", cfg.Watchdog.Mode)
+	}
+	if cfg.Watchdog.TimeoutS.Value != 60 || !cfg.Watchdog.TimeoutS.Unconfirmed {
+		t.Errorf("watchdog.timeout_s = %+v, want value=60 unconfirmed=true", cfg.Watchdog.TimeoutS)
+	}
+	wantPriority := []string{"remote", "demand_control", "load_tracking"}
+	if !reflect.DeepEqual(cfg.Modes.Priority.Value, wantPriority) || !cfg.Modes.Priority.Unconfirmed {
+		t.Errorf("modes.priority = %+v, want value=%v unconfirmed=true", cfg.Modes.Priority, wantPriority)
+	}
+	if cfg.Commands.AllowDangerous.Value != false || !cfg.Commands.AllowDangerous.Unconfirmed {
+		t.Errorf("commands.allow_dangerous = %+v, want value=false unconfirmed=true", cfg.Commands.AllowDangerous)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Default() failed its own Validate(): %v", err)
+	}
+}
+
+func TestValidateRejectsBadWatchdogMode(t *testing.T) {
+	cfg := Default()
+	cfg.Watchdog.Mode.Value = "retry_forever"
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate with an out-of-enum watchdog.mode returned nil error")
+	}
+}
+
+func TestValidateRejectsNonPositiveWatchdogTimeout(t *testing.T) {
+	for _, v := range []int{0, -1} {
+		cfg := Default()
+		cfg.Watchdog.TimeoutS.Value = v
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate with watchdog.timeout_s = %d returned nil error", v)
+		}
+	}
+}
+
+func TestValidateRejectsMalformedModePriority(t *testing.T) {
+	cases := [][]string{
+		{"remote", "demand_control"},                       // too short
+		{"remote", "demand_control", "load_tracking", "x"}, // too long
+		{"remote", "demand_control", "nonsense"},           // unknown name
+		{"remote", "remote", "load_tracking"},              // duplicate
+	}
+	for _, priority := range cases {
+		cfg := Default()
+		cfg.Modes.Priority.Value = priority
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate with modes.priority = %v returned nil error", priority)
+		}
+	}
+}
+
+func TestLoadParsesTask6Sections(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m261sim.yaml")
+	writeFile(t, path, ""+
+		"watchdog:\n  mode:\n    value: safe_state_after\n  timeout_s:\n    value: 5\n"+
+		"modes:\n  priority:\n    value: [load_tracking, remote, demand_control]\n"+
+		"commands:\n  allow_dangerous:\n    value: true\n")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Watchdog.Mode.Value != "safe_state_after" {
+		t.Errorf("watchdog.mode = %q, want safe_state_after", cfg.Watchdog.Mode.Value)
+	}
+	if cfg.Watchdog.TimeoutS.Value != 5 {
+		t.Errorf("watchdog.timeout_s = %d, want 5", cfg.Watchdog.TimeoutS.Value)
+	}
+	want := []string{"load_tracking", "remote", "demand_control"}
+	if !reflect.DeepEqual(cfg.Modes.Priority.Value, want) {
+		t.Errorf("modes.priority = %v, want %v", cfg.Modes.Priority.Value, want)
+	}
+	if !cfg.Commands.AllowDangerous.Value {
+		t.Error("commands.allow_dangerous = false, want true")
+	}
+}
+
+// TestRealConfigFileDeclaresTask6Defaults is TestRealConfigFileLoadsAndValidates's
+// Task 6 complement — the shipped config file itself, not a synthetic one.
+func TestRealConfigFileDeclaresTask6Defaults(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "config", "m261sim.yaml"))
+	if err != nil {
+		t.Fatalf("Load(simulator/config/m261sim.yaml): %v", err)
+	}
+	if cfg.Watchdog.Mode.Value != "zero_after" {
+		t.Errorf("shipped watchdog.mode = %q, want zero_after", cfg.Watchdog.Mode.Value)
+	}
+	if cfg.Commands.AllowDangerous.Value {
+		t.Error("shipped commands.allow_dangerous = true, want false by default")
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

@@ -104,6 +104,41 @@ def parse_enum(description: str | None) -> dict[str, str] | None:
     return {code: label.strip() for code, label in items}
 
 
+def validate_range(range_value: object) -> str | None:
+    """Validate the shape of a point's `range` field (AGENT-TASK §6 item 1):
+    `null`, or `{"min": <number|null>, "max": <number|null>}` with both keys
+    present, no other keys, both bounds finite numbers when not null, at
+    least one bound non-null, and min <= max when both are given. Returns
+    None if valid, or a human-readable reason if not — never silently
+    coerces a malformed shape into something usable.
+    """
+    if range_value is None:
+        return None
+    if not isinstance(range_value, dict):
+        return f"range must be null or an object, got {type(range_value).__name__}"
+    extra = set(range_value) - {"min", "max"}
+    if extra:
+        return f"range has unknown key(s): {sorted(extra)}"
+    missing = {"min", "max"} - set(range_value)
+    if missing:
+        return f"range is missing key(s): {sorted(missing)}"
+    lo, hi = range_value["min"], range_value["max"]
+    for name, v in (("min", lo), ("max", hi)):
+        if v is None:
+            continue
+        # bool is an int subclass in Python — reject it explicitly so
+        # `{"min": true}` doesn't silently pass as 1.
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return f"range.{name} must be a number or null, got {type(v).__name__}"
+        if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+            return f"range.{name} must be finite"
+    if lo is None and hi is None:
+        return "range must have at least one non-null bound"
+    if lo is not None and hi is not None and lo > hi:
+        return f"range.min ({lo}) must be <= range.max ({hi})"
+    return None
+
+
 _SLUG_NONALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 

@@ -17,7 +17,7 @@ from pathlib import Path
 import yaml
 
 from catalog.join import JoinedPoint, JoinWarnings, join_device
-from catalog.normalize import extract_unit, parse_enum, slugify
+from catalog.normalize import extract_unit, parse_enum, slugify, validate_range
 from catalog.parsing import (
     CatalogParseError,
     DEVICE_ADDR,
@@ -143,6 +143,13 @@ def to_record(point: JoinedPoint, slug: str) -> dict:
         "description": point.description,
         "dangerous": is_dangerous,
         "readback_iec104_addr": point.readback_iec104_addr,
+        # No numeric range is present anywhere in the register map (only
+        # enum constraints, handled above) — null rather than an invented
+        # number, same "unconfirmed stays null/config" rule the map follows
+        # elsewhere. AGENT-TASK §6 item 1: the only legitimate source for a
+        # non-null range is catalog/overrides.yaml, once Stage 0 confirms
+        # one — see apply_overrides/validate_ranges below.
+        "range": None,
         "sources": point.sources,
     }
 
@@ -166,6 +173,24 @@ def apply_overrides(records: list[dict], overrides_path: Path) -> list[dict]:
     return records
 
 
+def validate_ranges(records: list[dict]) -> None:
+    """AGENT-TASK §6 item 1: a point's `range` is either null or a
+    well-formed {"min", "max"} object (catalog/normalize.validate_range) —
+    checked here, after overrides.yaml has been applied, so a malformed
+    override fails the build loudly (matching apply_overrides' own
+    unknown-point-key failure) rather than silently producing a catalog
+    Task 6's commands.Processor would choke on later. Collects every
+    failure before raising, same style as check_anchors.
+    """
+    failures = []
+    for r in records:
+        reason = validate_range(r.get("range"))
+        if reason is not None:
+            failures.append(f"{r['device']}/{r['slug']}: {reason}")
+    if failures:
+        raise CatalogParseError("invalid `range` field(s):\n  " + "\n  ".join(failures))
+
+
 def build_catalog(
     registermap_dir: Path, overrides_path: Path, warnings: JoinWarnings | None = None
 ) -> list[dict]:
@@ -187,6 +212,7 @@ def build_catalog(
     records = [to_record(p, slug_by_point_id[id(p)]) for p in points]
 
     records = apply_overrides(records, overrides_path)
+    validate_ranges(records)
     return records
 
 

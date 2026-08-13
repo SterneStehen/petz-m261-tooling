@@ -6,16 +6,40 @@
 # into the Go source — so that once Stage 0 on-site testing confirms the
 # real value, only this file changes, not the code.
 #
-# Only modbus.byte_order is declared so far (Task 4, the only subsystem
-# that consumes a §7 parameter today). The remaining §7 parameters
-# (scaling.source, watchdog.mode/timeout_s, modes.priority,
-# setpoints.apply, battery.cell_address_layout, commands.allow_dangerous)
-# belong to the tasks that actually implement the code that reads them
-# (5–7) — declaring them here first, unused, would just be dead config
-# with an invented default nobody's enforcing yet.
+# scaling.source and battery.cell_address_layout aren't declared yet —
+# they belong to tasks that don't exist yet (no code reads them). Declaring
+# them here first, unused, would just be dead config with an invented
+# default nobody's enforcing.
 
 modbus:
   byte_order:
     value: big
     allowed: [big, little, big_word_swap, little_word_swap]
+    unconfirmed: true
+
+# Task 6 item 5: EMS's actual behavior on a stale Remote-mode setpoint
+# (Set Active Power/Set Reactive Power not refreshed) isn't confirmed.
+watchdog:
+  mode:
+    value: zero_after
+    allowed: [hold, zero_after, safe_state_after]
+    unconfirmed: true
+  timeout_s:
+    value: 60
+    unconfirmed: true
+
+# Task 6 item 6: which mode wins when Remote, Demand Control, and Load
+# Tracking are simultaneously enabled isn't described by the register map.
+# A permutation of exactly these three names, highest priority first.
+modes:
+  priority:
+    value: [remote, demand_control, load_tracking]
+    unconfirmed: true
+
+# Task 6 item 7: Trip (and Clear Protection, its release) are the two
+# points the catalog flags dangerous: true (Task 1 item 8). Both are
+# rejected unless this is explicitly set true.
+commands:
+  allow_dangerous:
+    value: false
     unconfirmed: true

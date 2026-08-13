@@ -14,6 +14,18 @@ class PointKey(NamedTuple):
 
 
 @dataclass(frozen=True)
+class Range:
+    """A confirmed engineering-value business range for a setpoint —
+    AGENT-TASK §6 item 1. Absent (PointMeta.range is None) means
+    unconfirmed, not "anything goes": enum and type-representability
+    checks apply independently and unconditionally regardless of Range.
+    min/max are independently optional so a one-sided range (min only,
+    or max only) is representable."""
+    min: Optional[float]
+    max: Optional[float]
+
+
+@dataclass(frozen=True)
 class PointMeta:
     """One point's full catalog record."""
     device: str
@@ -34,6 +46,7 @@ class PointMeta:
     description: Optional[str]
     dangerous: bool
     readback_iec104_addr: Optional[int]
+    range: Optional[Range]  # None if unconfirmed (every point today)
     sources: list[str]
 
 

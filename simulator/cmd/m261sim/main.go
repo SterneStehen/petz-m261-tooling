@@ -9,6 +9,7 @@ import (
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/config"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/iec104"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/modbustcp"
@@ -28,6 +29,23 @@ func resolveByteOrder(cfg config.Config, override string) (m261points.ByteOrder,
 	}
 	order, err := cfg.ModbusByteOrder()
 	return order, cfg, err
+}
+
+// commandsConfigFrom translates the loaded, YAML-shaped config.Config into
+// commands.Config's plain resolved values — split out for the same reason
+// resolveByteOrder is: unit-testable without touching YAML or a real
+// Processor. nominalPowerKW is threaded through separately (see
+// commands.Config.NominalPowerKW's doc comment) rather than hardcoded here,
+// so it always matches whatever physics.Params main() actually built the
+// engine with.
+func commandsConfigFrom(cfg config.Config, nominalPowerKW float64) commands.Config {
+	return commands.Config{
+		WatchdogMode:    commands.WatchdogMode(cfg.Watchdog.Mode.Value),
+		WatchdogTimeout: time.Duration(cfg.Watchdog.TimeoutS.Value) * time.Second,
+		ModePriority:    cfg.Modes.Priority.Value,
+		AllowDangerous:  cfg.Commands.AllowDangerous.Value,
+		NominalPowerKW:  nominalPowerKW,
+	}
 }
 
 func main() {
@@ -59,15 +77,30 @@ func main() {
 
 	st := store.New()
 
+	// Task 6: build the commands processor before anything else touches
+	// the store — it publishes its own out-of-the-box setpoint defaults
+	// (Power On, SoC bounds, System Max Charge/Discharge Power; see
+	// Processor.publishSensibleDefaults) that the physics runner's own
+	// initial publish, below, doesn't override.
+	physicsParams := physics.DefaultParams()
+	cmdProcessor, err := commands.NewProcessor(st, clock.Real{}, commandsConfigFrom(cfg, physicsParams.NominalACPowerKW))
+	if err != nil {
+		log.Fatalf("commands: %v", err)
+	}
+	log.Printf(
+		"commands: watchdog=%s (%ds), mode priority=%v, allow_dangerous=%v",
+		cfg.Watchdog.Mode.Value, cfg.Watchdog.TimeoutS.Value, cfg.Modes.Priority.Value, cfg.Commands.AllowDangerous.Value,
+	)
+
 	// Build and publish the physics model BEFORE either protocol listener
 	// opens: a client connecting in the window before the first Tick fires
 	// (physics-step defaults to 1s but is configurable, so that window
 	// isn't always negligible) must see the configured initial SoC/
 	// voltage/online status, not the store's zero defaults.
-	engine := physics.New(physics.DefaultParams(), *initialSOC)
-	runner := physics.NewRunner(engine, st, clock.Real{})
+	engine := physics.New(physicsParams, *initialSOC)
+	runner := physics.NewRunner(engine, st, clock.Real{}, cmdProcessor)
 
-	mb := modbustcp.New(st, modbustcp.Config{Addr: *modbusAddr, ByteOrder: order})
+	mb := modbustcp.New(st, modbustcp.Config{Addr: *modbusAddr, ByteOrder: order, Commands: cmdProcessor})
 	if err := mb.Start(); err != nil {
 		log.Fatalf("modbus tcp: %v", err)
 	}
@@ -76,7 +109,7 @@ func main() {
 		mb.Addr(), cfg.Modbus.ByteOrder.Value, cfg.Modbus.ByteOrder.Unconfirmed,
 	)
 
-	iec := iec104.New(st, iec104.Config{Addr: *iecAddr})
+	iec := iec104.New(st, iec104.Config{Addr: *iecAddr, Commands: cmdProcessor})
 	if err := iec.Start(); err != nil {
 		log.Fatalf("iec104: %v", err)
 	}

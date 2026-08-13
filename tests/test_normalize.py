@@ -1,4 +1,66 @@
-from catalog.normalize import extract_unit, join_key, parse_enum, slugify
+from catalog.normalize import extract_unit, join_key, parse_enum, slugify, validate_range
+
+
+# --------------------------------------------------------------------------
+# validate_range — AGENT-TASK §6 item 1's range metadata contract
+# --------------------------------------------------------------------------
+
+
+def test_validate_range_null_is_valid():
+    assert validate_range(None) is None
+
+
+def test_validate_range_min_only_is_valid():
+    assert validate_range({"min": 0, "max": None}) is None
+
+
+def test_validate_range_max_only_is_valid():
+    assert validate_range({"min": None, "max": 100}) is None
+
+
+def test_validate_range_min_and_max_is_valid():
+    assert validate_range({"min": 0, "max": 100}) is None
+
+
+def test_validate_range_both_null_is_invalid():
+    assert validate_range({"min": None, "max": None}) is not None
+
+
+def test_validate_range_min_greater_than_max_is_invalid():
+    assert validate_range({"min": 100, "max": 0}) is not None
+
+
+def test_validate_range_not_an_object_is_invalid():
+    for bad in (5, "a string", [0, 100], True):
+        assert validate_range(bad) is not None, bad
+
+
+def test_validate_range_unknown_key_is_invalid():
+    assert validate_range({"min": 0, "max": 100, "step": 1}) is not None
+
+
+def test_validate_range_missing_key_is_invalid():
+    assert validate_range({"min": 0}) is not None
+    assert validate_range({"max": 100}) is not None
+    assert validate_range({}) is not None
+
+
+def test_validate_range_non_numeric_bound_is_invalid():
+    assert validate_range({"min": "0", "max": None}) is not None
+    assert validate_range({"min": None, "max": [1]}) is not None
+    assert validate_range({"min": True, "max": None}) is not None  # bool is an int subclass
+
+
+def test_validate_range_non_finite_bound_is_invalid():
+    assert validate_range({"min": float("nan"), "max": None}) is not None
+    assert validate_range({"min": None, "max": float("inf")}) is not None
+    assert validate_range({"min": float("-inf"), "max": None}) is not None
+
+
+def test_validate_range_equal_min_max_is_valid():
+    """A single-point range (min == max) is degenerate but well-formed —
+    not the same case as both-null, which is what's actually forbidden."""
+    assert validate_range({"min": 50, "max": 50}) is None
 
 
 def test_join_key_collapses_nbsp_and_extra_whitespace():

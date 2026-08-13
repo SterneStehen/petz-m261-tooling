@@ -107,6 +107,18 @@ def gen_models(
     lines.append("")
     lines.append("")
     lines.append("@dataclass(frozen=True)")
+    lines.append("class Range:")
+    lines.append('    """A confirmed engineering-value business range for a setpoint —')
+    lines.append('    AGENT-TASK §6 item 1. Absent (PointMeta.range is None) means')
+    lines.append('    unconfirmed, not "anything goes": enum and type-representability')
+    lines.append('    checks apply independently and unconditionally regardless of Range.')
+    lines.append('    min/max are independently optional so a one-sided range (min only,')
+    lines.append('    or max only) is representable."""')
+    lines.append("    min: Optional[float]")
+    lines.append("    max: Optional[float]")
+    lines.append("")
+    lines.append("")
+    lines.append("@dataclass(frozen=True)")
     lines.append("class PointMeta:")
     lines.append('    """One point\'s full catalog record."""')
     lines.append("    device: str")
@@ -127,6 +139,7 @@ def gen_models(
     lines.append("    description: Optional[str]")
     lines.append("    dangerous: bool")
     lines.append("    readback_iec104_addr: Optional[int]")
+    lines.append("    range: Optional[Range]  # None if unconfirmed (every point today)")
     lines.append("    sources: list[str]")
     lines.append("")
     lines.append("")
@@ -159,13 +172,24 @@ def gen_models(
     return "\n".join(lines)
 
 
+def py_range_literal(range_value: dict | None) -> str:
+    """`range_value` is None or {"min": <number|None>, "max": <number|None>}
+    (already shape-validated by catalog.normalize.validate_range)."""
+    if range_value is None:
+        return "None"
+    lo, hi = range_value["min"], range_value["max"]
+    lo_py = "None" if lo is None else repr(float(lo))
+    hi_py = "None" if hi is None else repr(float(hi))
+    return f"Range(min={lo_py}, max={hi_py})"
+
+
 def gen_points(records: list[dict]) -> str:
     lines = [
         GENERATED_BANNER_PY,
         "",
         "from __future__ import annotations",
         "",
-        "from .models import PointKey, PointMeta",
+        "from .models import PointKey, PointMeta, Range",
         "",
         f"POINTS: dict[PointKey, PointMeta] = {{",
     ]
@@ -193,6 +217,7 @@ def gen_points(records: list[dict]) -> str:
             f"description={r['description']!r}, "
             f"dangerous={r['dangerous']!r}, "
             f"readback_iec104_addr={r['readback_iec104_addr']!r}, "
+            f"range={py_range_literal(r.get('range'))}, "
             f"sources={list(r['sources'])!r}),"
         )
     lines.append("}")
@@ -209,10 +234,10 @@ truth and catalog/overrides.yaml for manual corrections.
 """
 from __future__ import annotations
 
-from .models import PointKey, PointMeta
+from .models import PointKey, PointMeta, Range
 from .points import POINTS
 
-__all__ = ["PointKey", "PointMeta", "POINTS"]
+__all__ = ["PointKey", "PointMeta", "Range", "POINTS"]
 '''
 
 

@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from catalog.build_catalog import build_points
+from catalog.normalize import validate_range
 from catalog.parsing import parse_iec104, parse_modbus, parse_tag, split_subtables
 from catalog.xlsx_reader import read_sheet_rows
 
@@ -184,6 +185,25 @@ def check_setpoint_formula(records: list[dict]) -> CheckResult:
     return CheckResult(
         "§4.3 formula for all 148 setpoints", CRITICAL, not failures,
         "148/148 hold" if not failures else f"{len(failures)} violation(s)", failures,
+    )
+
+
+def check_range_shape_valid(records: list[dict]) -> CheckResult:
+    """AGENT-TASK §6 item 1: every record's `range` is null or a well-formed
+    {"min", "max"} object. build_catalog.py already hard-fails the build on
+    this (validate_ranges, right after overrides.yaml is applied) — this is
+    the same rule re-checked against the already-written catalog file, the
+    same defense-in-depth relationship check_anchors has to build_catalog's
+    own anchor check."""
+    failures = [
+        f"{r['device']}/{r['slug']}: {reason}"
+        for r in records
+        if (reason := validate_range(r.get("range"))) is not None
+    ]
+    return CheckResult(
+        "`range` field shape (§6 item 1)", CRITICAL, not failures,
+        "all well-formed" if not failures else f"{len(failures)} malformed", failures,
+        manufacturer_question=False,
     )
 
 
@@ -516,6 +536,7 @@ def run_checks(catalog_path: Path, registermap_dir: Path) -> list[CheckResult]:
         check_control_figures(records, registermap_dir),
         check_anchors(records),
         check_setpoint_formula(records),
+        check_range_shape_valid(records),
         check_tag_count_matches_ro_count(records),
         check_formula_only_matches(registermap_dir),
         check_key_points_present(records),

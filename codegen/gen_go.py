@@ -332,6 +332,19 @@ func TestDataTypeWidth(t *testing.T) {{
 '''
 
 
+def go_range_literal(range_value: dict | None) -> str:
+    """`range_value` is None or {"min": <number|None>, "max": <number|None>}
+    (already shape-validated by catalog.normalize.validate_range before this
+    runs). "nil" for None; otherwise a &Range{...} literal with float64Ptr
+    for each non-null bound, nil for a null one."""
+    if range_value is None:
+        return "nil"
+    lo, hi = range_value["min"], range_value["max"]
+    lo_go = "nil" if lo is None else f"float64Ptr({float(lo)})"
+    hi_go = "nil" if hi is None else f"float64Ptr({float(hi)})"
+    return f"&Range{{Min: {lo_go}, Max: {hi_go}}}"
+
+
 def gen_points_go(records: list[dict]) -> str:
     lines = [GENERATED_BANNER_GO, "", "package m261points", ""]
     lines.append("// PointClass mirrors the catalog's `class` field.")
@@ -358,6 +371,18 @@ def gen_points_go(records: list[dict]) -> str:
     lines.append("\tSlug   string")
     lines.append("}")
     lines.append("")
+    lines.append("// Range is a confirmed engineering-value business range for a setpoint —")
+    lines.append("// AGENT-TASK §6 item 1. A nil *Range (catalog \"range\": null) means")
+    lines.append("// unconfirmed, not \"anything goes\": enum and type-representability")
+    lines.append("// checks apply independently and unconditionally regardless of Range.")
+    lines.append("// Min/Max are themselves *float64 (not float64) so a one-sided range")
+    lines.append("// (min only, or max only) is representable — a zero value would silently")
+    lines.append("// mean \"bounded at 0\", which is a real, meaningful bound, not \"absent\".")
+    lines.append("type Range struct {")
+    lines.append("\tMin *float64")
+    lines.append("\tMax *float64")
+    lines.append("}")
+    lines.append("")
     lines.append("// PointMeta is one point's full catalog record.")
     lines.append("type PointMeta struct {")
     lines.append("\tDevice             string")
@@ -378,6 +403,7 @@ def gen_points_go(records: list[dict]) -> str:
     lines.append("\tDescription        string // \"\" if none")
     lines.append("\tDangerous          bool")
     lines.append("\tReadbackIEC104Addr *int")
+    lines.append("\tRange              *Range // nil if unconfirmed (every point today)")
     lines.append("\tSources            []string")
     lines.append("}")
     lines.append("")
@@ -396,6 +422,7 @@ def gen_points_go(records: list[dict]) -> str:
             items = ", ".join(f"{int(k)}: {go_string(v)}" for k, v in r["enum"].items())
             enum_go = "map[int]string{" + items + "}"
         sources = "[]string{" + ", ".join(go_string(s) for s in r["sources"]) + "}"
+        range_go = go_range_literal(r.get("range"))
         lines.append(
             f"\tPointKey{key}: {{"
             f"Device: {go_string(r['device'])}, "
@@ -416,12 +443,14 @@ def gen_points_go(records: list[dict]) -> str:
             f"Description: {go_string(r['description'])}, "
             f"Dangerous: {'true' if r['dangerous'] else 'false'}, "
             f"ReadbackIEC104Addr: {readback}, "
+            f"Range: {range_go}, "
             f"Sources: {sources}"
             f"}},"
         )
     lines.append("}")
     lines.append("")
     lines.append("func intPtr(v int) *int { return &v }")
+    lines.append("func float64Ptr(v float64) *float64 { return &v }")
     lines.append("")
     return "\n".join(lines)
 
