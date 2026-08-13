@@ -47,20 +47,31 @@ func buildRegisterSlots() map[regSlotKey]registerSlot {
 	return slots
 }
 
+// encodeRegisterPair and decodeRegisterPair apply scale identically for
+// F32 and non-F32 points — raw = engineering / scale on encode,
+// engineering = raw * scale on decode — only the wire width/format
+// differs (native float32 vs. an I16 catalog value widened to a 4-byte
+// I32 slot, §2.2). Every point in the real catalog has scale=1 today, so
+// this was previously indistinguishable from applying no scale at all
+// for F32 specifically — a real gap once a non-1 F32 scale exists (via
+// catalog/overrides.yaml, §7 scaling.source), since commands.Processor's
+// own validateValue already computes raw = value/scale for F32 too, and
+// this function silently skipping that division for F32 would mean
+// Modbus reads/writes stop agreeing with what Processor validated.
 func encodeRegisterPair(value float64, meta m261points.PointMeta, order m261points.ByteOrder) []byte {
-	if meta.DataType == m261points.DataTypeF32 {
-		return m261points.EncodeF32(float32(value), order)
-	}
 	raw := value
 	if meta.Scale != 0 {
 		raw = value / meta.Scale
+	}
+	if meta.DataType == m261points.DataTypeF32 {
+		return m261points.EncodeF32(float32(raw), order)
 	}
 	return m261points.EncodeI32(int32(math.Round(raw)), order)
 }
 
 func decodeRegisterPair(b []byte, meta m261points.PointMeta, order m261points.ByteOrder) float64 {
 	if meta.DataType == m261points.DataTypeF32 {
-		return float64(m261points.DecodeF32(b, order))
+		return float64(m261points.DecodeF32(b, order)) * meta.Scale
 	}
 	return float64(m261points.DecodeI32(b, order)) * meta.Scale
 }

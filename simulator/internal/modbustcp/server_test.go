@@ -172,6 +172,52 @@ func TestWriteSingleRegisterIsReadModifyWrite(t *testing.T) {
 	}
 }
 
+// TestF32ScaleAppliedOnReadAndWrite is the review-required proof that
+// Modbus applies scale to F32 points exactly the same way it already
+// does for I16-native ones (encode: raw = engineering/scale; decode:
+// engineering = raw*scale) — every real F32 point in the catalog has
+// scale=1 today, which made the F32 path indistinguishable from applying
+// no scale at all until this was fixed. m261points.Points is a shared,
+// exported package-level map; EMS/Set Active Power's Scale is temporarily
+// overwritten for this test only and restored on cleanup — never
+// touching the real generated catalog — since no real point can exercise
+// a non-1 F32 scale on its own.
+func TestF32ScaleAppliedOnReadAndWrite(t *testing.T) {
+	key := m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}
+	original := m261points.Points[key]
+	modified := original
+	modified.Scale = 10
+	m261points.Points[key] = modified
+	t.Cleanup(func() { m261points.Points[key] = original })
+
+	st := store.New()
+	_, addr := startServer(t, st, m261points.BigEndian)
+	client := newClient(t, addr, emsUnit)
+
+	// Write raw=42.5 over the wire (wire address = doc 40153 - 40001 =
+	// 152) — decodeRegisterPair must apply engineering = raw*scale.
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, math.Float32bits(42.5))
+	if _, err := client.WriteMultipleRegisters(152, 2, buf); err != nil {
+		t.Fatalf("WriteMultipleRegisters: %v", err)
+	}
+	if got, ok := st.Get(key); !ok || got != 425 {
+		t.Errorf("stored engineering value = %v, %v; want 425, true (raw 42.5 * scale 10)", got, ok)
+	}
+
+	// The other direction: set the store to a known engineering value
+	// directly, confirm the register read back is raw = engineering /
+	// scale, not the engineering value's own float32 bits.
+	st.Set(key, 425)
+	regs, err := client.ReadHoldingRegisters(152, 2)
+	if err != nil {
+		t.Fatalf("ReadHoldingRegisters: %v", err)
+	}
+	if got := math.Float32frombits(binary.BigEndian.Uint32(regs)); got != 42.5 {
+		t.Errorf("register read back = %v, want 42.5 (engineering 425 / scale 10)", got)
+	}
+}
+
 // --- Task 4 acceptance: all four byte order variants ---
 
 func TestAllFourByteOrders(t *testing.T) {

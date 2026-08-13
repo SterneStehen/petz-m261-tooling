@@ -131,16 +131,23 @@ func (p *Processor) Validate(key m261points.PointKey, value float64) error {
 // widened 32-bit wire slot (§2.2: an I16 catalog point still occupies a
 // 2-register/I32-shaped slot on the wire; that widening doesn't expand the
 // logical I16 domain the catalog actually declares). No clamping, no
-// wrapping, no silent rounding: raw for I16 must be an exact integer, not
-// merely "close enough to round" — and that includes I16 enum-backed
-// points (e.g. Set Operating Mode): 1.4 is rejected outright, never
-// silently treated as enum value 1.
+// wrapping, no silent rounding of a genuinely fractional engineering
+// value: 1.4 at scale=1 is rejected outright, never silently treated as
+// enum value 1 or truncated to 1. Integrality is checked with a small
+// tolerance rather than exact equality (see integralityDelta) — a
+// decimal, non-power-of-two scale like 0.1 makes raw = value/scale land a
+// few ULPs off the true integer even when the mathematical quotient is
+// exact (3276.7/0.1 evaluates to 32766.999999999996 in float64, not
+// 32767.0) — exact equality would reject that valid boundary. The
+// tolerance is tight enough that any actually-fractional value (0.4 away
+// from the nearest integer, not 1e-12) still fails it.
 //
 // Enum: only for points the catalog actually gives an Enum for (25 of
 // 148). A point without one isn't checked against a list that doesn't
 // exist. Membership is checked against raw (post-representability-check,
-// so already confirmed an exact integer) — never math.Round(value), which
-// would accept e.g. 1.4 as if it were 1.
+// so already confirmed within tolerance of an integer, then snapped to
+// it) — never math.Round(value), which would accept e.g. 1.4 as if it
+// were 1 regardless of scale.
 //
 // Business range: meta.Range, when the catalog actually has one (every
 // point today has none — see AGENT-TASK §6 item 1). Compared against
@@ -166,9 +173,11 @@ func validateValue(meta m261points.PointMeta, value float64) error {
 
 	switch meta.DataType {
 	case m261points.DataTypeI16:
-		if raw != math.Trunc(raw) {
+		rounded, ok := snapToIntegerWithinTolerance(raw)
+		if !ok {
 			return fmt.Errorf("raw value %v is not an integer (I16 does not round fractional values, it rejects them)", raw)
 		}
+		raw = rounded
 		if raw < -32768 || raw > 32767 {
 			return fmt.Errorf("raw value %v is outside the I16 domain [-32768, 32767]", raw)
 		}
@@ -179,14 +188,17 @@ func validateValue(meta m261points.PointMeta, value float64) error {
 	}
 
 	if meta.Enum != nil {
-		// raw's integrality is already confirmed for I16 above; enforced
-		// again here (redundantly, for I16, but not for a hypothetical
-		// non-I16 enum point — none exist in the catalog today, but
-		// nothing in the schema forbids one) so enum membership itself
-		// never rounds.
-		if raw != math.Trunc(raw) {
+		// raw is already snapped to an exact integer for I16 above
+		// (every real enum-bearing point is I16 today); the same
+		// tolerant snap is applied again here for a hypothetical non-I16
+		// enum point — none exist in the catalog today, but nothing in
+		// the schema forbids one — so enum membership never rounds a
+		// genuinely fractional value.
+		rounded, ok := snapToIntegerWithinTolerance(raw)
+		if !ok {
 			return fmt.Errorf("raw value %v is not an integer, so it cannot match an enum key (no rounding)", raw)
 		}
+		raw = rounded
 		if _, ok := meta.Enum[int(raw)]; !ok {
 			return fmt.Errorf("%v is not one of the allowed enum values %v", value, meta.Enum)
 		}
@@ -516,4 +528,31 @@ func (p *Processor) get(slug string) float64 {
 
 func (p *Processor) getInt(slug string) int {
 	return int(math.Round(p.get(slug)))
+}
+
+// integralityRelativeTolerance bounds how far raw = engineering_value /
+// scale may sit from the nearest integer and still be treated as exactly
+// that integer, as a fraction of raw's own magnitude (floored at 1, so
+// the tolerance near zero doesn't collapse to zero itself). A single
+// float64 division introduces error on the order of one ULP relative to
+// the result (~2.22e-16); 1e-9 is about seven orders of magnitude more
+// generous than that — comfortably absorbing the rounding noise a
+// decimal, non-power-of-two scale like 0.1 introduces (3276.7/0.1 = 32767
+// mathematically, but 32766.999999999996 in float64) — while staying
+// many orders of magnitude tighter than any engineering value with
+// genuine fractional intent (1.4 at scale=1 is 0.4 away from its nearest
+// integer, not 1e-9 of anything close to it).
+const integralityRelativeTolerance = 1e-9
+
+// snapToIntegerWithinTolerance reports whether raw is within
+// integralityRelativeTolerance of an integer and, if so, returns that
+// integer (as a float64, still to be range/domain-checked by the
+// caller) — never the caller's job to re-derive the rounding decision.
+func snapToIntegerWithinTolerance(raw float64) (rounded float64, ok bool) {
+	rounded = math.Round(raw)
+	tolerance := integralityRelativeTolerance * math.Max(1, math.Abs(raw))
+	if math.Abs(raw-rounded) > tolerance {
+		return 0, false
+	}
+	return rounded, true
 }

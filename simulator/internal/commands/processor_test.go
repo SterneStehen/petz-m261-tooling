@@ -301,6 +301,37 @@ func TestValidateNonUnitScaleBoundary(t *testing.T) {
 	}
 }
 
+// TestValidateDecimalScaleBoundary is
+// TestValidateNonUnitScaleBoundary's review-required decimal-scale
+// complement: 0.5 is an exact power of two, so raw = value/scale
+// introduces no floating-point rounding of its own — it doesn't actually
+// exercise the tolerance snapToIntegerWithinTolerance adds. 0.1 is not
+// exactly representable in binary, so 3276.7/0.1 evaluates to
+// 32766.999999999996 in float64, a few ULPs off the true 32767 even
+// though the mathematical quotient is exact — this must still be
+// accepted. A genuinely fractional neighbor (3276.75, raw≈32767.5, half
+// an integer away — nowhere near the ULP-scale tolerance) must still be
+// rejected at the very same scale, proving the tolerance doesn't
+// swallow real fractional intent just because the scale is decimal.
+func TestValidateDecimalScaleBoundary(t *testing.T) {
+	key := emsKey("adjustment_interval_seconds")
+
+	p, st, _ := newProcessor(t)
+	withTemporaryMeta(t, key, func(m *m261points.PointMeta) { m.Scale = 0.1 })
+	if err := p.Write(key, 3276.7); err != nil {
+		t.Errorf("Write(%v) with scale=0.1 (raw=32767 mathematically, 32766.999999999996 in float64) = %v, want accepted", 3276.7, err)
+	}
+	if v, _ := st.Get(key); v != 3276.7 {
+		t.Errorf("stored value = %v, want 3276.7 (engineering value, not raw)", v)
+	}
+
+	p2, _, _ := newProcessor(t)
+	withTemporaryMeta(t, key, func(m *m261points.PointMeta) { m.Scale = 0.1 })
+	if err := p2.Write(key, 3276.75); !errors.Is(err, commands.ErrInvalidValue) {
+		t.Errorf("Write(%v) with scale=0.1 (raw≈32767.5, genuinely fractional, not a rounding artifact) = %v, want ErrInvalidValue", 3276.75, err)
+	}
+}
+
 func TestValidateRangeMinOnly(t *testing.T) {
 	p, st, _ := newProcessor(t)
 	key := emsKey("anti_reverse_power_margin_kw")
