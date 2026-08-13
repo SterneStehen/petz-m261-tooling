@@ -119,12 +119,11 @@ func (p *Processor) Validate(key m261points.PointKey, value float64) error {
 }
 
 // validateValue implements Task 6 item 1's three independent checks —
-// enum, logical-type representability, and business range — none of which
-// substitutes for another.
-//
-// Enum: only for points the catalog actually gives an Enum for (25 of
-// 148). A point without one isn't checked against a list that doesn't
-// exist.
+// enum, logical-type representability, and business range. "Independent"
+// means every check that applies to a point always runs, in full, for
+// that point: an enum-bearing point still gets the finite/scale/
+// logical-type/range checks (nothing about having an Enum exempts it from
+// them), and enum membership itself is never reached via rounding.
 //
 // Representability: checked against raw = engineering_value / scale — the
 // same formula gen/go/m261points/codec.go's EncodeValue already applies —
@@ -133,7 +132,15 @@ func (p *Processor) Validate(key m261points.PointKey, value float64) error {
 // 2-register/I32-shaped slot on the wire; that widening doesn't expand the
 // logical I16 domain the catalog actually declares). No clamping, no
 // wrapping, no silent rounding: raw for I16 must be an exact integer, not
-// merely "close enough to round".
+// merely "close enough to round" — and that includes I16 enum-backed
+// points (e.g. Set Operating Mode): 1.4 is rejected outright, never
+// silently treated as enum value 1.
+//
+// Enum: only for points the catalog actually gives an Enum for (25 of
+// 148). A point without one isn't checked against a list that doesn't
+// exist. Membership is checked against raw (post-representability-check,
+// so already confirmed an exact integer) — never math.Round(value), which
+// would accept e.g. 1.4 as if it were 1.
 //
 // Business range: meta.Range, when the catalog actually has one (every
 // point today has none — see AGENT-TASK §6 item 1). Compared against
@@ -145,12 +152,6 @@ func (p *Processor) Validate(key m261points.PointKey, value float64) error {
 // distinguishes "the write is rejected" from "the setpoint is clipped,
 // not executed literally", and conflating the two would fail it.
 func validateValue(meta m261points.PointMeta, value float64) error {
-	if meta.Enum != nil {
-		if _, ok := meta.Enum[int(math.Round(value))]; !ok {
-			return fmt.Errorf("%v is not one of the allowed enum values %v", value, meta.Enum)
-		}
-		return nil
-	}
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return fmt.Errorf("engineering value %v is not finite", value)
 	}
@@ -159,12 +160,12 @@ func validateValue(meta m261points.PointMeta, value float64) error {
 		return fmt.Errorf("catalog scale %v is not finite and non-zero (metadata bug, not a value the client sent)", scale)
 	}
 	raw := value / scale
+	if math.IsNaN(raw) || math.IsInf(raw, 0) {
+		return fmt.Errorf("raw value %v is not finite", raw)
+	}
 
 	switch meta.DataType {
 	case m261points.DataTypeI16:
-		if math.IsNaN(raw) || math.IsInf(raw, 0) {
-			return fmt.Errorf("raw value %v is not finite", raw)
-		}
 		if raw != math.Trunc(raw) {
 			return fmt.Errorf("raw value %v is not an integer (I16 does not round fractional values, it rejects them)", raw)
 		}
@@ -172,11 +173,22 @@ func validateValue(meta m261points.PointMeta, value float64) error {
 			return fmt.Errorf("raw value %v is outside the I16 domain [-32768, 32767]", raw)
 		}
 	case m261points.DataTypeF32:
-		if math.IsNaN(raw) || math.IsInf(raw, 0) {
-			return fmt.Errorf("raw value %v is not finite", raw)
-		}
 		if math.Abs(raw) > math.MaxFloat32 {
 			return fmt.Errorf("raw value %v overflows float32 (max %v) — ordinary float32 rounding/precision loss within range is fine, this is not that", raw, math.MaxFloat32)
+		}
+	}
+
+	if meta.Enum != nil {
+		// raw's integrality is already confirmed for I16 above; enforced
+		// again here (redundantly, for I16, but not for a hypothetical
+		// non-I16 enum point — none exist in the catalog today, but
+		// nothing in the schema forbids one) so enum membership itself
+		// never rounds.
+		if raw != math.Trunc(raw) {
+			return fmt.Errorf("raw value %v is not an integer, so it cannot match an enum key (no rounding)", raw)
+		}
+		if _, ok := meta.Enum[int(raw)]; !ok {
+			return fmt.Errorf("%v is not one of the allowed enum values %v", value, meta.Enum)
 		}
 	}
 
@@ -275,14 +287,15 @@ func (p *Processor) ResolvePower(now time.Time, bmsMaxChargeKW, bmsMaxDischargeK
 	case modeAutoStrategy:
 		activeKW, reactiveKW = p.scheduleLookup(now), 0
 	case modeRemote:
-		if p.resolvePriorityDriver() == "remote" {
-			activeKW = p.get("set_active_power_kw")
-			reactiveKW = p.get("set_reactive_power_kvar")
-		}
-		// else: Demand Control or Load Tracking outranks Remote in
-		// modes.priority and is enabled — see resolvePriorityDriver's
-		// doc comment for why that resolves to 0 rather than a computed
-		// value.
+		// resolvePriorityDriver's return value only decides which
+		// Diagnostic (if any) gets recorded — see its doc comment for why
+		// dispatch itself always falls through to Set Active Power
+		// regardless of which name wins: Demand Control/Load Tracking have
+		// zero effect on dispatched power, which means "as if the
+		// unsupported mode were absent", not "force dispatch to zero".
+		p.resolvePriorityDriver()
+		activeKW = p.get("set_active_power_kw")
+		reactiveKW = p.get("set_reactive_power_kvar")
 		activeKW, reactiveKW = p.applyWatchdog(now, activeKW, reactiveKW)
 	default:
 		// Write already rejects anything outside the documented 0/1/2
@@ -318,12 +331,13 @@ func (p *Processor) ResolvePower(now time.Time, bmsMaxChargeKW, bmsMaxDischargeK
 // such device exists anywhere in the current catalog) — inventing a
 // formula would fabricate behavior the source data doesn't contain
 // (AGENT-TASK §1 rule 1). So when either outranks "remote" in
-// modes.priority and is enabled, the caller gets 0 kW and a recorded
-// accepted_but_unsupported Diagnostic naming which mode won, rather than a
-// guessed value delivered silently; when "remote" is the winning enabled
-// driver (including when it's the only one enabled at all, the common
-// case), Set Active Power drives dispatch exactly as item 2 documents and
-// no diagnostic is recorded for this reason.
+// modes.priority and is enabled, this records an accepted_but_unsupported
+// Diagnostic naming which mode won — but per AGENT-TASK §6 item 6,
+// dispatch must behave "as if the unsupported mode were absent, not as a
+// silent forced zero": the caller (ResolvePower) always dispatches Set
+// Active Power regardless of what this function returns. The return
+// value exists only to pick which name (if any) the recorded Diagnostic
+// names as the winner — it never gates dispatch itself.
 func (p *Processor) resolvePriorityDriver() string {
 	enabled := map[string]bool{
 		"remote":         true, // this is only ever called from the modeRemote branch
@@ -462,11 +476,22 @@ func periodActive(curMinutes, start, end int) bool {
 // Reactive power isn't limited here — the register map documents no
 // reactive-power equivalent of System Maximum Charge/Discharge Power or an
 // SoC-driven reactive bound.
+//
+// chargeCapKW/dischargeCapKW are magnitudes and are floored at 0: System
+// Maximum Charge/Discharge Power is representable as negative on the wire
+// (no confirmed business range exists to reject it as out-of-range at
+// write time — see validateValue), but a "negative maximum magnitude" is
+// nonsensical, and treating it as a literal negative cap would let
+// -chargeCapKW/dischargeCapKW flip sign in the clamps below and turn a
+// charge request into discharge (or vice versa) — an accepted, merely
+// unconfirmed limit value must never reverse the requested power's
+// direction. A negative configured limit floors to 0 instead: "no power
+// allowed in this direction", the most restrictive, safe reading.
 func (p *Processor) applyPowerLimits(activeKW, socPercent, bmsMaxChargeKW, bmsMaxDischargeKW float64) float64 {
 	maxChargeSOC := p.get("maximum_charge_soc")
 	minDischargeSOC := p.get("minimum_discharge_soc")
-	chargeCapKW := math.Min(p.get("system_maximum_charge_power"), bmsMaxChargeKW)
-	dischargeCapKW := math.Min(p.get("system_maximum_discharge_power"), bmsMaxDischargeKW)
+	chargeCapKW := math.Max(0, math.Min(p.get("system_maximum_charge_power"), bmsMaxChargeKW))
+	dischargeCapKW := math.Max(0, math.Min(p.get("system_maximum_discharge_power"), bmsMaxDischargeKW))
 
 	switch {
 	case activeKW < 0: // charging (§4.5: negative = charge)

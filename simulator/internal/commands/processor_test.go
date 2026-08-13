@@ -123,6 +123,236 @@ func TestWriteRejectsNonFiniteF32(t *testing.T) {
 	}
 }
 
+// TestWriteRejectsF32AboveMaxFloat32 is distinct from
+// TestWriteRejectsNonFiniteF32: 1e40 is a perfectly finite float64 (well
+// under float64's own ~1.8e308 ceiling), but it overflows float32's
+// ~3.4e38 ceiling — casting it to float32 silently produces +Inf, which
+// EncodeF32 would then encode as a real, on-wire infinity if this weren't
+// caught first. NaN/Inf-in-float64 and finite-float64-that-overflows-
+// float32 are two different failure shapes, both required to be rejected.
+func TestWriteRejectsF32AboveMaxFloat32(t *testing.T) {
+	p, _, _ := newProcessor(t)
+	for _, v := range []float64{1e40, -1e40} {
+		if err := p.Write(emsKey("set_active_power_kw"), v); err == nil {
+			t.Errorf("Write(set_active_power_kw, %v) accepted a value finite in float64 but overflowing float32", v)
+		} else if !errors.Is(err, commands.ErrInvalidValue) {
+			t.Errorf("value %v: error = %v, want ErrInvalidValue", v, err)
+		}
+	}
+}
+
+// TestWriteRejectsFractionalI16Value is the review-required proof that a
+// non-enum I16 point rejects a fractional value outright rather than
+// rounding it — System Maximum Charge Power has no Enum, so this
+// specifically exercises the representability check's own integrality
+// rule, independent of enum membership.
+func TestWriteRejectsFractionalI16Value(t *testing.T) {
+	p, st, _ := newProcessor(t)
+	before, _ := st.Get(emsKey("system_maximum_charge_power"))
+	if err := p.Write(emsKey("system_maximum_charge_power"), 5.5); err == nil {
+		t.Error("Write(system_maximum_charge_power, 5.5) accepted a fractional I16 value")
+	} else if !errors.Is(err, commands.ErrInvalidValue) {
+		t.Errorf("error = %v, want ErrInvalidValue", err)
+	}
+	if after, _ := st.Get(emsKey("system_maximum_charge_power")); after != before {
+		t.Errorf("store changed to %v after a rejected fractional write, want unchanged %v", after, before)
+	}
+}
+
+// TestWriteI16ExactBoundaries checks underflow and overflow as separate,
+// exact cases on both sides of the valid [-32768, 32767] domain — not
+// just "some out-of-range value is rejected somewhere".
+func TestWriteI16ExactBoundaries(t *testing.T) {
+	cases := []struct {
+		value float64
+		want  bool // true = accepted
+	}{
+		{32767, true},   // max valid
+		{32768, false},  // one past max: overflow
+		{-32768, true},  // min valid
+		{-32769, false}, // one past min: underflow
+	}
+	for _, c := range cases {
+		p, _, _ := newProcessor(t)
+		err := p.Write(emsKey("system_maximum_charge_power"), c.value)
+		accepted := err == nil
+		if accepted != c.want {
+			t.Errorf("Write(system_maximum_charge_power, %v): accepted=%v, want %v (err=%v)", c.value, accepted, c.want, err)
+		}
+	}
+}
+
+// TestWriteRejectsFractionalEnumValue is the review-required fix
+// verification: Set Operating Mode = 1.4 must be rejected outright, never
+// silently accepted as enum value 1 via rounding.
+func TestWriteRejectsFractionalEnumValue(t *testing.T) {
+	p, st, _ := newProcessor(t)
+	before, _ := st.Get(emsKey("set_operating_mode"))
+	if err := p.Write(emsKey("set_operating_mode"), 1.4); err == nil {
+		t.Error("Write(set_operating_mode, 1.4) accepted a fractional value (silently rounded to enum 1)")
+	} else if !errors.Is(err, commands.ErrInvalidValue) {
+		t.Errorf("error = %v, want ErrInvalidValue", err)
+	}
+	if after, _ := st.Get(emsKey("set_operating_mode")); after != before {
+		t.Errorf("store changed to %v after a rejected fractional enum write, want unchanged %v", after, before)
+	}
+}
+
+// TestWriteRejectsNaNAndInfForEnumPoint is the review-required fix
+// verification for the early-return bug: an enum-bearing point used to
+// skip the finite check entirely (int(math.Round(NaN)) is
+// implementation-defined in Go, and could coincidentally match a real
+// enum key like 0). NaN/+Inf/-Inf must all be rejected for an enum point
+// exactly like any other.
+func TestWriteRejectsNaNAndInfForEnumPoint(t *testing.T) {
+	p, st, _ := newProcessor(t)
+	before, _ := st.Get(emsKey("set_operating_mode"))
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if err := p.Write(emsKey("set_operating_mode"), v); err == nil {
+			t.Errorf("Write(set_operating_mode, %v) accepted a non-finite value on an enum point", v)
+		} else if !errors.Is(err, commands.ErrInvalidValue) {
+			t.Errorf("value %v: error = %v, want ErrInvalidValue", v, err)
+		}
+	}
+	if after, _ := st.Get(emsKey("set_operating_mode")); after != before {
+		t.Errorf("store changed to %v after rejected non-finite writes, want unchanged %v", after, before)
+	}
+}
+
+// --- isolated metadata fixtures --------------------------------------------
+//
+// The real catalog gives every one of the 148 setpoints scale=1 and
+// range=nil — there is no real point to exercise a non-unit scale or a
+// confirmed business range against. m261points.Points is an exported
+// package-level map, so withTemporaryMeta overwrites one real point's
+// metadata for the lifetime of a single test (restored on cleanup) rather
+// than touching the generated catalog file itself — the Go-side
+// equivalent of tests/test_range_propagation.py's temporary
+// catalog/overrides.yaml fixtures on the Python side. Safe here because
+// this file never calls t.Parallel(): tests run strictly sequentially, so
+// there's no window for one test's fixture to leak into another's.
+
+func withTemporaryMeta(t *testing.T, key m261points.PointKey, mutate func(*m261points.PointMeta)) {
+	t.Helper()
+	original, ok := m261points.Points[key]
+	if !ok {
+		t.Fatalf("withTemporaryMeta: %+v is not a real catalog point", key)
+	}
+	modified := original
+	mutate(&modified)
+	m261points.Points[key] = modified
+	t.Cleanup(func() { m261points.Points[key] = original })
+}
+
+func f64(v float64) *float64 { return &v }
+
+func TestValidateRejectsZeroScale(t *testing.T) {
+	p, st, _ := newProcessor(t)
+	key := emsKey("start_charge_power_kw")
+	withTemporaryMeta(t, key, func(m *m261points.PointMeta) { m.Scale = 0 })
+
+	before, _ := st.Get(key)
+	if err := p.Write(key, 5); !errors.Is(err, commands.ErrInvalidValue) {
+		t.Errorf("Write with scale=0 = %v, want ErrInvalidValue", err)
+	}
+	if after, _ := st.Get(key); after != before {
+		t.Errorf("store changed to %v after a rejected zero-scale write, want unchanged %v", after, before)
+	}
+}
+
+func TestValidateRejectsNonFiniteScale(t *testing.T) {
+	for _, scale := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		p, _, _ := newProcessor(t)
+		key := emsKey("start_discharge_power_kw")
+		withTemporaryMeta(t, key, func(m *m261points.PointMeta) { m.Scale = scale })
+
+		if err := p.Write(key, 5); !errors.Is(err, commands.ErrInvalidValue) {
+			t.Errorf("scale=%v: Write = %v, want ErrInvalidValue", scale, err)
+		}
+	}
+}
+
+// TestValidateNonUnitScaleBoundary confirms raw = engineering_value/scale
+// is what's actually checked against the I16 domain, not
+// engineering_value directly — a fixture the real catalog (scale=1
+// everywhere) can never exercise on its own. Scale 0.5 is picked
+// deliberately: it's an exact power of two, so division by it introduces
+// no IEEE-754 rounding error (unlike, say, 0.1, which isn't exactly
+// representable in binary and would make 3276.7/0.1 land a hair off
+// 32767 for reasons that have nothing to do with the code under test).
+// engineering 16383.5 -> raw 32767 (valid, the exact I16 max);
+// engineering 16384.0 -> raw 32768 (invalid, one past it).
+func TestValidateNonUnitScaleBoundary(t *testing.T) {
+	key := emsKey("adjustment_interval_seconds")
+
+	p, st, _ := newProcessor(t)
+	withTemporaryMeta(t, key, func(m *m261points.PointMeta) { m.Scale = 0.5 })
+	if err := p.Write(key, 16383.5); err != nil {
+		t.Errorf("Write(%v) with scale=0.5 (raw=32767, exactly I16 max) = %v, want accepted", 16383.5, err)
+	}
+	if v, _ := st.Get(key); v != 16383.5 {
+		t.Errorf("stored value = %v, want 16383.5 (engineering value, not raw)", v)
+	}
+
+	p2, _, _ := newProcessor(t)
+	withTemporaryMeta(t, key, func(m *m261points.PointMeta) { m.Scale = 0.5 })
+	if err := p2.Write(key, 16384.0); !errors.Is(err, commands.ErrInvalidValue) {
+		t.Errorf("Write(%v) with scale=0.5 (raw=32768, one past I16 max) = %v, want ErrInvalidValue", 16384.0, err)
+	}
+}
+
+func TestValidateRangeMinOnly(t *testing.T) {
+	p, st, _ := newProcessor(t)
+	key := emsKey("anti_reverse_power_margin_kw")
+	withTemporaryMeta(t, key, func(m *m261points.PointMeta) { m.Range = &m261points.Range{Min: f64(10)} })
+
+	if err := p.Write(key, 9); !errors.Is(err, commands.ErrInvalidValue) {
+		t.Errorf("Write(9) below confirmed min 10 = %v, want ErrInvalidValue", err)
+	}
+	if err := p.Write(key, 10); err != nil {
+		t.Errorf("Write(10) at the confirmed min = %v, want accepted", err)
+	}
+	if err := p.Write(key, 1000); err != nil {
+		t.Errorf("Write(1000), min-only range has no upper bound, = %v, want accepted", err)
+	}
+	if v, _ := st.Get(key); v != 1000 {
+		t.Errorf("stored value = %v, want 1000", v)
+	}
+}
+
+func TestValidateRangeMaxOnly(t *testing.T) {
+	p, _, _ := newProcessor(t)
+	key := emsKey("adjustment_interval_seconds")
+	withTemporaryMeta(t, key, func(m *m261points.PointMeta) { m.Range = &m261points.Range{Max: f64(300)} })
+
+	if err := p.Write(key, 301); !errors.Is(err, commands.ErrInvalidValue) {
+		t.Errorf("Write(301) above confirmed max 300 = %v, want ErrInvalidValue", err)
+	}
+	if err := p.Write(key, 300); err != nil {
+		t.Errorf("Write(300) at the confirmed max = %v, want accepted", err)
+	}
+	if err := p.Write(key, -1000); err != nil {
+		t.Errorf("Write(-1000), max-only range has no lower bound, = %v, want accepted", err)
+	}
+}
+
+func TestValidateRangeMinAndMax(t *testing.T) {
+	p, _, _ := newProcessor(t)
+	key := emsKey("start_charge_power_kw")
+	withTemporaryMeta(t, key, func(m *m261points.PointMeta) { m.Range = &m261points.Range{Min: f64(0), Max: f64(100)} })
+
+	for _, v := range []float64{-1, 101} {
+		if err := p.Write(key, v); !errors.Is(err, commands.ErrInvalidValue) {
+			t.Errorf("Write(%v) outside [0, 100] = %v, want ErrInvalidValue", v, err)
+		}
+	}
+	for _, v := range []float64{0, 50, 100} {
+		if err := p.Write(key, v); err != nil {
+			t.Errorf("Write(%v) inside [0, 100] = %v, want accepted", v, err)
+		}
+	}
+}
+
 func TestWriteRejectsNonSetpointPoints(t *testing.T) {
 	p, _, _ := newProcessor(t)
 	cases := []m261points.PointKey{
@@ -476,6 +706,52 @@ func TestChargeLimitAppliesOnChargeSide(t *testing.T) {
 	}
 }
 
+// TestNegativeSystemMaxChargePowerBlocksRatherThanReversesCharge is the
+// review-required fix verification: System Maximum Charge Power is
+// representable as negative on the wire (no confirmed business range
+// exists to reject it as out-of-range at write time), and a negative
+// configured cap must never flip a charge request into discharge. Before
+// the fix: chargeCapKW = min(-10, 130.5) = -10, then
+// math.Max(-50, -(-10)) = math.Max(-50, 10) = +10 — a charge request
+// became a discharge result. The correct behavior is "no charging
+// allowed" (0), not sign reversal.
+func TestNegativeSystemMaxChargePowerBlocksRatherThanReversesCharge(t *testing.T) {
+	p, st, clk := newProcessor(t)
+	setMode(t, p, modeRemote)
+	st.Set(emsKey("system_maximum_charge_power"), -10)
+	if err := p.Write(emsKey("set_active_power_kw"), -50); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := p.ResolvePower(clk.Now(), 130.5, 130.5, 50, false, false)
+	if active > 0 {
+		t.Fatalf("dispatched active power = %v, a charge request must never become positive (discharge)", active)
+	}
+	if active != 0 {
+		t.Errorf("dispatched active power = %v, want 0 (a negative configured limit blocks charging, not a reversed +10)", active)
+	}
+}
+
+// TestNegativeSystemMaxDischargePowerBlocksRatherThanReversesDischarge is
+// TestNegativeSystemMaxChargePowerBlocksRatherThanReversesCharge's
+// discharge-side twin: dischargeCapKW = min(-10, 130.5) = -10, then
+// math.Min(50, -10) = -10 would turn a discharge request into a charge
+// result.
+func TestNegativeSystemMaxDischargePowerBlocksRatherThanReversesDischarge(t *testing.T) {
+	p, st, clk := newProcessor(t)
+	setMode(t, p, modeRemote)
+	st.Set(emsKey("system_maximum_discharge_power"), -10)
+	if err := p.Write(emsKey("set_active_power_kw"), 50); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := p.ResolvePower(clk.Now(), 130.5, 130.5, 50, false, false)
+	if active < 0 {
+		t.Fatalf("dispatched active power = %v, a discharge request must never become negative (charge)", active)
+	}
+	if active != 0 {
+		t.Errorf("dispatched active power = %v, want 0 (a negative configured limit blocks discharging, not a reversed -10)", active)
+	}
+}
+
 func TestMaximumChargeSOCBlocksFurtherCharging(t *testing.T) {
 	p, st, clk := newProcessor(t)
 	setMode(t, p, modeRemote)
@@ -773,8 +1049,12 @@ func TestModePriorityRemoteFirstIsUnaffectedByOtherFlags(t *testing.T) {
 
 // TestModePriorityDemandControlOutranksRemote proves modes.priority is a
 // genuine, live config parameter (§7) and not dead code: reordering it so
-// demand_control outranks remote changes dispatch even though Set Active
-// Power itself is unchanged and still valid.
+// demand_control outranks remote still records a Diagnostic naming the
+// winner, even though — per AGENT-TASK §6 item 6 — dispatch itself must
+// stay exactly as if demand_control were absent (Set Active Power, not a
+// forced 0): there is no confirmed formula to compute a power value from
+// demand_control, so the only defensible behavior is to leave dispatch
+// alone and flag the fact, not to invent a zero.
 func TestModePriorityDemandControlOutranksRemote(t *testing.T) {
 	st := store.New()
 	clk := clock.NewFake(time.Now())
@@ -792,8 +1072,8 @@ func TestModePriorityDemandControlOutranksRemote(t *testing.T) {
 		t.Fatal(err)
 	}
 	active, _ := p.ResolvePower(clk.Now(), 130.5, 130.5, 50, false, false)
-	if active != 0 {
-		t.Errorf("dispatch with demand_control outranking remote (and enabled) = %v, want 0 (no confirmed demand-control formula)", active)
+	if active != 33 {
+		t.Errorf("dispatch with demand_control outranking remote (and enabled) = %v, want 33 (unaffected — no confirmed demand-control formula, so dispatch stays as if it were absent)", active)
 	}
 
 	d, ok := p.DiagnosticFor(emsKey("demand_control"))
@@ -832,8 +1112,8 @@ func TestModePriorityLoadTrackingOutranksRemote(t *testing.T) {
 		t.Fatal(err)
 	}
 	active, _ := p.ResolvePower(clk.Now(), 130.5, 130.5, 50, false, false)
-	if active != 0 {
-		t.Errorf("dispatch with load_tracking outranking remote (and enabled) = %v, want 0", active)
+	if active != 33 {
+		t.Errorf("dispatch with load_tracking outranking remote (and enabled) = %v, want 33 (unaffected)", active)
 	}
 
 	d, ok := p.DiagnosticFor(emsKey("enable_load_tracking"))
