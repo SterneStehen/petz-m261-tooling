@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/appgate"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
@@ -56,6 +57,21 @@ type Processor struct {
 
 	diagMu      sync.Mutex
 	diagnostics map[m261points.PointKey]Diagnostic
+
+	gate *appgate.Gate // see SetGate
+}
+
+// SetGate wires the process-wide reset-atomicity gate (package appgate)
+// — Write becomes a shared (Op) operation against it once set, so a
+// controlapi.Server.doReset's exclusive section can never interleave
+// with one. nil (never calling SetGate) disables gating.
+func (p *Processor) SetGate(g *appgate.Gate) { p.gate = g }
+
+func (p *Processor) opDone() func() {
+	if p.gate == nil {
+		return func() {}
+	}
+	return p.gate.Op()
 }
 
 // NewProcessor builds a Processor and publishes the EMS setpoint defaults
@@ -240,6 +256,8 @@ func (p *Processor) Write(key m261points.PointKey, value float64) error {
 		log.Printf("commands: rejected write %s/%s = %v: %v", key.Device, key.Slug, value, err)
 		return err
 	}
+	done := p.opDone()
+	defer done()
 	p.applySideEffects(key, value)
 	p.store.Set(key, value)
 	return nil

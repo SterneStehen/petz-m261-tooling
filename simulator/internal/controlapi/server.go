@@ -3,25 +3,18 @@
 // M261 hardware at all (AGENT-TASK.md, Task 7 item 3): state
 // inspection, fault injection, link-fault control, scenario load/start/
 // stop, clock fast-forward, and reset.
-//
-// The clock/scenario endpoints (POST /clock/advance, POST /scenario/*)
-// only work when the simulator's single shared Clock is a *clock.Fake —
-// checked per-request, not assumed — because advancing or replaying
-// against clock.Real has no coherent meaning (AGENT-TASK §1.5: the
-// simulator has exactly one injectable clock, business logic never calls
-// time.Now() directly, and this package is business logic). Everything
-// else (state, faults, link, reset) works the same regardless of clock
-// mode.
 package controlapi
 
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/appgate"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/faults"
@@ -42,20 +35,27 @@ type Config struct {
 	Injector       *faults.Injector
 	Processor      *commands.Processor
 	PhysicsRunner  *physics.Runner
-	Clock          clock.Clock // shared with PhysicsRunner/Processor/protocol servers
+	Clock          clock.Clock // always a *clock.Fake — see main.go's single-clock wiring
 	StepInterval   time.Duration
 	ScenarioRunner *scenario.Runner
 	IECServer      linkfault.Target
 	ModbusServer   linkfault.Target
 	ScenariosDir   string // POST /scenario/load {"name": "<file in scenarios/>"}
 
+	// Gate is the process-wide reset-atomicity lock (package appgate) —
+	// doReset acquires it exclusively for its whole sequence; every
+	// ordinary write elsewhere (commands.Processor.Write,
+	// faults.Injector.Inject/Clear, physics.Runner.Tick/TickOnce) takes
+	// its shared side. Required — a nil Gate makes doReset's atomicity
+	// guarantee (AGENT-TASK.md, Task 7 item 7) silently vacuous.
+	Gate *appgate.Gate
+
 	// Reset support (Task 7 item 7) — StartupSnapshot is a
-	// store.Store.Snapshot() taken once, right after the simulator
-	// finished its own startup initialization; NewEngine rebuilds a fresh
-	// physics.Engine with the exact params/initial SoC/RNG seed the
-	// simulator started with. StartupInstant is the Clock value at that
-	// same moment — only meaningful (and only applied) when Clock is a
-	// *clock.Fake; ignored otherwise, since clock.Real can't be rewound.
+	// store.Store.Snapshot() taken once, before either protocol listener
+	// opens (so no client-visible write can land in it — see main.go);
+	// NewEngine rebuilds a fresh physics.Engine with the exact params/
+	// initial SoC/RNG seed the simulator started with. StartupInstant is
+	// the Clock value at that same moment.
 	StartupSnapshot map[m261points.PointKey]float64
 	NewEngine       func() *physics.Engine
 	StartupInstant  time.Time
@@ -63,24 +63,31 @@ type Config struct {
 
 // Server is the control API's HTTP server.
 type Server struct {
-	cfg Config
-	ln  net.Listener
-	hs  *http.Server
+	cfg          Config
+	validDevices map[string]bool
+	ln           net.Listener
+	hs           *http.Server
 }
 
 func New(cfg Config) *Server {
-	s := &Server{cfg: cfg}
+	s := &Server{cfg: cfg, validDevices: make(map[string]bool)}
+	for key := range m261points.Points {
+		s.validDevices[key.Device] = true
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /state", s.handleState)
-	mux.HandleFunc("POST /faults", s.handleInjectFault)
-	mux.HandleFunc("DELETE /faults/{device}/{point}", s.handleClearFault)
-	mux.HandleFunc("POST /link", s.handleSetLink)
-	mux.HandleFunc("POST /link/clear", s.handleClearLink)
-	mux.HandleFunc("POST /scenario/load", s.handleScenarioLoad)
-	mux.HandleFunc("POST /scenario/start", s.handleScenarioStart)
-	mux.HandleFunc("POST /scenario/stop", s.handleScenarioStop)
-	mux.HandleFunc("POST /clock/advance", s.handleClockAdvance)
-	mux.HandleFunc("POST /reset", s.handleReset)
+	mux.HandleFunc("/state", s.handleState)
+	mux.HandleFunc("/faults", s.handleFaults)
+	mux.HandleFunc("/faults/{device}/{point}", s.handleFaultByPath)
+	mux.HandleFunc("/link", s.handleLink)
+	mux.HandleFunc("/link/clear", s.handleLinkClear)
+	mux.HandleFunc("/scenario/load", s.handleScenarioLoad)
+	mux.HandleFunc("/scenario/start", s.handleScenarioStart)
+	mux.HandleFunc("/scenario/stop", s.handleScenarioStop)
+	mux.HandleFunc("/clock/advance", s.handleClockAdvance)
+	mux.HandleFunc("/reset", s.handleReset)
+	mux.HandleFunc("/", s.handleNotFound) // every unregistered path — a JSON 404, not net/http's plain-text default
+
 	s.hs = &http.Server{Handler: mux}
 	return s
 }
@@ -100,6 +107,10 @@ func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 
 func (s *Server) Close() error {
 	return s.hs.Close()
+}
+
+func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	writeError(w, http.StatusNotFound, "not_found", fmt.Errorf("no such endpoint: %s %s", r.Method, r.URL.Path))
 }
 
 // --- JSON helpers -----------------------------------------------------
@@ -134,8 +145,44 @@ func writeNoContent(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// requireMethod writes a JSON 405 (with an Allow header, matching
+// net/http's own convention for the automatic 405 this replaces) and
+// returns false if r wasn't sent with method want — every handler in
+// this package registers its path without a method restriction (see
+// New) specifically so it can produce this JSON shape instead of net/
+// http's plain-text default for a mismatched method on a known path.
+func requireMethod(w http.ResponseWriter, r *http.Request, want string) bool {
+	if r.Method == want {
+		return true
+	}
+	w.Header().Set("Allow", want)
+	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", fmt.Errorf("%s not allowed on %s, want %s", r.Method, r.URL.Path, want))
+	return false
+}
+
+// decodeJSON decodes exactly one JSON value from r.Body and rejects
+// anything else in the body after it (a second JSON value, or trailing
+// non-whitespace garbage) — without this, {"a":1}{"b":2} silently
+// decodes only the first object and ignores the second rather than
+// being rejected as a malformed request.
 func decodeJSON(r *http.Request, v any) error {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
-	return dec.Decode(v)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); err == nil {
+		return fmt.Errorf("body contains more than one JSON value")
+	} else if err != io.EOF {
+		return err
+	}
+	return nil
+}
+
+// knownDevice reports whether device is a real catalog device (EMS/BMS/
+// PCS/TMS/BMS_CELLS/PCS_METER) — used so a typo'd ?device= query gets a
+// clear 400 instead of silently matching nothing.
+func (s *Server) knownDevice(device string) bool {
+	return s.validDevices[device]
 }

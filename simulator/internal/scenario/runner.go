@@ -23,20 +23,33 @@ var (
 )
 
 // Runner executes a loaded Scenario deterministically (AGENT-TASK.md,
-// Task 7 item 5): the shared clock (which must be a *clock.Fake — this
-// package exists specifically for the fake-clock-controlled mode, see
-// controlapi's doc comment) is the only notion of time anywhere in this
-// file; ticks physics.Runner one stepInterval at a time on the way to
-// each step's deadline, never a bigger jump (see advanceTo); Speed from
-// the loaded Scenario's ClockSpec is not consulted anywhere in this
-// file — every run, at any declared speed, drives the identical sequence
-// of stepInterval-sized Ticks with no artificial real-time delay between
-// them, which is what makes "accelerated vs normal execution produces
-// the same final Store state" true unconditionally, by construction,
-// rather than something that has to be carefully arranged. See
-// scenarios/README.md (or the package doc comment) if a future change
-// ever wants Speed to introduce real-time pacing for a live demo — that
-// would be additive, not a change to this determinism guarantee.
+// Task 7 item 5): the shared clock (a *clock.Fake — the same one
+// physics.Runner's real-time background pacer (PacedRun) and POST
+// /clock/advance also drive, per main.go's single-clock wiring) is the
+// only notion of time anywhere in this file. Every clock advance funnels
+// through physics.Runner.TickOnce, one stepInterval-sized increment at a
+// time on the way to each step's deadline, never a bigger jump (see
+// advanceTo) — so heartbeat and every other per-tick point never skips a
+// tick regardless of how far a step's at: is from the last one.
+//
+// A running Runner suspends physics.Runner's own real-time pacing for
+// its whole duration (SuspendPacing, called once in Start, resumed when
+// the run() goroutine exits) — otherwise PacedRun's independent ticks
+// would race this file's own TickOnce calls for who advances the shared
+// clock next, breaking the deterministic step-timing guarantee below.
+//
+// Speed (the loaded Scenario's ClockSpec.Speed) genuinely paces
+// advanceTo in real wall-clock time — a real time.Sleep of
+// stepInterval/Speed before each increment, interruptible by Stop()
+// between increments — rather than being decorative: an operator running
+// a scenario live sees model time advance at Speed x real time, exactly
+// like physics.Runner.PacedRun's own speed parameter for the
+// no-scenario-loaded case. This does not threaten "accelerated vs normal
+// execution produces the same final Store state": the *sequence* of
+// stepInterval-sized dt values applied to the engine is identical
+// regardless of Speed (only how far apart in real time each one lands),
+// and the physics model's output depends only on that sequence, never on
+// wall-clock timing.
 type Runner struct {
 	mu sync.Mutex
 
@@ -47,14 +60,24 @@ type Runner struct {
 	startInstant time.Time
 	haveStart    bool
 
-	// doneCh is non-nil exactly while a run() goroutine is alive, and is
-	// closed by run() itself right before it returns. Stop (and
-	// ResetPlayback, which calls it) blocks on this channel so that "Stop
-	// returned" really means "no step is executing and no Tick is in
-	// flight", not just "we asked it to stop" — required for Task 7,
-	// item 7's reset atomicity: a caller doing Reset must be able to touch
-	// Store/Processor/physics.Runner state immediately after Stop returns
+	// doneCh is non-nil exactly while a run() goroutine is alive or has
+	// been asked to stop but hasn't confirmed exit yet, and is closed by
+	// run() itself right before it returns. Stop (and ResetPlayback,
+	// which calls it) blocks on this channel so that "Stop returned"
+	// really means "no step is executing and no Tick is in flight", not
+	// just "we asked it to stop" — required for Task 7 item 7's reset
+	// atomicity: a caller doing Reset must be able to touch Store/
+	// Processor/physics.Runner state immediately after Stop returns
 	// without a straggler goroutine still mutating any of it.
+	//
+	// Start checks this (not just running) before launching a new
+	// goroutine: reviewed gap this closes — running flips to false the
+	// instant Stop is called, before the run() goroutine has actually
+	// exited, so a second Start racing in during that window used to see
+	// running == false and launch a second concurrent run() goroutine
+	// against the same Runner state. Checking doneCh (only replaced once
+	// the previous one is confirmed closed) instead of running closes
+	// that window.
 	doneCh chan struct{}
 
 	store         *store.Store
@@ -85,16 +108,60 @@ func NewRunner(
 // Load installs s as the current scenario, cursor at the beginning.
 // Fails if a scenario is currently running — stop it first, matching
 // POST /scenario/load's documented 409-on-conflict shape one layer up.
+//
+// Before installing anything, Load dry-validates every write: and
+// fault: step against commands.Processor.Validate / faults.Injector's
+// own checks — the same checks Write/Inject would apply at execution
+// time — and rejects the whole scenario if any of them would fail
+// (AGENT-TASK.md, Task 7 item 5: malformed actions fail before
+// execution). Reviewed gap this closes: previously only structural
+// validity (known device/point, right action shape) was checked at load
+// time; a step whose *value* Processor/Injector would reject only failed
+// once the scenario reached it, after any earlier steps' writes had
+// already landed in the Store — a partial-execution outcome Task 7 item
+// 5 explicitly rules out ("reject the whole thing, don't apply it
+// partially").
 func (r *Runner) Load(s *Scenario) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.running {
+		r.mu.Unlock()
 		return ErrLoadWhileRunning
 	}
+	r.mu.Unlock()
+
+	if err := r.validateAll(s); err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.scenario = s
 	r.cursor = 0
 	r.lastErr = nil
 	r.haveStart = false
+	return nil
+}
+
+// validateAll dry-runs every write:/fault: step's value against the same
+// validation Write/Inject apply, without touching the Store or any
+// Processor/Injector internal state — expect:/link: steps aren't
+// value-checked here (expect never mutates; link's protocol/mode/
+// delay_ms enum-shape is already fully checked by Parse).
+func (r *Runner) validateAll(s *Scenario) error {
+	for i, step := range s.Steps {
+		switch {
+		case step.Write != nil:
+			key := m261points.PointKey{Device: step.Write.Device, Slug: step.Write.Point}
+			if err := r.processor.Validate(key, step.Write.Value); err != nil {
+				return fmt.Errorf("scenario: step %d: write: %w", i, err)
+			}
+		case step.Fault != nil:
+			key := m261points.PointKey{Device: step.Fault.Device, Slug: step.Fault.Point}
+			if err := r.injector.Validate(key, step.Fault.Value); err != nil {
+				return fmt.Errorf("scenario: step %d: fault: %w", i, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -137,13 +204,17 @@ func (r *Runner) Cursor() int {
 // from). A resumed Start (cursor > 0) does neither: the clock keeps
 // whatever value Stop() left it at, and step At offsets keep being
 // measured against the original clock.start, not a new one.
+//
+// Fails with ErrAlreadyRunning if a previous run's goroutine hasn't
+// confirmed its own exit yet (doneCh still open) — see doneCh's doc
+// comment for why that's a different, stricter check than "running".
 func (r *Runner) Start() error {
 	r.mu.Lock()
 	if r.scenario == nil {
 		r.mu.Unlock()
 		return ErrNoScenarioLoaded
 	}
-	if r.running {
+	if r.running || goroutineStillAlive(r.doneCh) {
 		r.mu.Unlock()
 		return ErrAlreadyRunning
 	}
@@ -159,8 +230,25 @@ func (r *Runner) Start() error {
 	r.doneCh = done
 	r.mu.Unlock()
 
-	go r.run(done)
+	resumePacing := r.physicsRunner.SuspendPacing()
+	go r.run(done, resumePacing)
 	return nil
+}
+
+// goroutineStillAlive reports whether done represents a run() goroutine
+// that hasn't confirmed its own exit — nil (never started) or an already
+// -closed channel both mean "no", matching Start's "safe to launch a new
+// one" condition.
+func goroutineStillAlive(done chan struct{}) bool {
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
 }
 
 // Stop halts execution and blocks until the run() goroutine has actually
@@ -171,11 +259,10 @@ func (r *Runner) Start() error {
 // is a no-op that returns immediately.
 func (r *Runner) Stop() {
 	r.mu.Lock()
-	running := r.running
 	done := r.doneCh
 	r.running = false
 	r.mu.Unlock()
-	if !running || done == nil {
+	if !goroutineStillAlive(done) {
 		return
 	}
 	<-done
@@ -196,7 +283,8 @@ func (r *Runner) ResetPlayback() {
 	r.mu.Unlock()
 }
 
-func (r *Runner) run(done chan struct{}) {
+func (r *Runner) run(done chan struct{}, resumePacing func()) {
+	defer resumePacing()
 	defer close(done)
 	for {
 		r.mu.Lock()
@@ -211,9 +299,10 @@ func (r *Runner) run(done chan struct{}) {
 		}
 		step := r.scenario.Steps[r.cursor]
 		startInstant := r.startInstant
+		speed := r.scenario.Clock.Speed
 		r.mu.Unlock()
 
-		if !r.advanceTo(startInstant.Add(step.At)) {
+		if !r.advanceTo(startInstant.Add(step.At), speed) {
 			return // Stop() fired while ticking toward this step's deadline
 		}
 
@@ -235,9 +324,17 @@ func (r *Runner) run(done chan struct{}) {
 // advanceTo ticks physics forward in stepInterval-sized increments
 // (never a bigger jump — see the package doc comment and
 // physics.Runner.FastForward's) until the shared clock reaches deadline,
-// checking for Stop() between every increment. Returns false if Stop()
+// checking for Stop() between every increment. Each increment is paced
+// in real wall-clock time at stepInterval/speed (see the package doc
+// comment on why this doesn't affect the resulting physics state, only
+// how long real time this takes) — sleeping happens between increments,
+// never while holding r.mu, so Stop() lands promptly rather than after
+// however long the current sleep has left. Returns false if Stop()
 // interrupted it before reaching deadline.
-func (r *Runner) advanceTo(deadline time.Time) bool {
+func (r *Runner) advanceTo(deadline time.Time, speed float64) bool {
+	if speed <= 0 {
+		speed = 1
+	}
 	for {
 		r.mu.Lock()
 		running := r.running
@@ -249,12 +346,52 @@ func (r *Runner) advanceTo(deadline time.Time) bool {
 		if !now.Before(deadline) {
 			return true
 		}
-		next := now.Add(r.stepInterval)
-		if next.After(deadline) {
-			next = deadline
+		next := r.stepInterval
+		if remaining := deadline.Sub(now); remaining < next {
+			next = remaining
 		}
-		r.clk.Set(next)
-		r.physicsRunner.Tick()
+
+		pace := time.Duration(float64(next) / speed)
+		if pace > 0 && !r.sleepInterruptible(pace) {
+			return false
+		}
+
+		if err := r.physicsRunner.TickOnce(next); err != nil {
+			// Only reachable if this Runner's clock somehow isn't the
+			// *clock.Fake it was constructed with — never in practice,
+			// but surfacing it as a failed step is more honest than a
+			// silent no-op or a panic.
+			r.mu.Lock()
+			r.lastErr = err
+			r.running = false
+			r.mu.Unlock()
+			return false
+		}
+	}
+}
+
+// sleepInterruptible sleeps up to d in small quanta, checking Running()
+// between each one, so a concurrent Stop() takes effect within about a
+// millisecond instead of only after the full pace duration elapses —
+// relevant mainly at low speed, where a single increment's real-time
+// pace can be seconds long. Returns false if Stop() fired before d
+// elapsed.
+func (r *Runner) sleepInterruptible(d time.Duration) bool {
+	const quantum = time.Millisecond
+	end := time.Now().Add(d)
+	for {
+		if !r.Running() {
+			return false
+		}
+		remaining := time.Until(end)
+		if remaining <= 0 {
+			return true
+		}
+		sleep := quantum
+		if remaining < sleep {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
 	}
 }
 

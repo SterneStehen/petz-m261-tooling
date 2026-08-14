@@ -203,14 +203,14 @@ func TestTickReadsMeterDirectionFromStoreEveryTick(t *testing.T) {
 	}
 }
 
-func TestRunCallsTickOnRealCadenceUntilStopped(t *testing.T) {
+func TestPacedRunCallsTickOnRealCadenceUntilStopped(t *testing.T) {
 	st := store.New()
-	clk := clock.Real{}
+	clk := clock.NewFake(time.Now())
 	r := NewRunner(New(DefaultParams(), 50), st, clk, newTestProcessor(t, st, clk))
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
-		r.Run(10*time.Millisecond, stop)
+		r.PacedRun(10*time.Millisecond, 1, stop)
 		close(done)
 	}()
 
@@ -219,7 +219,7 @@ func TestRunCallsTickOnRealCadenceUntilStopped(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("Run did not return after stop was closed")
+		t.Fatal("PacedRun did not return after stop was closed")
 	}
 
 	if hb := get(t, st, "EMS", "ems_periodic_heartbeat_indicator"); hb < 2 {
@@ -227,24 +227,33 @@ func TestRunCallsTickOnRealCadenceUntilStopped(t *testing.T) {
 	}
 }
 
-// TestRunDoesNotPanicOnNonPositiveInterval is the code-review-requested
-// fix for time.NewTicker's panic on a zero/negative duration — main.go
-// validates -physics-step before calling Run, but Run itself must not be
-// fragile to a caller that doesn't.
-func TestRunDoesNotPanicOnNonPositiveInterval(t *testing.T) {
-	for _, interval := range []time.Duration{0, -time.Second} {
+// TestPacedRunDoesNotPanicOnNonPositiveInterval is the code-review-
+// requested fix for time.NewTicker's panic on a zero/negative duration —
+// main.go validates -physics-step/-speed before calling PacedRun, but
+// PacedRun itself must not be fragile to a caller that doesn't.
+func TestPacedRunDoesNotPanicOnNonPositiveInterval(t *testing.T) {
+	cases := []struct {
+		interval time.Duration
+		speed    float64
+	}{
+		{0, 1},
+		{-time.Second, 1},
+		{time.Second, 0},
+		{time.Second, -1},
+	}
+	for _, c := range cases {
 		st := store.New()
-		clk := clock.Real{}
+		clk := clock.NewFake(time.Now())
 		r := NewRunner(New(DefaultParams(), 50), st, clk, newTestProcessor(t, st, clk))
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			r.Run(interval, nil) // must return immediately, not panic or hang
+			r.PacedRun(c.interval, c.speed, nil) // must return immediately, not panic or hang
 		}()
 		select {
 		case <-done:
 		case <-time.After(time.Second):
-			t.Errorf("Run(%v, nil) did not return", interval)
+			t.Errorf("PacedRun(%v, %v, nil) did not return", c.interval, c.speed)
 		}
 	}
 }

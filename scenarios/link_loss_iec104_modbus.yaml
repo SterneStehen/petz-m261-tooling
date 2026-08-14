@@ -4,7 +4,7 @@
 # failure (drop, item 2) on both protocols at once and recovery via
 # link: clear.
 name: link_loss_iec104_modbus
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 3600}
 steps:
   - at: 0s
     write: {device: EMS, point: set_operating_mode, value: 2}

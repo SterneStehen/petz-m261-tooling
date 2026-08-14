@@ -108,15 +108,25 @@ func (s *Server) acceptLoop() {
 		if err != nil {
 			return // listener closed by Close(), or a fatal accept error either way
 		}
+		// The dropped() check and the registration below must happen as
+		// one critical section under connMu — the same lock SetDrop's own
+		// close-everything-currently-registered loop takes. Checking
+		// dropped() first and registering separately (the original
+		// version) left a window: SetDrop could run its close loop
+		// between the two, missing this connection entirely because it
+		// wasn't registered yet, and leaving it to be registered and
+		// served normally right after — a connection that should have
+		// been refused instead survives drop being activated. Serializing
+		// both under connMu with SetDrop closes that window: whichever of
+		// "this registers" or "SetDrop's close loop runs" happens first,
+		// the other is guaranteed to observe it (drop already true, or
+		// the connection already in conns to be closed).
+		s.connMu.Lock()
 		if s.link.dropped() {
-			// Task 7 item 2's drop mode refuses new connections for as
-			// long as it's active, not just the ones open when it was
-			// set — close immediately, never register or hand off to
-			// handleConn.
+			s.connMu.Unlock()
 			conn.Close() //nolint:errcheck
 			continue
 		}
-		s.connMu.Lock()
 		s.conns[conn] = struct{}{}
 		s.connMu.Unlock()
 		s.wg.Add(1)

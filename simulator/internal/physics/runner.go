@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/appgate"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
@@ -34,6 +36,31 @@ type Runner struct {
 	clock    clock.Clock
 	commands *commands.Processor
 	last     time.Time
+
+	gate *appgate.Gate // see SetGate
+
+	// pacingSuspendCount > 0 means PacedRun must not tick right now —
+	// something else (a running scenario, an in-flight POST
+	// /clock/advance) already owns advancing the clock. A count, not a
+	// bool: SuspendPacing is safe to call from more than one concurrent
+	// suspender without one's Resume prematurely re-arming PacedRun while
+	// the other still needs it suspended.
+	pacingSuspendCount atomic.Int32
+}
+
+// SetGate wires the process-wide reset-atomicity gate (see package
+// appgate) — every Tick/TickOnce becomes a shared (Op) operation against
+// it once set, so a controlapi.Server.doReset's exclusive section can
+// never interleave with one. nil (the zero value, if SetGate is never
+// called) disables gating entirely — every package test that doesn't
+// care about cross-component reset atomicity keeps working unchanged.
+func (r *Runner) SetGate(g *appgate.Gate) { r.gate = g }
+
+func (r *Runner) opDone() func() {
+	if r.gate == nil {
+		return func() {}
+	}
+	return r.gate.Op()
 }
 
 // NewRunner builds a Runner and immediately publishes the engine's
@@ -61,6 +88,8 @@ func NewRunner(engine *Engine, st *store.Store, clk clock.Clock, cmds *commands.
 // against the pre-reset engine, or Reset completes first and this Tick
 // runs against the freshly reset one, never a mix of both.
 func (r *Runner) Tick() {
+	done := r.opDone()
+	defer done()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.clock.Now()
@@ -109,21 +138,67 @@ func (r *Runner) Reset(engine *Engine, now time.Time) {
 	r.writeState()
 }
 
-// Run blocks, calling Tick every stepInterval until stop is closed. This
-// is the one place allowed to run on the real wall clock (via
-// time.Ticker) even though Tick itself only ever consults the injected
-// clock — it's the outermost driving loop, not business logic, matching
-// how simulator/internal/clock.Real is meant to be used. Tests call Tick
-// directly against a fake clock instead of calling Run.
+// TickOnce advances the shared *clock.Fake by exactly d and steps the
+// engine once, as a single atomic operation (one gate.Op, one r.mu
+// critical section covering both the clock advance and the step) — the
+// one primitive every clock-advancing caller (the real-time background
+// pacer PacedRun, POST /clock/advance, and the scenario engine) funnels
+// through, so none of them can ever race each other: whichever caller's
+// TickOnce acquires r.mu first completes its whole
+// advance-then-observe-then-step before any other can begin. Reviewed
+// gap this closes: the previous version let a caller read fc.Now(),
+// compute a target, call fc.Set(target), and only then call Tick()
+// separately — three uncoordinated steps a concurrent caller could
+// interleave with.
 //
-// A non-positive stepInterval is a no-op rather than the panic
-// time.NewTicker would raise — main.go validates this upfront and fails
-// fast with a clear message before starting anything, but Run doesn't
-// assume every caller does that.
-func (r *Runner) Run(stepInterval time.Duration, stop <-chan struct{}) {
-	if stepInterval <= 0 {
+// Requires the Clock this Runner was built with to be a *clock.Fake —
+// advancing a real wall clock by a caller-chosen amount has no meaning,
+// and returns an error rather than silently doing nothing.
+func (r *Runner) TickOnce(d time.Duration) error {
+	fc, ok := r.clock.(*clock.Fake)
+	if !ok {
+		return fmt.Errorf("physics: TickOnce requires a *clock.Fake clock, got %T", r.clock)
+	}
+	if d < 0 {
+		return fmt.Errorf("physics: TickOnce d must be non-negative, got %s", d)
+	}
+	done := r.opDone()
+	defer done()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fc.Advance(d)
+	now := fc.Now()
+	dt := now.Sub(r.last)
+	r.last = now
+	if dt > 0 {
+		r.step(dt)
+	}
+	return nil
+}
+
+// PacedRun blocks, advancing the shared clock (which must be a
+// *clock.Fake — see TickOnce) by stepInterval*speed once per real
+// stepInterval of wall-clock time, until stop is closed — the
+// "live"/default-running mode: an operator watching the simulator with
+// no scenario loaded and no manual POST /clock/advance in flight sees
+// model time advance at speed x real time (speed=1 is real-time pace),
+// exactly as AGENT-TASK.md's Task 7 item 4 clock.speed field describes
+// for a scenario's own playback. Because every advance funnels through
+// the same TickOnce as POST /clock/advance and the scenario engine
+// (appgate-serialized against Reset, and mutually exclusive with them by
+// virtue of all three sharing this Runner's own r.mu), PacedRun,
+// a running scenario, and a manual advance can safely coexist in the
+// same process without corrupting the model-time sequence — whichever's
+// TickOnce call lands first for a given increment simply goes first.
+//
+// A non-positive stepInterval or speed is a no-op rather than a panic —
+// main.go validates both upfront and fails fast before starting
+// anything, but PacedRun doesn't assume every caller does that.
+func (r *Runner) PacedRun(stepInterval time.Duration, speed float64, stop <-chan struct{}) {
+	if stepInterval <= 0 || speed <= 0 {
 		return
 	}
+	advance := time.Duration(float64(stepInterval) * speed)
 	ticker := time.NewTicker(stepInterval)
 	defer ticker.Stop()
 	for {
@@ -131,8 +206,31 @@ func (r *Runner) Run(stepInterval time.Duration, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			r.Tick()
+			if r.pacingSuspended() {
+				continue // a scenario or a manual POST /clock/advance owns the clock right now
+			}
+			r.TickOnce(advance) //nolint:errcheck // this Runner's own clock is always a *clock.Fake when PacedRun is used; see main.go
 		}
+	}
+}
+
+func (r *Runner) pacingSuspended() bool { return r.pacingSuspendCount.Load() > 0 }
+
+// SuspendPacing tells PacedRun to stop ticking the shared clock on its
+// own until the returned resume function is called — used by the
+// scenario engine (for the duration of a run) and by POST
+// /clock/advance (for the duration of one request) so that whichever of
+// them is actively driving the clock doesn't have PacedRun's own
+// real-time-paced ticks interleaved with its own, which would make the
+// exact tick count/sequence either of them promises (Task 7 item 8's "no
+// gaps" requirement, or a scenario's own deterministic step timing)
+// unpredictable. Safe to call from more than one concurrent suspender —
+// see pacingSuspendCount's own doc comment.
+func (r *Runner) SuspendPacing() (resume func()) {
+	r.pacingSuspendCount.Add(1)
+	var once sync.Once
+	return func() {
+		once.Do(func() { r.pacingSuspendCount.Add(-1) })
 	}
 }
 
@@ -142,7 +240,9 @@ func (r *Runner) Run(stepInterval time.Duration, stop <-chan struct{}) {
 // jump (Task 7's scenario engine setting the clock to a scenario's
 // declared clock.start) and the very next Tick must compute a small, sane
 // dt from that new baseline instead of one spanning however long it's
-// been since the previous Tick.
+// been since the previous Tick. Only called from within
+// controlapi.Server.doReset's own exclusive gate section (see appgate) —
+// never independently gated itself, unlike TickOnce/Tick.
 func (r *Runner) Rebase(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -150,40 +250,37 @@ func (r *Runner) Rebase(now time.Time) {
 }
 
 // FastForward advances the shared clock from its current value up to
-// current+total, calling Tick once per stepInterval-sized increment
+// current+total, calling TickOnce once per stepInterval-sized increment
 // along the way (the final increment may be shorter) rather than one
 // coarse jump — Task 7 item 8: a jump big enough to silently skip
 // heartbeat increments would fail "no gaps in the model-time heartbeat
 // sequence" by construction, no matter how the caller phrases the
 // request. Used directly by the 72-hour acceptance test and by Task 7's
 // POST /clock/advance; the scenario engine (package scenario) drives its
-// own, interruptible version of the same increment-then-Tick loop instead
-// of calling this, so Stop() can take effect between increments — but
-// the increment size and the "Tick once per increment, never a bigger
-// jump" rule are identical either way.
-//
-// Requires the Clock this Runner was built with to be a *clock.Fake —
-// fast-forwarding a real wall clock has no meaning, and returns an error
-// rather than silently doing nothing.
+// own, interruptible version of the same TickOnce-per-increment loop
+// instead of calling this, so Stop() can take effect between increments
+// — but the increment size and the "TickOnce once per increment, never a
+// bigger jump" rule are identical either way.
 func (r *Runner) FastForward(total, stepInterval time.Duration) error {
-	fc, ok := r.clock.(*clock.Fake)
-	if !ok {
-		return fmt.Errorf("physics: FastForward requires a *clock.Fake clock, got %T", r.clock)
-	}
 	if total < 0 {
 		return fmt.Errorf("physics: FastForward total must be non-negative, got %s", total)
 	}
 	if stepInterval <= 0 {
 		return fmt.Errorf("physics: FastForward stepInterval must be positive, got %s", stepInterval)
 	}
+	fc, ok := r.clock.(*clock.Fake)
+	if !ok {
+		return fmt.Errorf("physics: FastForward requires a *clock.Fake clock, got %T", r.clock)
+	}
 	target := fc.Now().Add(total)
 	for fc.Now().Before(target) {
-		next := fc.Now().Add(stepInterval)
-		if next.After(target) {
-			next = target
+		next := stepInterval
+		if remaining := target.Sub(fc.Now()); remaining < next {
+			next = remaining
 		}
-		fc.Set(next)
-		r.Tick()
+		if err := r.TickOnce(next); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -8,7 +8,7 @@
 # scenario demonstrates the SoC limit stopping dispatch on its own, not
 # the watchdog timing out first for an unrelated reason.
 name: soc_violation
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 3600}
 steps:
   - at: 0s
     write: {device: EMS, point: set_operating_mode, value: 2}

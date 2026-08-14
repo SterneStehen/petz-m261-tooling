@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -44,10 +46,14 @@ type rawStep struct {
 	Link   *rawLink       `yaml:"link"`
 }
 
+// Value is a pointer, not a plain float64 — a missing value: key must be
+// a load-time rejection (AGENT-TASK.md, Task 7 item 5: malformed actions
+// fail before execution), not silently decode to the zero value and get
+// executed as if the author had written value: 0.
 type rawPointValue struct {
-	Device string  `yaml:"device"`
-	Point  string  `yaml:"point"`
-	Value  float64 `yaml:"value"`
+	Device string   `yaml:"device"`
+	Point  string   `yaml:"point"`
+	Value  *float64 `yaml:"value"`
 }
 
 type rawExpect struct {
@@ -73,6 +79,17 @@ func Parse(data []byte) (*Scenario, error) {
 	dec.KnownFields(true) // Task 7 item 5: unknown keys fail before execution
 	var raw rawScenario
 	if err := dec.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMalformed, err)
+	}
+	// A second document in the same file (a "---"-separated multi-doc
+	// YAML stream) is rejected outright rather than silently ignored —
+	// decoding only the first document and discarding the rest without
+	// telling the caller would violate the same "one scenario, fully
+	// valid or fully rejected" contract everything else in Parse follows.
+	var trailing yaml.Node
+	if err := dec.Decode(&trailing); err == nil {
+		return nil, fmt.Errorf("%w: file contains more than one YAML document", ErrMalformed)
+	} else if !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
 	if raw.Name == "" {
@@ -168,14 +185,26 @@ func parseStep(i int, rs rawStep) (Step, m261points.PointKey, bool, error) {
 		if err != nil {
 			return Step{}, m261points.PointKey{}, false, err
 		}
-		return Step{Write: &WriteAction{Device: rs.Write.Device, Point: rs.Write.Point, Value: rs.Write.Value}}, key, true, nil
+		if rs.Write.Value == nil {
+			return Step{}, m261points.PointKey{}, false, fmt.Errorf("%w: step %d: write: value is required", ErrMalformed, i)
+		}
+		if err := requireFinite(i, "write: value", *rs.Write.Value); err != nil {
+			return Step{}, m261points.PointKey{}, false, err
+		}
+		return Step{Write: &WriteAction{Device: rs.Write.Device, Point: rs.Write.Point, Value: *rs.Write.Value}}, key, true, nil
 
 	case rs.Fault != nil:
 		key, err := resolvePoint(i, "fault", rs.Fault.Device, rs.Fault.Point)
 		if err != nil {
 			return Step{}, m261points.PointKey{}, false, err
 		}
-		return Step{Fault: &FaultAction{Device: rs.Fault.Device, Point: rs.Fault.Point, Value: rs.Fault.Value}}, key, true, nil
+		if rs.Fault.Value == nil {
+			return Step{}, m261points.PointKey{}, false, fmt.Errorf("%w: step %d: fault: value is required", ErrMalformed, i)
+		}
+		if err := requireFinite(i, "fault: value", *rs.Fault.Value); err != nil {
+			return Step{}, m261points.PointKey{}, false, err
+		}
+		return Step{Fault: &FaultAction{Device: rs.Fault.Device, Point: rs.Fault.Point, Value: *rs.Fault.Value}}, key, true, nil
 
 	case rs.Expect != nil:
 		if _, err := resolvePoint(i, "expect", rs.Expect.Device, rs.Expect.Point); err != nil {
@@ -186,6 +215,18 @@ func parseStep(i int, rs rawStep) (Step, m261points.PointKey, bool, error) {
 		if hasValue == hasRange { // both false, or both true — either way, ambiguous/missing
 			return Step{}, m261points.PointKey{}, false, fmt.Errorf(
 				"%w: step %d: expect requires exactly one of value or min/max", ErrMalformed, i,
+			)
+		}
+		for name, v := range map[string]*float64{"expect: value": rs.Expect.Value, "expect: min": rs.Expect.Min, "expect: max": rs.Expect.Max} {
+			if v != nil {
+				if err := requireFinite(i, name, *v); err != nil {
+					return Step{}, m261points.PointKey{}, false, err
+				}
+			}
+		}
+		if rs.Expect.Min != nil && rs.Expect.Max != nil && *rs.Expect.Min > *rs.Expect.Max {
+			return Step{}, m261points.PointKey{}, false, fmt.Errorf(
+				"%w: step %d: expect: min (%v) > max (%v)", ErrMalformed, i, *rs.Expect.Min, *rs.Expect.Max,
 			)
 		}
 		return Step{Expect: &ExpectAction{
@@ -219,7 +260,23 @@ func parseStep(i int, rs rawStep) (Step, m261points.PointKey, bool, error) {
 	}
 }
 
+// requireFinite rejects a NaN/±Inf value at load time — YAML's .nan/.inf/
+// -.inf literals decode to real IEEE-754 NaN/Inf float64s, and every
+// value-carrying field here would otherwise reach commands.Processor.
+// Validate/faults.Injector.Validate's own finite check anyway, just
+// after Load already has to fail (validateAll), one step later than
+// necessary and with a less specific error.
+func requireFinite(i int, name string, v float64) error {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return fmt.Errorf("%w: step %d: %s: %v is not finite", ErrMalformed, i, name, v)
+	}
+	return nil
+}
+
 func resolvePoint(i int, actionName, device, point string) (m261points.PointKey, error) {
+	if device == "" || point == "" {
+		return m261points.PointKey{}, fmt.Errorf("%w: step %d: %s: device and point are both required", ErrMalformed, i, actionName)
+	}
 	key := m261points.PointKey{Device: device, Slug: point}
 	if _, ok := m261points.Points[key]; !ok {
 		return key, fmt.Errorf("%w: step %d: %s: unknown point %s/%s", ErrMalformed, i, actionName, device, point)

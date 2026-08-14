@@ -2,7 +2,7 @@
 # setpoint write sent twice must be idempotent: no error, and the store
 # ends up at the value both writes agreed on.
 name: repeat_command
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 3600}
 steps:
   - at: 0s
     write: {device: EMS, point: set_operating_mode, value: 2}

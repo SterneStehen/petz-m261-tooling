@@ -92,14 +92,17 @@ func (s *Server) acceptLoop() {
 		if err != nil {
 			return
 		}
+		// dropped() and registration must be one critical section under
+		// connMu, the same lock SetDrop's own close-loop takes — see
+		// modbustcp's identical fix (simulator/internal/modbustcp/
+		// server.go, acceptLoop) for the TOCTOU window this closes.
+		c := &clientConn{srv: s, nc: nc}
+		s.connMu.Lock()
 		if s.link.dropped() {
-			// Task 7 item 2's drop mode refuses new connections for as
-			// long as it's active — close immediately, never register.
+			s.connMu.Unlock()
 			nc.Close() //nolint:errcheck
 			continue
 		}
-		c := &clientConn{srv: s, nc: nc}
-		s.connMu.Lock()
 		s.conns[c] = struct{}{}
 		s.connMu.Unlock()
 		s.wg.Add(1)

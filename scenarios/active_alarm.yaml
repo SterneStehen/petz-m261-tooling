@@ -1,7 +1,7 @@
 # AGENT-TASK.md, Task 7 item 6: "active alarm" — injecting an alarm
 # through the fault: action (item 1) is visible in the Store immediately.
 name: active_alarm
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 3600}
 steps:
   - at: 0s
     fault: {device: EMS, point: manual_protection, value: 1}

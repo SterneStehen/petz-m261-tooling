@@ -112,7 +112,7 @@ func TestRunnerExecutesFullExampleScenario(t *testing.T) {
 	h := newHarness(t)
 	mustLoad(t, h.runner, `
 name: example
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 60}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
 steps:
   - at: 0s
     write: {device: EMS, point: set_operating_mode, value: 2}
@@ -150,28 +150,59 @@ steps:
 }
 
 // TestRunnerSameTimestampDifferentPointsExecuteInDeclarationOrder proves
-// Task 7 item 5's ordering rule directly, not just via a final-state
-// snapshot: two writes at the identical at: must apply in the order they
-// were declared.
+// Task 7 item 5's ordering rule directly, by observing the actual order
+// two Store writes land in via store.Store.Subscribe — not indirectly,
+// via a final-state check an out-of-order (or even fully reordered)
+// execution could pass just as easily: two independent writes landing in
+// either order both leave the same two points at the same final values,
+// so a test that only inspects the end state (the previous version of
+// this test) can't actually distinguish "declaration order" from "any
+// order at all".
 func TestRunnerSameTimestampDifferentPointsExecuteInDeclarationOrder(t *testing.T) {
 	h := newHarness(t)
+	changes, unsubscribe := h.store.Subscribe()
+	defer unsubscribe()
+
+	// at: 0s for both — deliberately no physics tick needed to reach
+	// either deadline (advanceTo returns immediately when the clock is
+	// already there): a real tick's own writeState publishes several
+	// hundred Store Changes (every catalog point physics touches), which
+	// would fill the Subscribe channel's small fixed buffer (64) before
+	// the two writes this test actually cares about ever got a chance to
+	// publish, and silently drop them (Store.publish is best-effort).
 	mustLoad(t, h.runner, `
 name: order
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
 steps:
-  - at: 5s
+  - at: 0s
     write: {device: EMS, point: set_operating_mode, value: 2}
-  - at: 5s
+  - at: 0s
     write: {device: EMS, point: set_active_power_kw, value: -33}
-  - at: 5s
-    expect: {device: EMS, point: set_active_power_kw, value: -33}
 `)
 	if err := h.runner.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	waitUntilStopped(t, h.runner)
 	if err := h.runner.LastError(); err != nil {
-		t.Fatalf("scenario failed (order not respected — the expect at step 2 ran before the write at step 1 landed): %v", err)
+		t.Fatalf("scenario failed: %v", err)
+	}
+
+	modeKey := m261points.PointKey{Device: "EMS", Slug: "set_operating_mode"}
+	powerKey := m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}
+	var order []m261points.PointKey
+loop:
+	for {
+		select {
+		case c := <-changes:
+			if c.Key == modeKey || c.Key == powerKey {
+				order = append(order, c.Key)
+			}
+		default:
+			break loop
+		}
+	}
+	if len(order) != 2 || order[0] != modeKey || order[1] != powerKey {
+		t.Fatalf("observed Store write order = %v, want [%v, %v] (declaration order) — a reordered or interleaved execution would fail this", order, modeKey, powerKey)
 	}
 }
 
@@ -182,7 +213,7 @@ func TestRunnerExpectFailureStopsScenario(t *testing.T) {
 	h := newHarness(t)
 	mustLoad(t, h.runner, `
 name: bad-expect
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
 steps:
   - at: 0s
     expect: {device: BMS, point: soc, value: 999}
@@ -205,48 +236,58 @@ steps:
 	}
 }
 
-// TestRunnerRejectedWriteStopsScenario mirrors the expect-failure case
-// for a write commands.Processor itself rejects (Task 6's own
-// validation, exercised through the scenario path per Task 7 item 3's
-// "no exception for the scenario path" rule).
-func TestRunnerRejectedWriteStopsScenario(t *testing.T) {
+// TestRunnerRejectsWriteAtLoadTime proves Load itself rejects a write:
+// step whose value commands.Processor.Validate would reject (Task 6's
+// own validation, dry-run through the scenario path per Task 7 item 3's
+// "no exception for the scenario path" rule) — at Load time, before
+// Start is ever called, per Task 7 item 5's "reject the whole thing,
+// don't apply it partially": an earlier version only discovered this at
+// execution time, which meant any steps *before* the bad one had already
+// landed in the Store by the time the scenario failed.
+func TestRunnerRejectsWriteAtLoadTime(t *testing.T) {
 	h := newHarness(t)
-	mustLoad(t, h.runner, `
+	s, err := scenario.Parse([]byte(`
 name: bad-write
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
 steps:
   - at: 0s
+    write: {device: EMS, point: set_active_power_kw, value: -10}
+  - at: 1s
     write: {device: EMS, point: set_operating_mode, value: 99}
-`)
-	if err := h.runner.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
 	}
-	waitUntilStopped(t, h.runner)
-	if h.runner.LastError() == nil {
-		t.Fatal("LastError() = nil, want the rejected write's error (99 is not a valid Set Operating Mode enum value)")
+	if err := h.runner.Load(s); err == nil {
+		t.Fatal("Load succeeded, want a rejection (99 is not a valid Set Operating Mode enum value)")
+	}
+	if h.runner.Loaded() != nil {
+		t.Error("Loaded() is non-nil after a rejected Load — the scenario must not be installed")
+	}
+	// The first step's value was fine on its own — proves rejection came
+	// from validating step 1, not step 0, and (since Load never even
+	// calls Start) nothing was ever written to the Store.
+	if v, _ := h.store.Get(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}); v != 0 {
+		t.Errorf("set_active_power_kw = %v after a rejected Load, want unchanged 0 — Load must not execute any step", v)
 	}
 }
 
-// TestRunnerRejectedFaultStopsScenario mirrors the same for a fault: step
+// TestRunnerRejectsFaultAtLoadTime mirrors the same for a fault: step
 // targeting a non-alarm point.
-func TestRunnerRejectedFaultStopsScenario(t *testing.T) {
+func TestRunnerRejectsFaultAtLoadTime(t *testing.T) {
 	h := newHarness(t)
-	// Parse doesn't reject this — class:alarm-ness isn't checked until
-	// execution (faults.Injector), same split as commands.Processor for
-	// write:.
-	mustLoad(t, h.runner, `
+	s, err := scenario.Parse([]byte(`
 name: bad-fault
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
 steps:
   - at: 0s
     fault: {device: EMS, point: set_active_power_kw, value: 1}
-`)
-	if err := h.runner.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
 	}
-	waitUntilStopped(t, h.runner)
-	if h.runner.LastError() == nil {
-		t.Fatal("LastError() = nil, want the rejected fault's error (set_active_power_kw is not class:alarm)")
+	if err := h.runner.Load(s); err == nil {
+		t.Fatal("Load succeeded, want a rejection (set_active_power_kw is not class:alarm)")
 	}
 }
 
@@ -258,7 +299,7 @@ func TestRunnerStopIsSynchronous(t *testing.T) {
 	h := newHarness(t)
 	mustLoad(t, h.runner, `
 name: long
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
 steps:
   - at: 1h
     write: {device: EMS, point: set_operating_mode, value: 2}
@@ -285,7 +326,7 @@ func TestRunnerStopThenStartResumes(t *testing.T) {
 	h := newHarness(t)
 	mustLoad(t, h.runner, `
 name: resume
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
 steps:
   - at: 0s
     write: {device: EMS, point: set_operating_mode, value: 2}
@@ -321,7 +362,7 @@ func TestRunnerResetPlaybackReturnsToStepZero(t *testing.T) {
 	h := newHarness(t)
 	mustLoad(t, h.runner, `
 name: resettable
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
 steps:
   - at: 0s
     write: {device: EMS, point: set_operating_mode, value: 2}
@@ -378,8 +419,8 @@ steps:
 		return h.store.Snapshot()
 	}
 
-	slow := run(1)
-	fast := run(60)
+	slow := run(100000)
+	fast := run(1000000)
 
 	if len(slow) != len(fast) {
 		t.Fatalf("snapshot sizes differ: %d vs %d", len(slow), len(fast))

@@ -1,18 +1,20 @@
 # AGENT-TASK.md, Task 7 item 6/8: minimum 72 hours of continuous
 # monitoring without gaps. This scenario itself doesn't assert "no gaps"
 # directly (that's Test72HourNoGapsInHeartbeat, simulator/cmd/m261sim,
-# which checks the exact heartbeat count against the configured physics
-# step) — it demonstrates the operational shape: nothing else happening,
-# the simulator simply stays up and reporting for 72 simulated hours.
+# which checks the full per-tick heartbeat sequence, not just the
+# endpoints) — it demonstrates the operational shape: nothing else
+# happening, the simulator simply stays up and reporting for 72 simulated
+# hours.
 #
-# Runs on the simulator's fake clock with no real sleep either way (item
-# 8), but the number of physics ticks needed to reach 72h scales with
-# whatever -physics-step the simulator was started with — run this one
-# with a coarse step (e.g. -physics-step 5m) in CI to keep it fast; a
-# coarser step doesn't change what's being proven, only how many Tick
-# calls it takes to get there.
+# speed: 360000 (1 real second = 100 model hours) is a CI-appropriate
+# acceleration, not a claim about what a live operator would use — the
+# scenario engine paces real time at stepInterval/speed per tick
+# (simulator/internal/scenario's own doc comment), so this scenario
+# completes in single-digit real seconds instead of a real 72 hours. A
+# live dashboard would load this with a smaller speed (or 1, for
+# real-time) to actually watch it.
 name: 72_hour_monitoring
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 360000}
 steps:
   - at: 0s
     expect: {device: EMS, point: online_status, value: 1}

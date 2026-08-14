@@ -6,11 +6,11 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/appgate"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/config"
@@ -54,22 +54,6 @@ func commandsConfigFrom(cfg config.Config, nominalPowerKW float64) commands.Conf
 	}
 }
 
-// resolveClock builds the simulator's single shared Clock (AGENT-TASK
-// §1.5) per -clock, plus the *clock.Fake instance Task 7's scenario
-// engine is constructed with either way (see main's own comment on why
-// that's always safe to build, even in real mode).
-func resolveClock(mode string, startupInstant time.Time) (clock.Clock, *clock.Fake, error) {
-	fake := clock.NewFake(startupInstant)
-	switch mode {
-	case "real":
-		return clock.Real{}, fake, nil
-	case "fake":
-		return fake, fake, nil
-	default:
-		return nil, nil, fmt.Errorf("-clock must be real or fake, got %q", mode)
-	}
-}
-
 func main() {
 	modbusAddr := flag.String("modbus-addr", ":502", "Modbus TCP listen address")
 	iecAddr := flag.String("iec104-addr", ":2404", "IEC-104 listen address")
@@ -81,11 +65,10 @@ func main() {
 	)
 	initialSOC := flag.Float64("initial-soc", 50, "starting battery SoC, percent (0-100)")
 	stepInterval := flag.Duration("physics-step", time.Second, "physics model tick interval (AGENT-TASK §5: 1s default, configurable)")
-	clockMode := flag.String(
-		"clock", "real",
-		"simulator clock: real (production; physics ticks on a real-time ticker) or "+
-			"fake (required for Task 7's POST /clock/advance and scenario playback -- physics only "+
-			"advances when explicitly driven through the control API)",
+	speed := flag.Float64(
+		"speed", 1.0,
+		"live pacing rate for the simulator's single model clock: model-seconds per real second when "+
+			"no scenario is loaded and no POST /clock/advance is in flight (1.0 = real-time)",
 	)
 	scenariosDir := flag.String("scenarios-dir", "scenarios", "directory POST /scenario/load's {\"name\": ...} form reads scenario files from")
 	flag.Parse()
@@ -99,17 +82,36 @@ func main() {
 		log.Fatal(err)
 	}
 	if *stepInterval <= 0 {
-		// time.NewTicker panics on a non-positive duration; fail with a
-		// clear message before anything is listening, rather than crash
-		// the process the first time the physics runner starts.
+		// PacedRun/time.NewTicker treat a non-positive interval as a
+		// silent no-op rather than a panic; fail fast here instead, with
+		// a clear message before anything is listening.
 		log.Fatalf("-physics-step must be positive, got %s", *stepInterval)
 	}
-
-	startupInstant := time.Now()
-	sharedClock, fakeClk, err := resolveClock(*clockMode, startupInstant)
-	if err != nil {
-		log.Fatal(err)
+	if *speed <= 0 {
+		log.Fatalf("-speed must be positive, got %v", *speed)
 	}
+
+	// The simulator has exactly one model clock (AGENT-TASK §1.5),
+	// always a *clock.Fake — never clock.Real directly wired into
+	// physics/commands/scenario. Task 7's POST /clock/advance and
+	// scenario playback need a controllable clock to exist at all times,
+	// not only in some special startup mode (a real gap in an earlier
+	// version: a "-clock=real" default made every scenario/clock-advance
+	// endpoint permanently 409 unless the operator remembered to pass
+	// "-clock=fake"). physics.Runner.PacedRun (below) is what makes this
+	// clock behave like ordinary wall-clock time by default: it advances
+	// the fake clock at -speed model-seconds per real second, on its own,
+	// whenever nothing else (a running scenario, an in-flight POST
+	// /clock/advance) has claimed it via SuspendPacing.
+	startupInstant := time.Now()
+	sharedClock := clock.NewFake(startupInstant)
+
+	// gate is the process-wide reset-atomicity lock (package appgate):
+	// commands.Processor.Write, faults.Injector.Inject/Clear, and
+	// physics.Runner.Tick/TickOnce all take its shared side; POST /reset
+	// takes the exclusive side for its whole sequence. See
+	// controlapi.Server.doReset's doc comment for the gap this closes.
+	gate := appgate.New()
 
 	st := store.New()
 
@@ -123,17 +125,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("commands: %v", err)
 	}
+	cmdProcessor.SetGate(gate)
 	log.Printf(
 		"commands: watchdog=%s (%ds), mode priority=%v, allow_dangerous=%v",
 		cfg.Watchdog.Mode.Value, cfg.Watchdog.TimeoutS.Value, cfg.Modes.Priority.Value, cfg.Commands.AllowDangerous.Value,
 	)
 
-	// Build and publish the physics model BEFORE either protocol listener
-	// opens: a client connecting in the window before the first Tick fires
-	// (physics-step defaults to 1s but is configurable, so that window
-	// isn't always negligible) must see the configured initial SoC/
-	// voltage/online status, not the store's zero defaults.
-	//
 	// newEngine rebuilds an Engine identical to the one built here — same
 	// params, same initial SoC, and (since RNGSeed lives in physicsParams)
 	// the same RNG seed — for Task 7's POST /reset (AGENT-TASK.md, Task 7
@@ -141,6 +138,22 @@ func main() {
 	// process start would, not just some valid one).
 	newEngine := func() *physics.Engine { return physics.New(physicsParams, *initialSOC) }
 	runner := physics.NewRunner(newEngine(), st, sharedClock, cmdProcessor)
+	runner.SetGate(gate)
+
+	injector := faults.NewInjector(st)
+	injector.SetGate(gate)
+
+	// StartupSnapshot is captured now — after the commands processor's
+	// sensible defaults and physics.NewRunner's own initial writeState
+	// have already published everything they're going to at startup, but
+	// *before* either protocol listener opens below — so POST /reset
+	// (controlapi) has an exact, literal record of "the state right after
+	// process start" to restore. Reviewed gap this closes: capturing the
+	// snapshot after the listeners were already open meant a client that
+	// connected and wrote something in the window before the first
+	// request to /reset would have that write baked into the reset
+	// baseline itself.
+	startupSnapshot := st.Snapshot()
 
 	mb := modbustcp.New(st, modbustcp.Config{Addr: *modbusAddr, ByteOrder: order, Commands: cmdProcessor})
 	if err := mb.Start(); err != nil {
@@ -157,18 +170,8 @@ func main() {
 	}
 	log.Printf("iec104 listening on %s", iec.Addr())
 
-	// Task 7: fault injection, scenario engine, control API.
-	injector := faults.NewInjector(st)
-	scenarioRunner := scenario.NewRunner(st, injector, cmdProcessor, runner, fakeClk, *stepInterval, iec, mb)
-
-	// StartupSnapshot is captured only now — after both the commands
-	// processor's sensible defaults and physics.NewRunner's own initial
-	// writeState have already published everything they're going to at
-	// startup — so POST /reset (controlapi) has an exact, literal record
-	// of "the state right after process start" to restore, rather than
-	// re-deriving defaults through logic a future change could drift out
-	// of sync with (AGENT-TASK.md, Task 7 item 7).
-	startupSnapshot := st.Snapshot()
+	// Task 7: scenario engine and control API.
+	scenarioRunner := scenario.NewRunner(st, injector, cmdProcessor, runner, sharedClock, *stepInterval, iec, mb)
 
 	capi := controlapi.New(controlapi.Config{
 		Addr:            *controlAddr,
@@ -182,6 +185,7 @@ func main() {
 		IECServer:       iec,
 		ModbusServer:    mb,
 		ScenariosDir:    *scenariosDir,
+		Gate:            gate,
 		StartupSnapshot: startupSnapshot,
 		NewEngine:       newEngine,
 		StartupInstant:  startupInstant,
@@ -189,17 +193,14 @@ func main() {
 	if err := capi.Start(); err != nil {
 		log.Fatalf("control api: %v", err)
 	}
-	log.Printf("control api listening on %s (clock=%s)", capi.Addr(), *clockMode)
+	log.Printf("control api listening on %s", capi.Addr())
 
-	if *clockMode == "real" {
-		go runner.Run(*stepInterval, nil)
-		log.Printf("physics model running at a %s step (real clock), starting SoC %.1f%%", *stepInterval, *initialSOC)
-	} else {
-		log.Printf(
-			"physics model using a fake clock, starting SoC %.1f%% -- advances only via POST /clock/advance or a running scenario",
-			*initialSOC,
-		)
-	}
+	go runner.PacedRun(*stepInterval, *speed, nil)
+	log.Printf(
+		"physics model running at a %s step, speed=%vx, starting SoC %.1f%% -- POST /clock/advance and scenarios "+
+			"available at any time (suspends live pacing for their own duration)",
+		*stepInterval, *speed, *initialSOC,
+	)
 
-	select {} // servers, the physics runner (real-clock mode), and the control API run in background goroutines; block forever
+	select {} // servers, the physics runner, and the control API run in background goroutines; block forever
 }

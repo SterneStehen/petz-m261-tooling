@@ -7,7 +7,7 @@
 # real restart to confirm the simulator came back up correctly: EMS
 # stays online and the heartbeat keeps advancing across an idle period.
 name: restart
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 3600}
 steps:
   - at: 0s
     expect: {device: EMS, point: online_status, value: 1}

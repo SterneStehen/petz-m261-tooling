@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/appgate"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/controlapi"
@@ -47,38 +49,28 @@ type harness struct {
 	iec, mb        *fakeLinkTarget
 	server         *controlapi.Server
 	baseURL        string
+	startupInstant time.Time
 }
 
-// newHarness builds a controlapi.Server with a *clock.Fake — the mode
-// most of this package's endpoints need (POST /clock/advance, scenario
-// playback). newHarnessRealClock (below) covers the clock_not_fake path.
+// newHarness builds a controlapi.Server exactly as main.go wires one —
+// a single *clock.Fake, every component sharing one appgate.Gate.
 func newHarness(t *testing.T) *harness {
-	t.Helper()
-	return newHarnessWithClock(t, true)
-}
-
-func newHarnessRealClock(t *testing.T) *harness {
-	t.Helper()
-	return newHarnessWithClock(t, false)
-}
-
-func newHarnessWithClock(t *testing.T, fake bool) *harness {
 	t.Helper()
 	st := store.New()
 	startupInstant := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
 	fc := clock.NewFake(startupInstant)
-	var clk clock.Clock = fc
-	if !fake {
-		clk = clock.Real{}
-	}
+	gate := appgate.New()
 
-	proc, err := commands.NewProcessor(st, clk, commands.DefaultConfig())
+	proc, err := commands.NewProcessor(st, fc, commands.DefaultConfig())
 	if err != nil {
 		t.Fatalf("commands.NewProcessor: %v", err)
 	}
+	proc.SetGate(gate)
 	newEngine := func() *physics.Engine { return physics.New(physics.DefaultParams(), 50) }
-	pr := physics.NewRunner(newEngine(), st, clk, proc)
+	pr := physics.NewRunner(newEngine(), st, fc, proc)
+	pr.SetGate(gate)
 	inj := faults.NewInjector(st)
+	inj.SetGate(gate)
 	iec, mb := &fakeLinkTarget{}, &fakeLinkTarget{}
 	sr := scenario.NewRunner(st, inj, proc, pr, fc, time.Minute, iec, mb)
 
@@ -90,12 +82,13 @@ func newHarnessWithClock(t *testing.T, fake bool) *harness {
 		Injector:        inj,
 		Processor:       proc,
 		PhysicsRunner:   pr,
-		Clock:           clk,
+		Clock:           fc,
 		StepInterval:    time.Minute,
 		ScenarioRunner:  sr,
 		IECServer:       iec,
 		ModbusServer:    mb,
 		ScenariosDir:    "",
+		Gate:            gate,
 		StartupSnapshot: startupSnapshot,
 		NewEngine:       newEngine,
 		StartupInstant:  startupInstant,
@@ -106,7 +99,7 @@ func newHarnessWithClock(t *testing.T, fake bool) *harness {
 	t.Cleanup(func() { srv.Close() })
 	return &harness{
 		store: st, injector: inj, processor: proc, physicsRunner: pr, clk: fc, scenarioRunner: sr,
-		iec: iec, mb: mb, server: srv, baseURL: "http://" + srv.Addr().String(),
+		iec: iec, mb: mb, server: srv, baseURL: "http://" + srv.Addr().String(), startupInstant: startupInstant,
 	}
 }
 
@@ -160,6 +153,48 @@ func decodeError(t *testing.T, body []byte) apiError {
 	return e
 }
 
+// --- routing/method/JSON contract ------------------------------------------
+
+func TestUnknownRouteIsJSON404(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do(t, "GET", "/nope", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body = %s", resp.StatusCode, body)
+	}
+	if e := decodeError(t, body); e.Error.Code != "not_found" {
+		t.Errorf("error.code = %q, want not_found (body: %s)", e.Error.Code, body)
+	}
+}
+
+func TestWrongMethodIsJSON405(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do(t, "POST", "/state", nil)
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405, body = %s", resp.StatusCode, body)
+	}
+	if e := decodeError(t, body); e.Error.Code != "method_not_allowed" {
+		t.Errorf("error.code = %q, want method_not_allowed (body: %s)", e.Error.Code, body)
+	}
+	if got := resp.Header.Get("Allow"); got != "GET" {
+		t.Errorf("Allow header = %q, want GET", got)
+	}
+}
+
+func TestTrailingJSONDataRejected(t *testing.T) {
+	h := newHarness(t)
+	req, _ := http.NewRequest("POST", h.baseURL+"/faults", bytes.NewReader(
+		[]byte(`{"device":"BMS","point":"cell_temperature_too_high","value":1}{"device":"BMS","point":"cell_temperature_too_high","value":0}`),
+	))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (a second JSON value in the body must be rejected, not silently ignored)", resp.StatusCode)
+	}
+}
+
 // --- GET /state -------------------------------------------------------
 
 func TestState(t *testing.T) {
@@ -201,6 +236,17 @@ func TestStateFiltersByDevice(t *testing.T) {
 	}
 	if len(got.Points) == 0 {
 		t.Error("?device=BMS returned no points")
+	}
+}
+
+func TestStateRejectsUnknownDevice(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do(t, "GET", "/state?device=NOPE", nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", resp.StatusCode, body)
+	}
+	if e := decodeError(t, body); e.Error.Code != "unknown_device" {
+		t.Errorf("error.code = %q, want unknown_device", e.Error.Code)
 	}
 }
 
@@ -249,6 +295,14 @@ func TestInjectFaultRejectsMalformedJSON(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestInjectFaultRequiresValue(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do(t, "POST", "/faults", map[string]any{"device": "BMS", "point": "cell_temperature_too_high"})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (value is missing, must not default to 0), body = %s", resp.StatusCode, body)
 	}
 }
 
@@ -305,6 +359,27 @@ func TestSetLinkRejectsBadProtocol(t *testing.T) {
 	}
 }
 
+// TestSetLinkDelayRequiresPositiveDelayMS mirrors scenario.Parse's own
+// rule for link: {mode: delay} — a control-API request for the identical
+// action must not be looser (accepting 0/negative/absent delay_ms as if
+// it meant something) than the scenario dialect.
+func TestSetLinkDelayRequiresPositiveDelayMS(t *testing.T) {
+	h := newHarness(t)
+	for _, body := range []map[string]any{
+		{"protocol": "iec104", "mode": "delay"}, // absent
+		{"protocol": "iec104", "mode": "delay", "delay_ms": 0},
+		{"protocol": "iec104", "mode": "delay", "delay_ms": -5},
+	} {
+		resp, respBody := h.do(t, "POST", "/link", body)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("delay_ms=%v: status = %d, want 400, body = %s", body["delay_ms"], resp.StatusCode, respBody)
+		}
+	}
+	if h.iec.delay != 0 {
+		t.Errorf("iec.delay = %v, want unchanged 0 — no invalid delay request should have taken effect", h.iec.delay)
+	}
+}
+
 func TestClearLink(t *testing.T) {
 	h := newHarness(t)
 	h.iec.drop, h.mb.hang = true, true
@@ -321,7 +396,7 @@ func TestClearLink(t *testing.T) {
 
 const inlineScenarioYAML = `
 name: inline-test
-clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
 steps:
   - at: 0s
     write: {device: EMS, point: set_operating_mode, value: 2}
@@ -412,15 +487,19 @@ func TestScenarioStartWithoutLoadIsConflict(t *testing.T) {
 	}
 }
 
-func TestScenarioStartRequiresFakeClock(t *testing.T) {
-	h := newHarnessRealClock(t)
+// TestScenarioStartAvailableByDefault is the fix for a reviewed
+// architectural gap: an earlier version defaulted to a clock.Real shared
+// clock, which made every scenario/clock-advance endpoint permanently
+// 409 unless an operator remembered a non-default flag. newHarness wires
+// exactly what main.go now always wires (a single *clock.Fake) — this
+// just confirms scenario start succeeds against it with no special
+// setup.
+func TestScenarioStartAvailableByDefault(t *testing.T) {
+	h := newHarness(t)
 	h.do(t, "POST", "/scenario/load", map[string]any{"yaml": inlineScenarioYAML})
 	resp, body := h.do(t, "POST", "/scenario/start", nil)
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409, body = %s", resp.StatusCode, body)
-	}
-	if e := decodeError(t, body); e.Error.Code != "clock_not_fake" {
-		t.Errorf("error.code = %q, want clock_not_fake", e.Error.Code)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204, body = %s", resp.StatusCode, body)
 	}
 }
 
@@ -450,19 +529,16 @@ func TestClockAdvance(t *testing.T) {
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
 	}
-	if got := h.clk.Now(); got.Sub(time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)) != 2*time.Minute {
+	if got := h.clk.Now(); got.Sub(h.startupInstant) != 2*time.Minute {
 		t.Errorf("clock advanced to %v, want +2m from startup", got)
 	}
 }
 
-func TestClockAdvanceRequiresFakeClock(t *testing.T) {
-	h := newHarnessRealClock(t)
+func TestClockAdvanceAvailableByDefault(t *testing.T) {
+	h := newHarness(t)
 	resp, body := h.do(t, "POST", "/clock/advance", map[string]any{"by_seconds": 1})
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409, body = %s", resp.StatusCode, body)
-	}
-	if e := decodeError(t, body); e.Error.Code != "clock_not_fake" {
-		t.Errorf("error.code = %q, want clock_not_fake", e.Error.Code)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204, body = %s", resp.StatusCode, body)
 	}
 }
 
@@ -471,6 +547,14 @@ func TestClockAdvanceRejectsNegative(t *testing.T) {
 	resp, body := h.do(t, "POST", "/clock/advance", map[string]any{"by_seconds": -1})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400, body = %s", resp.StatusCode, body)
+	}
+}
+
+func TestClockAdvanceRequiresBySeconds(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do(t, "POST", "/clock/advance", map[string]any{})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (by_seconds is missing, must not default to 0), body = %s", resp.StatusCode, body)
 	}
 }
 
@@ -492,14 +576,8 @@ func TestResetFromDirtyState(t *testing.T) {
 	h.store.Set(m261points.PointKey{Device: "BMS", Slug: "cell_temperature_too_high"}, 1)
 	// Dirty link fault state.
 	h.iec.drop = true
-	// Dirty the watchdog/latch: enter Remote, go stale under
-	// safe_state_after... simpler: just accumulate a Diagnostic via Trip
-	// with allow_dangerous off is rejected, so directly exercise via
-	// Demand Control priority winning instead (always available,
-	// DefaultConfig's ModePriority already has demand_control below
-	// remote — use Manual/Remote mode switch instead for a cheap,
-	// reliable dirty signal): write Set Operating Mode = Remote and a
-	// setpoint to arm the watchdog timer.
+	// Dirty the watchdog/latch: enter Remote and refresh a setpoint to
+	// arm the watchdog timer.
 	if err := h.processor.Write(m261points.PointKey{Device: "EMS", Slug: "set_operating_mode"}, 2); err != nil {
 		t.Fatal(err)
 	}
@@ -538,8 +616,8 @@ func TestResetFromDirtyState(t *testing.T) {
 		t.Errorf("SoC after reset = %v, want 50 (startup initial SoC)", soc)
 	}
 	// Clock: back to the startup instant.
-	if got := h.clk.Now(); !got.Equal(time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)) {
-		t.Errorf("clock after reset = %v, want the startup instant", got)
+	if got := h.clk.Now(); !got.Equal(h.startupInstant) {
+		t.Errorf("clock after reset = %v, want the startup instant %v", got, h.startupInstant)
 	}
 	// Watchdog: a fresh Remote setpoint dispatches immediately (proves
 	// the pre-reset watchdog timer/latch didn't survive).
@@ -552,6 +630,42 @@ func TestResetFromDirtyState(t *testing.T) {
 	active, _ := h.processor.ResolvePower(h.clk.Now(), 130.5, 130.5, 50, false, false)
 	if active != 40 {
 		t.Errorf("dispatch right after reset + fresh Remote setpoint = %v, want 40", active)
+	}
+}
+
+// TestResetIsAtomicAgainstConcurrentWrites stresses the reviewed gap
+// directly: many goroutines writing through commands.Processor
+// concurrently with POST /reset, run under -race so any interleaving
+// that isn't properly serialized by appgate.Gate surfaces as a detected
+// race, not just a flaky assertion. The functional check afterward
+// (dispatch behaves correctly for a fresh Remote setpoint) would fail if
+// Processor's internal state ended up torn — part reset, part not.
+func TestResetIsAtomicAgainstConcurrentWrites(t *testing.T) {
+	h := newHarness(t)
+	const n = 100
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			h.processor.Write(m261points.PointKey{Device: "EMS", Slug: "maximum_charge_soc"}, float64(50+i%50)) //nolint:errcheck
+		}(i)
+	}
+	resp, body := h.do(t, "POST", "/reset", nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	wg.Wait()
+
+	if err := h.processor.Write(m261points.PointKey{Device: "EMS", Slug: "set_operating_mode"}, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.processor.Write(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, 40); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := h.processor.ResolvePower(h.clk.Now(), 130.5, 130.5, 50, false, false)
+	if active != 40 {
+		t.Errorf("dispatch after concurrent writes racing reset = %v, want 40 (Processor state must stay internally consistent)", active)
 	}
 }
 
