@@ -11,6 +11,7 @@ import (
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/faults"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/physics"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/scenario"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
@@ -69,6 +70,7 @@ func newHarnessWithSOCAndStep(t *testing.T, initialSOC float64, stepInterval tim
 	inj := faults.NewInjector(st)
 	iec, mb := &fakeLinkTarget{}, &fakeLinkTarget{}
 	r := scenario.NewRunner(st, inj, proc, pr, clk, stepInterval, iec, mb)
+	r.SetLinkCoordinator(linkfault.NewCoordinator())
 	return &harness{store: st, injector: inj, processor: proc, physics: pr, clk: clk, iec: iec, mb: mb, runner: r}
 }
 
@@ -615,4 +617,60 @@ steps:
 		t.Fatal("concurrent Load/Start/Stop/ResetPlayback fuzzing did not finish within 30s — likely deadlocked")
 	}
 	h.runner.Stop() // leave the runner quiesced for t.Cleanup
+}
+
+// TestFailingScenarioVsConcurrentLoadNeverRaces is Significant 3's
+// regression test: run() used to set running=false and unlock r.mu
+// *before* reading r.scenario.Name/r.cursor for its own failure log line
+// — a concurrent Load(), which only checked r.running (not doneCh
+// liveness) before installing a new scenario, could land in that exact
+// window and mutate r.scenario/r.cursor while the failing run()
+// goroutine's own deferred log line was still reading them, a genuine
+// data race under -race. Deliberately uses a scenario that fails at its
+// very first step (an always-false expect:), maximizing how often Start
+// and the failure race a concurrent Load within this test's real time
+// budget.
+func TestFailingScenarioVsConcurrentLoadNeverRaces(t *testing.T) {
+	h := newHarness(t)
+	other := mustParse(t, `
+name: other
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
+steps:
+  - at: 0s
+    write: {device: EMS, point: set_operating_mode, value: 1}
+`)
+	mustLoad(t, h.runner, `
+name: always-fails
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
+steps:
+  - at: 0s
+    expect: {device: BMS, point: soc, value: 999}
+`)
+
+	const iterations = 50
+	for i := 0; i < iterations; i++ {
+		if err := h.runner.Start(); err != nil {
+			t.Fatalf("iter %d: Start: %v", i, err)
+		}
+		// Race Load immediately, while the just-started run() goroutine is
+		// likely still executing its first (failing) step's cleanup.
+		err := h.runner.Load(other)
+		if err != nil && !errors.Is(err, scenario.ErrLoadWhileRunning) {
+			t.Fatalf("iter %d: Load returned %v, want nil or ErrLoadWhileRunning", i, err)
+		}
+		waitUntilStopped(t, h.runner)
+		// Whichever scenario ended up loaded (this Load might have won or
+		// lost the race), get back to a known state for the next
+		// iteration.
+		h.runner.ResetPlayback()
+		if h.runner.Loaded() == nil || err != nil {
+			mustLoad(t, h.runner, `
+name: always-fails
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
+steps:
+  - at: 0s
+    expect: {device: BMS, point: soc, value: 999}
+`)
+		}
+	}
 }

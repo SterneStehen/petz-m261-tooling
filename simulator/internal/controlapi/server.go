@@ -50,6 +50,14 @@ type Config struct {
 	// guarantee (AGENT-TASK.md, Task 7 item 7) silently vacuous.
 	Gate *appgate.Gate
 
+	// LinkCoordinator serializes every link-fault operation (POST /link,
+	// POST /link/clear, a scenario's link: step, and doReset's own clear)
+	// against each other and against a heartbeat_pause's own heartbeat
+	// capture — see linkfault.Coordinator's doc comment for the races
+	// this closes. Shared with scenario.Runner and both protocol servers
+	// (main.go wires the same instance everywhere).
+	LinkCoordinator *linkfault.Coordinator
+
 	// Reset support (Task 7 item 7) — StartupSnapshot is a
 	// store.Store.Snapshot() taken once, before either protocol listener
 	// opens (so no client-visible write can land in it — see main.go);

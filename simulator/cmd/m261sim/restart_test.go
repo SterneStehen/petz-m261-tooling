@@ -150,14 +150,25 @@ func TestProcessRestartStartsClean(t *testing.T) {
 	}
 	bin := buildM261sim(t)
 
-	first := startM261simProcess(t, bin)
+	// -physics-step=24h: the reviewed fix for a flaky assumption -- the
+	// live background pacer (physics.Runner.PacedRun) starts ticking the
+	// instant main() reaches it, before this test ever gets a chance to
+	// read GET /state, so "heartbeat is still exactly 0" is only
+	// deterministically true if no tick could plausibly have fired yet.
+	// A 24h step (paired with the default -speed=1x) makes the first real
+	// tick due so far in the future that this test's own real-time
+	// duration can never reach it, however slow the CI worker -- closing
+	// the gap a 1s default step left open (a tick landing between process
+	// start and this test's first GET /state on a sufficiently loaded
+	// machine).
+	first := startM261simProcess(t, bin, "-physics-step=24h")
 	firstState := first.getState(t)
 	hb, ok := firstState["EMS/ems_periodic_heartbeat_indicator"]
 	if !ok {
 		t.Fatal("first process: EMS/ems_periodic_heartbeat_indicator missing from GET /state")
 	}
 	if hb != 0 {
-		t.Fatalf("first process: heartbeat = %v immediately after startup, want 0 (no PacedRun tick has fired yet)", hb)
+		t.Fatalf("first process: heartbeat = %v immediately after startup, want 0 (no PacedRun tick can plausibly have fired yet, -physics-step=24h)", hb)
 	}
 
 	// Dirty the first process's in-memory state via its own control API —
@@ -187,14 +198,14 @@ func TestProcessRestartStartsClean(t *testing.T) {
 	}
 	first.cmd.Wait() //nolint:errcheck
 
-	second := startM261simProcess(t, bin)
+	second := startM261simProcess(t, bin, "-physics-step=24h")
 	secondState := second.getState(t)
 
 	if got := secondState["BMS/cell_temperature_too_high"]; got != 0 {
 		t.Errorf("second process: BMS/cell_temperature_too_high = %v, want 0 (a fresh process, not a survivor of the first's dirty state)", got)
 	}
 	if got := secondState["EMS/ems_periodic_heartbeat_indicator"]; got != 0 {
-		t.Errorf("second process: heartbeat = %v, want 0 (same deterministic startup state as the first process had)", got)
+		t.Errorf("second process: heartbeat = %v, want 0 (no PacedRun tick can plausibly have fired yet, -physics-step=24h -- same deterministic startup state as the first process had)", got)
 	}
 	// Every point the first process had at its own clean startup must
 	// match the second process's clean startup, point for point — same

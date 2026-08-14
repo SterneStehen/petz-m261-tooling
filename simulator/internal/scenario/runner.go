@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
-	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/appgate"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/faults"
@@ -132,16 +131,18 @@ type Runner struct {
 	iecTarget     linkfault.Target
 	modbusTarget  linkfault.Target
 
-	gate *appgate.Gate // see SetGate
+	linkCoord *linkfault.Coordinator // see SetLinkCoordinator
 }
 
-// SetGate wires the process-wide reset-atomicity gate (package appgate):
-// a link: step's Apply call becomes one shared (Op) operation against
-// it, closing the same protocol: both non-atomicity gap SetGate's
-// controlapi counterpart (controlapi.Server's handleLink) closes for the
-// control API's identical action. nil (never calling SetGate) disables
-// gating, same as every other gated type in this codebase.
-func (r *Runner) SetGate(g *appgate.Gate) { r.gate = g }
+// SetLinkCoordinator wires the shared link-fault coordinator (package
+// linkfault) — a link: step's Apply call becomes one operation fully
+// serialized against every other coordinator-mediated link operation
+// (POST /link, POST /link/clear, POST /reset's own clear) through it,
+// closing the same protocol: both non-atomicity and heartbeat_pause-vs-
+// reset staleness gaps linkfault.Coordinator's own doc comment describes.
+// nil (never calling SetLinkCoordinator) disables coordination, same as
+// every other gated type in this codebase.
+func (r *Runner) SetLinkCoordinator(c *linkfault.Coordinator) { r.linkCoord = c }
 
 func NewRunner(
 	st *store.Store,
@@ -180,14 +181,27 @@ func NewRunner(
 // Start race this closes (a previous version released the lock across
 // validateAll and re-acquired it only to install, leaving a window where
 // a concurrent Start could run against stale state).
+//
+// Checks goroutineStillAlive(r.doneCh), not just r.running — third-review
+// -round fix: a scenario that fails or completes *on its own* (not via an
+// external Stop()) sets running=false and only *afterward* logs its own
+// failure context and closes doneCh (see run()'s own doc comment); a
+// Load() landing in that narrow window used to see running==false and
+// proceed to install a new scenario — including rewinding r.cursor and
+// replacing r.scenario — while the old run() goroutine's own deferred
+// cleanup was still reading those exact fields for its log message,
+// a genuine data race (caught under -race). Treating a still-alive
+// doneCh as a conflict, exactly like Start already does, closes it: the
+// caller gets ErrLoadWhileRunning and can retry a moment later instead of
+// racing the old goroutine's tail end.
 func (r *Runner) Load(s *Scenario) error {
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
 
 	r.mu.Lock()
-	running := r.running
+	conflict := r.running || goroutineStillAlive(r.doneCh)
 	r.mu.Unlock()
-	if running {
+	if conflict {
 		return ErrLoadWhileRunning
 	}
 
@@ -451,8 +465,21 @@ func (r *Runner) run(done, stop chan struct{}) {
 			r.mu.Lock()
 			r.lastErr = err
 			r.running = false
+			// name/cursor captured *inside* this same critical section,
+			// not read again after unlocking below — third-review-round
+			// fix: Load() only checked r.running (now also checks
+			// goroutineStillAlive(r.doneCh), but a caller building against
+			// an older assumption, or any other future reader of these
+			// fields outside r.mu, could still race this goroutine's own
+			// read of r.scenario.Name/r.cursor between the unlock below
+			// and this log line — a real data race under -race once
+			// something concurrently mutates r.scenario/r.cursor in that
+			// window (which Load, pre-fix, could do). Reading them here,
+			// under the lock, removes the window entirely rather than
+			// relying on nothing else ever running concurrently.
+			name, cursor := r.scenario.Name, r.cursor
 			r.mu.Unlock()
-			log.Printf("scenario: %q step %d (at %s) failed, scenario stopped: %v", r.scenario.Name, r.cursor, step.At, err)
+			log.Printf("scenario: %q step %d (at %s) failed, scenario stopped: %v", name, cursor, step.At, err)
 			return
 		}
 
@@ -540,17 +567,10 @@ func (r *Runner) checkExpect(e *ExpectAction) error {
 }
 
 func (r *Runner) applyLink(l *LinkAction) error {
-	var hbValue float64
-	if l.Mode == string(linkfault.ModeHeartbeatPause) {
-		hbValue, _ = r.store.Get(linkfault.HeartbeatKey)
-	}
 	delay := time.Duration(l.DelayMS) * time.Millisecond
-	// See controlapi.Server.handleLink's identical comment: one gate.Op
-	// for the whole (potentially protocol: both) Apply call, so a
-	// concurrent POST /reset's own sequential ClearLinkFaults calls can
-	// never interleave with this step's own sequential mutation of the
-	// two protocol targets.
-	release := r.gate.Op()
-	defer release()
-	return linkfault.Apply(r.iecTarget, r.modbusTarget, linkfault.Protocol(l.Protocol), linkfault.Mode(l.Mode), delay, hbValue)
+	// linkfault.ApplyCoordinated: see controlapi.Server.handleLink's
+	// identical comment for the races this closes (protocol: both vs a
+	// concurrent reset/link operation, heartbeat_pause's capture vs a
+	// concurrent reset).
+	return linkfault.ApplyCoordinated(r.linkCoord, r.store, r.iecTarget, r.modbusTarget, linkfault.Protocol(l.Protocol), linkfault.Mode(l.Mode), delay)
 }

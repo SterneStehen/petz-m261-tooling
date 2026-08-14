@@ -16,6 +16,7 @@ import (
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/controlapi"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/faults"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/physics"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/scenario"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
@@ -62,6 +63,24 @@ func (f *fakeLinkTarget) ClearLinkFaults() {
 	f.cleared = true
 }
 
+// linkTargetState is fakeLinkTarget's field values without its mutex --
+// fakeLinkTarget itself must never be copied by value (go vet's copylocks
+// check, correctly: it embeds a sync.Mutex), so snapshot returns this
+// instead, for tests that assert on the final state after racing
+// concurrent mutators.
+type linkTargetState struct {
+	drop, hang, cleared bool
+	delay               time.Duration
+	hbValue             float64
+	hbSet               bool
+}
+
+func (f *fakeLinkTarget) snapshot() linkTargetState {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return linkTargetState{drop: f.drop, hang: f.hang, cleared: f.cleared, delay: f.delay, hbValue: f.hbValue, hbSet: f.hbSet}
+}
+
 type harness struct {
 	store          *store.Store
 	injector       *faults.Injector
@@ -83,6 +102,7 @@ func newHarness(t *testing.T) *harness {
 	startupInstant := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
 	fc := clock.NewFake(startupInstant)
 	gate := appgate.New()
+	linkCoord := linkfault.NewCoordinator()
 
 	proc, err := commands.NewProcessor(st, fc, commands.DefaultConfig())
 	if err != nil {
@@ -96,6 +116,7 @@ func newHarness(t *testing.T) *harness {
 	inj.SetGate(gate)
 	iec, mb := &fakeLinkTarget{}, &fakeLinkTarget{}
 	sr := scenario.NewRunner(st, inj, proc, pr, fc, time.Minute, iec, mb)
+	sr.SetLinkCoordinator(linkCoord)
 
 	startupSnapshot := st.Snapshot()
 
@@ -112,6 +133,7 @@ func newHarness(t *testing.T) *harness {
 		ModbusServer:    mb,
 		ScenariosDir:    "",
 		Gate:            gate,
+		LinkCoordinator: linkCoord,
 		StartupSnapshot: startupSnapshot,
 		NewEngine:       newEngine,
 		StartupInstant:  startupInstant,
@@ -814,30 +836,123 @@ func TestResetIsAtomicAgainstConcurrentStateReads(t *testing.T) {
 	}
 }
 
-// TestResetIsAtomicAgainstConcurrentLinkBothAction is Blocker 2's link
+// TestResetIsAtomicAgainstConcurrentLinkBothAction is Blocker 3's link
 // half: POST /link with protocol: both mutates iec104's and modbus's
 // link state sequentially, not as one atomic step, and so did POST
-// /reset's own ClearLinkFaults calls — without a gate.Op spanning the
-// whole Apply call, the two sequential pairs could interleave and leave
-// one protocol faulted while the other was cleared, a combination
-// neither "reset happened" nor "reset didn't happen" produces on its
-// own. Raced under -race; the meaningful assertion is that this never
-// panics/data-races and every request completes, since the exact timing
-// of which side wins is inherently non-deterministic.
+// /reset's own clear — without LinkCoordinator spanning the whole
+// two-target Apply call for *both* operations, the two sequential pairs
+// could interleave and leave one protocol faulted while the other was
+// cleared, a combination neither "reset happened" nor "reset didn't
+// happen" produces on its own. Raced under -race for many iterations;
+// the exact timing of which side (the n concurrent drops, or the reset)
+// lands last is inherently non-deterministic, but whichever does, the
+// two targets must always agree with each other — asserted on every
+// iteration, not just "no panic/no race".
 func TestResetIsAtomicAgainstConcurrentLinkBothAction(t *testing.T) {
-	h := newHarness(t)
-	var wg sync.WaitGroup
-	const n = 20
-	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for iter := 0; iter < 20; iter++ {
+		h := newHarness(t)
+		var wg sync.WaitGroup
+		const n = 20
+		wg.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				defer wg.Done()
+				h.do(t, "POST", "/link", map[string]any{"protocol": "both", "mode": "drop"})
+			}()
+		}
+		resp, body := h.do(t, "POST", "/reset", nil)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("iter %d: reset status = %d, body = %s", iter, resp.StatusCode, body)
+		}
+		wg.Wait()
+
+		// iec.cleared/mb.cleared are sticky ("ClearLinkFaults ran at least
+		// once on this target", never reset back to false by a later
+		// SetDrop) — not "currently cleared" — so only drop (the field
+		// that actually flips back and forth as these two kinds of
+		// operations race) is a meaningful "did the two targets end up
+		// agreeing" check here.
+		iec, mb := h.iec.snapshot(), h.mb.snapshot()
+		if iec.drop != mb.drop {
+			t.Fatalf("iter %d: iec.drop=%v mb.drop=%v after racing protocol:both drop vs reset, want equal (never split)", iter, iec.drop, mb.drop)
+		}
+	}
+}
+
+// TestConcurrentLinkBothOperationsNeverSplit is Blocker 3's link-vs-link
+// case (not link-vs-reset): two concurrent protocol: both operations
+// (one drop, one clear) racing each other, with no reset involved at
+// all — LinkCoordinator must serialize them against *each other* too,
+// not only against reset, since appgate.Gate.Op (the pre-fix mechanism)
+// is a shared lock that never excluded two concurrent Op holders from
+// each other.
+func TestConcurrentLinkBothOperationsNeverSplit(t *testing.T) {
+	for iter := 0; iter < 20; iter++ {
+		h := newHarness(t)
+		var wg sync.WaitGroup
+		wg.Add(2)
 		go func() {
 			defer wg.Done()
 			h.do(t, "POST", "/link", map[string]any{"protocol": "both", "mode": "drop"})
 		}()
+		go func() {
+			defer wg.Done()
+			h.do(t, "POST", "/link/clear", map[string]any{"protocol": "both"})
+		}()
+		wg.Wait()
+
+		iec, mb := h.iec.snapshot(), h.mb.snapshot()
+		if iec.drop != mb.drop || iec.cleared != mb.cleared {
+			t.Fatalf("iter %d: iec=%+v mb=%+v after racing two concurrent protocol:both operations, want the two targets to always agree", iter, iec, mb)
+		}
 	}
-	resp, body := h.do(t, "POST", "/reset", nil)
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("reset status = %d, body = %s", resp.StatusCode, body)
+}
+
+// TestHeartbeatPauseNeverSurvivesResetWithStaleValue is Blocker 3's
+// heartbeat_pause-vs-reset case: heartbeat_pause used to read the Store's
+// current heartbeat value *before* acquiring any lock at all, so a
+// concurrent POST /reset landing between that read and the eventual
+// Apply could produce a pause holding a stale pre-reset value — one the
+// just-reset Store no longer has, and (since reset's own clear only ran
+// once, before this racing heartbeat_pause's own Apply) one that then
+// survives the reset indefinitely. Dirties the heartbeat to a
+// distinctive value no post-reset state can legitimately produce, races
+// many heartbeat_pause requests against one reset, and asserts every
+// resulting final state is either "not paused" or "paused at the
+// current (post-reset) value" — never paused at the pre-reset dirty
+// value.
+func TestHeartbeatPauseNeverSurvivesResetWithStaleValue(t *testing.T) {
+	const dirtyHeartbeat = 999999.0
+	for iter := 0; iter < 20; iter++ {
+		h := newHarness(t)
+		h.store.Set(m261points.PointKey{Device: "EMS", Slug: "ems_periodic_heartbeat_indicator"}, dirtyHeartbeat)
+
+		var wg sync.WaitGroup
+		const n = 20
+		wg.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				defer wg.Done()
+				h.do(t, "POST", "/link", map[string]any{"protocol": "both", "mode": "heartbeat_pause"})
+			}()
+		}
+		resp, body := h.do(t, "POST", "/reset", nil)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("iter %d: reset status = %d, body = %s", iter, resp.StatusCode, body)
+		}
+		wg.Wait()
+
+		freshValue, _ := h.store.Get(m261points.PointKey{Device: "EMS", Slug: "ems_periodic_heartbeat_indicator"})
+		for _, target := range []struct {
+			name string
+			snap linkTargetState
+		}{{"iec", h.iec.snapshot()}, {"mb", h.mb.snapshot()}} {
+			if target.snap.hbSet && target.snap.hbValue == dirtyHeartbeat {
+				t.Fatalf("iter %d: %s paused at %v (the pre-reset dirty value) after racing heartbeat_pause vs reset — a stale pause survived the reset", iter, target.name, target.snap.hbValue)
+			}
+			if target.snap.hbSet && target.snap.hbValue != freshValue {
+				t.Fatalf("iter %d: %s paused at %v, want either not paused or paused at the current post-reset value %v", iter, target.name, target.snap.hbValue, freshValue)
+			}
+		}
 	}
-	wg.Wait()
 }

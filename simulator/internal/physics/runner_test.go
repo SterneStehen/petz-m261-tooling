@@ -2,6 +2,7 @@ package physics
 
 import (
 	"errors"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -560,5 +561,149 @@ func TestPacedRunSkipsTickWhileDriveHeld(t *testing.T) {
 	}
 	if hb := get(t, st, "EMS", "ems_periodic_heartbeat_indicator"); hb != 1 {
 		t.Errorf("heartbeat = %v after ReleaseDrive + one TickOnce, want 1", hb)
+	}
+}
+
+// TestFastForwardNeverBusyDueToBackgroundPacer is Blocker 1's third-
+// review-round black-box reproduction, turned into a deterministic
+// barrier test: with PacedRun running continuously in the background at
+// a fast tick rate (maximizing the odds of an external FastForward
+// landing on top of one of its ticks), every external FastForward call
+// must still succeed — ErrClockBusy is only a valid outcome between two
+// *external* drivers, never because the background pacer happened to be
+// mid-tick. Reproduced against the pre-fix design (PacedRun contending
+// for the same lock external callers used): 20/20 advances failed at
+// speed=1000000; 1 in 500 failed even at speed=1.
+func TestFastForwardNeverBusyDueToBackgroundPacer(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	proc := newTestProcessor(t, st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+	stop := make(chan struct{})
+	pacerDone := make(chan struct{})
+	go func() {
+		defer close(pacerDone)
+		r.PacedRun(time.Microsecond, 1000000, stop) // as fast as the ticker/scheduler allow
+	}()
+	defer func() {
+		close(stop)
+		<-pacerDone
+	}()
+
+	const n = 500
+	for i := 0; i < n; i++ {
+		if err := r.FastForward(time.Millisecond, time.Millisecond); err != nil {
+			t.Fatalf("FastForward #%d/%d against a live background pacer: %v, want nil (pacer must yield, never cause ErrClockBusy)", i+1, n, err)
+		}
+	}
+}
+
+// TestExternalDriversStillConflictWithEachOtherUnderLivePacer is
+// TestFastForwardNeverBusyDueToBackgroundPacer's complement: the fix for
+// pacer-vs-external contention must not accidentally also suppress
+// genuine external-vs-external contention. A long-running external
+// driver (modeled via TryAcquireDrive directly, standing in for a
+// running scenario) must still make a concurrent FastForward fail with
+// ErrClockBusy, live background pacer or not.
+func TestExternalDriversStillConflictWithEachOtherUnderLivePacer(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	proc := newTestProcessor(t, st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+	stop := make(chan struct{})
+	pacerDone := make(chan struct{})
+	go func() {
+		defer close(pacerDone)
+		r.PacedRun(time.Microsecond, 1000000, stop)
+	}()
+	defer func() {
+		close(stop)
+		<-pacerDone
+	}()
+
+	if !r.TryAcquireDrive() {
+		t.Fatal("TryAcquireDrive on a fresh Runner returned false")
+	}
+	defer r.ReleaseDrive()
+
+	if err := r.FastForward(time.Millisecond, time.Millisecond); !errors.Is(err, ErrClockBusy) {
+		t.Fatalf("FastForward while another external driver holds ownership (live pacer also running): err = %v, want ErrClockBusy", err)
+	}
+}
+
+// TestCheckedPaceRejectsOverflow is Significant 2's regression test: a
+// bare time.Duration(float64(d)/speed) conversion is implementation-
+// defined (not a panic) once the quotient falls outside int64
+// nanoseconds — reproduced black-box as a valid, finite, positive speed
+// (1e-300) making the live simulator run at ~1ns cadence instead of
+// "almost stopped" (heartbeat reached 24,478 within seconds of real
+// time). CheckedPace must reject this instead of silently producing an
+// implementation-defined Duration.
+func TestCheckedPaceRejectsOverflow(t *testing.T) {
+	cases := []struct {
+		name  string
+		d     time.Duration
+		speed float64
+	}{
+		{"extremely small speed", time.Second, 1e-300},
+		{"speed makes NaN", time.Second, math.NaN()},
+		{"speed is zero", time.Second, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := CheckedPace(c.d, c.speed)
+			if err == nil {
+				t.Errorf("CheckedPace(%v, %v) = nil error, want a rejection", c.d, c.speed)
+			}
+		})
+	}
+
+	// A normal, representable case must still succeed.
+	got, err := CheckedPace(time.Second, 2)
+	if err != nil {
+		t.Fatalf("CheckedPace(1s, 2) = %v, want nil error", err)
+	}
+	if got != 500*time.Millisecond {
+		t.Errorf("CheckedPace(1s, 2) = %v, want 500ms", got)
+	}
+
+	// An infinite speed divides the result down to a representable 0,
+	// not an overflow — CheckedPace itself doesn't need to reject this;
+	// validSpeed (checked separately, upstream of every public caller)
+	// already rejects a non-finite speed before it ever reaches here.
+	if got, err := CheckedPace(time.Second, math.Inf(1)); err != nil || got != 0 {
+		t.Errorf("CheckedPace(1s, +Inf) = (%v, %v), want (0, nil)", got, err)
+	}
+}
+
+// TestPacedRunDoesNotRunawayOnExtremeSpeed is TestCheckedPaceRejectsOverflow's
+// integration counterpart: PacedRun given a valid-per-validSpeed but
+// pace-overflowing speed must simply not tick (degrade to "no live
+// pacing"), never silently run at an implementation-defined ~1ns
+// cadence.
+func TestPacedRunDoesNotRunawayOnExtremeSpeed(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	proc := newTestProcessor(t, st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.PacedRun(time.Second, 1e-300, stop)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("PacedRun did not return after stop was closed")
+	}
+
+	if hb := get(t, st, "EMS", "ems_periodic_heartbeat_indicator"); hb != 0 {
+		t.Errorf("heartbeat = %v after ~50ms with an overflowing speed, want 0 (PacedRun must refuse to run away, not tick at ~1ns cadence)", hb)
 	}
 }

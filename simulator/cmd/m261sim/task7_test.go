@@ -24,6 +24,7 @@ import (
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/controlapi"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/faults"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/iec104"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/modbustcp"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/physics"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/scenario"
@@ -52,6 +53,7 @@ func newTask7Sim(t *testing.T) *task7Sim {
 	startupInstant := time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC)
 	clk := clock.NewFake(startupInstant)
 	gate := appgate.New()
+	linkCoord := linkfault.NewCoordinator()
 
 	proc, err := commands.NewProcessor(st, clk, commands.DefaultConfig())
 	if err != nil {
@@ -63,13 +65,25 @@ func newTask7Sim(t *testing.T) *task7Sim {
 	pr := physics.NewRunner(newEngine(), st, clk, proc)
 	pr.SetGate(gate)
 
+	// Every gate/coordinator below is wired exactly as main.go wires it —
+	// third-review-round fix: this harness previously built mb/iec/sr
+	// without SetGate/SetLinkCoordinator at all, so every one of this
+	// file's own "atomic against reset" tests exercised none of the
+	// atomicity they claimed to verify (nil *appgate.Gate/*linkfault.
+	// Coordinator disable gating entirely, by design, for exactly this
+	// kind of package-local test that doesn't care — but this package's
+	// tests very much do).
 	mb := modbustcp.New(st, modbustcp.Config{Addr: "127.0.0.1:0", ByteOrder: m261points.BigEndian, Commands: proc})
+	mb.SetGate(gate)
+	mb.SetLinkCoordinator(linkCoord)
 	if err := mb.Start(); err != nil {
 		t.Fatalf("modbustcp Start: %v", err)
 	}
 	t.Cleanup(func() { mb.Close() })
 
 	iec := iec104.New(st, iec104.Config{Addr: "127.0.0.1:0", Commands: proc})
+	iec.SetGate(gate)
+	iec.SetLinkCoordinator(linkCoord)
 	if err := iec.Start(); err != nil {
 		t.Fatalf("iec104 Start: %v", err)
 	}
@@ -78,11 +92,12 @@ func newTask7Sim(t *testing.T) *task7Sim {
 	inj := faults.NewInjector(st)
 	inj.SetGate(gate)
 	sr := scenario.NewRunner(st, inj, proc, pr, clk, 5*time.Minute, iec, mb)
+	sr.SetLinkCoordinator(linkCoord)
 
 	capi := controlapi.New(controlapi.Config{
 		Addr: "127.0.0.1:0", Store: st, Injector: inj, Processor: proc, PhysicsRunner: pr,
 		Clock: clk, StepInterval: 5 * time.Minute, ScenarioRunner: sr, IECServer: iec, ModbusServer: mb,
-		Gate: gate, StartupSnapshot: st.Snapshot(), NewEngine: newEngine, StartupInstant: startupInstant,
+		Gate: gate, LinkCoordinator: linkCoord, StartupSnapshot: st.Snapshot(), NewEngine: newEngine, StartupInstant: startupInstant,
 	})
 	if err := capi.Start(); err != nil {
 		t.Fatalf("controlapi Start: %v", err)
@@ -549,6 +564,84 @@ func TestFC16BatchWriteAtomicAgainstConcurrentReset(t *testing.T) {
 	if !bothWritten && !bothDefault {
 		t.Errorf("active=%v reactive=%v after racing FC16 writes vs reset — want both at the written values (%v, %v) or both at their pre-write defaults (%v, %v), never a split pair",
 			active, reactive, activeKW, reactiveKvar, preActive, preReactive)
+	}
+}
+
+// TestFC06HalfWriteNeverCommitsStaleReadAcrossReset is Blocker 2's exact
+// reproduction schedule, made deterministic (not just a stress test) by
+// computing every reachable outcome up front and asserting the observed
+// final value is one of exactly those, never a third, only-reachable-via
+// -the-bug value:
+//
+//  1. maximum_charge_soc (F32, two Modbus registers) is 77.
+//  2. FC06 (WriteSingleRegister) touches only the *low* register — a
+//     read-modify-write against whatever the high register currently is.
+//  3. A concurrent POST /reset restores the point to 100 (the real
+//     default — see TestResetDoesNotRequireProtocolClientReconnect).
+//
+// Before this fix, applyRegisterWrites read the pre-reset pair (encoding
+// 77), composed the new low register onto it, and committed that stale
+// composite *after* reset had already run — a result matching neither
+// "write completed, then reset" (100, since reset unconditionally
+// overwrites the whole point) nor "reset completed, then write" (the low
+// register composed onto 100's own encoding, computed below as
+// wantResetFirst). Racing many such FC06 requests against many resets,
+// the observed final value must always be exactly one of those two.
+func TestFC06HalfWriteNeverCommitsStaleReadAcrossReset(t *testing.T) {
+	const dirty = 77.0
+	const resetDefault = 100.0
+	const wireAddr = 18 // maximum_charge_soc: F32, modbus_addr 40019 -> wire 40019-40001
+	const lowRegWireAddr = wireAddr + 1
+	var lowRegPattern uint16 = 0x1234
+	lowRegHi, lowRegLo := byte(lowRegPattern>>8), byte(lowRegPattern)
+
+	dirtyBytes := m261points.EncodeF32(dirty, m261points.BigEndian)
+	staleComposite := math.Float32frombits(binary.BigEndian.Uint32(append(append([]byte(nil), dirtyBytes[0:2]...), lowRegHi, lowRegLo)))
+
+	resetBytes := m261points.EncodeF32(resetDefault, m261points.BigEndian)
+	wantResetFirst := math.Float32frombits(binary.BigEndian.Uint32(append(append([]byte(nil), resetBytes[0:2]...), lowRegHi, lowRegLo)))
+
+	key := m261points.PointKey{Device: "EMS", Slug: "maximum_charge_soc"}
+
+	for iter := 0; iter < 20; iter++ {
+		sim := newTask7Sim(t)
+		if err := sim.processor.Write(key, dirty); err != nil {
+			t.Fatalf("iter %d: setup Write: %v", iter, err)
+		}
+
+		mbHandler := gomodbus.NewTCPClientHandler(sim.mb.Addr().String())
+		mbHandler.SlaveId = 1
+		mbHandler.Timeout = 5 * time.Second
+		if err := mbHandler.Connect(); err != nil {
+			t.Fatalf("iter %d: modbus Connect: %v", iter, err)
+		}
+		mbClient := gomodbus.NewClient(mbHandler)
+
+		const n = 10
+		var wg sync.WaitGroup
+		wg.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				defer wg.Done()
+				mbClient.WriteSingleRegister(lowRegWireAddr, lowRegPattern) //nolint:errcheck // a rejected/erroring write is fine here; only a *committed stale* one is a failure
+			}()
+		}
+		resp := postJSON(t, sim.apiURL("/reset"), nil)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("iter %d: POST /reset: status %d", iter, resp.StatusCode)
+		}
+		resp.Body.Close()
+		wg.Wait()
+		mbHandler.Close()
+
+		got, _ := sim.store.Get(key)
+		gotF32 := float32(got)
+		if gotF32 == staleComposite {
+			t.Fatalf("iter %d: maximum_charge_soc = %v — the stale-read composite (a pre-reset base register pair, committed after reset), want %v (reset-first) or %v (reset default)", iter, got, wantResetFirst, resetDefault)
+		}
+		if gotF32 != float32(resetDefault) && gotF32 != wantResetFirst {
+			t.Fatalf("iter %d: maximum_charge_soc = %v, want exactly %v (reset default, write-then-reset) or %v (reset-then-write composite)", iter, got, resetDefault, wantResetFirst)
+		}
 	}
 }
 

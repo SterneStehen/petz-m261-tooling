@@ -119,7 +119,16 @@ func (s *Server) handleReadRegisters(unitID byte, pdu []byte, class int) []byte 
 	if qty == 0 || qty > 125 {
 		return exceptionPDU(pdu[0], excIllegalDataValue)
 	}
-	// One gate.Op for the whole response — see handleReadBits.
+	// linkCoord (outer) plus gate.Op (inner) for the whole response — see
+	// handleReadBits for gate.Op's own rationale, and
+	// iec104.Server.handleGeneralInterrogation's identical comment for
+	// linkCoord's: without it, this response's Store reads and its
+	// heartbeat-override resolution could be torn apart by a concurrent
+	// link mutation the same way an unguarded Store read and a separately
+	// -locked heartbeat check could be by one. Lock order (linkCoord
+	// outer, gate.Op inner) matches doReset's and GI's own.
+	s.linkCoord.Lock()
+	defer s.linkCoord.Unlock()
 	done := s.opDone()
 	defer done()
 
@@ -209,7 +218,25 @@ func (s *Server) handleWriteMultipleRegisters(unitID byte, pdu []byte) []byte {
 // multi-register FC16 write spanning more than one catalog point must not
 // partially apply if a later point in the request fails validation, so
 // commit only happens once every touched point has already passed.
+//
+// The *entire* transaction — from the first read-modify-write seed read
+// (s.store.Get, for an FC06 half-write) through decode, Validate, and the
+// final WriteBatch commit — runs under one gate.Op, not just the commit.
+// Reviewed gap this closes (third review round): the read used to happen
+// completely unguarded, before any gate acquisition at all. Reproduction:
+// maximum_charge_soc is 77; FC06 reads the old pair and prepares 77.25;
+// a concurrent POST /reset restores the point to 100; FC06 (which had
+// already read 77 before the reset ran) commits the stale 77.25 — a
+// result matching neither "write, then reset" (100) nor "reset, then
+// write" (whatever decoding the new half against 100 would produce).
+// commands.Processor.WriteBatch is deliberately ungated so this one
+// gate.Op is the only one — see its own doc comment for why nesting a
+// second one here would risk deadlocking against a queued exclusive
+// Reset (the reviewer's explicit warning).
 func (s *Server) applyRegisterWrites(unit int, start uint16, regs [][]byte) byte {
+	done := s.opDone()
+	defer done()
+
 	touched := make(map[m261points.PointKey][]byte)
 	order := make([]m261points.PointKey, 0, len(regs)/2+1)
 	for i, val2 := range regs {

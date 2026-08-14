@@ -46,7 +46,8 @@ type Server struct {
 
 	link linkState // Task 7 item 2 — see linkstate.go
 
-	gate *appgate.Gate // see SetGate
+	gate      *appgate.Gate          // see SetGate
+	linkCoord *linkfault.Coordinator // see SetLinkCoordinator
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -66,6 +67,18 @@ func New(st *store.Store, cfg Config) *Server {
 // some post-reset values. nil (never calling SetGate) disables gating,
 // same as every other gated type in this codebase.
 func (s *Server) SetGate(g *appgate.Gate) { s.gate = g }
+
+// SetLinkCoordinator wires the shared link-fault coordinator (package
+// linkfault): a general interrogation's snapshot-plus-heartbeat-override
+// read becomes one operation fully serialized against every link
+// mutation (a link operation, POST /reset's own clear) — see
+// linkfault.Coordinator's own doc comment for the torn-view race this
+// closes (a reset or link mutation landing between the snapshot capture
+// and the heartbeat override read could otherwise combine pre-reset
+// Store data with post-reset link state, or vice versa). nil (never
+// calling SetLinkCoordinator) disables coordination, same as every other
+// gated type in this codebase.
+func (s *Server) SetLinkCoordinator(c *linkfault.Coordinator) { s.linkCoord = c }
 
 func (s *Server) opDone() func() {
 	if s.gate == nil {
@@ -363,19 +376,30 @@ func (s *Server) handleGeneralInterrogation(c *clientConn, hdr asduHeader, objs 
 
 	c.writeIFrame(buildCICNA1(hdr.CommonAddr, cotActivationCon, qoi)) //nolint:errcheck
 
-	// gate.Op held only around the snapshot capture, not the write loop
-	// below: once SnapshotDevice returns, this response is already fully
-	// determined from one consistent, atomically-captured map, immune to
-	// anything that mutates the Store afterward — holding the gate any
-	// longer than that would needlessly block a concurrent POST /reset
+	// gate.Op and linkCoord held only around the snapshot-plus-heartbeat-
+	// override capture, not the write loop below: once both reads return,
+	// this response is already fully determined from one consistent,
+	// atomically-captured pair, immune to anything that mutates the Store
+	// or link state afterward — holding either lock any longer than that
+	// would needlessly block a concurrent POST /reset or link operation
 	// behind this connection's own TCP write speed. What this closes:
-	// without it, this read could start after only *part* of POST
-	// /reset's six-step sequence had run (see doReset), returning a
-	// response that mixes pre- and post-reset values no single instant
-	// ever actually existed in.
+	// without gate.Op, this read could start after only *part* of POST
+	// /reset's sequence had run (see doReset), returning a response that
+	// mixes pre- and post-reset Store values no single instant ever
+	// actually had; without linkCoord, the snapshot and the heartbeat
+	// override used to be captured as two *separate* reads (the override
+	// only resolved later, per-key, inside the loop below) — a reset or
+	// link mutation landing between them could combine a pre-reset Store
+	// snapshot with a post-reset heartbeat override, or vice versa
+	// (third review round finding). Lock order (linkCoord outer, gate.Op
+	// inner) matches doReset's own — see its doc comment — so the two can
+	// never deadlock against each other.
+	s.linkCoord.Lock()
 	done := s.opDone()
 	snap := s.store.SnapshotDevice(hdr.CommonAddr)
+	heartbeatFrozen, heartbeatPaused := s.link.heartbeatOverride()
 	done()
+	s.linkCoord.Unlock()
 	keys := make([]m261points.PointKey, 0, len(snap))
 	for k := range snap {
 		keys = append(keys, k)
@@ -386,10 +410,8 @@ func (s *Server) handleGeneralInterrogation(c *clientConn, hdr asduHeader, objs 
 	for _, k := range keys {
 		meta := m261points.Points[k]
 		value := snap[k]
-		if k == linkfault.HeartbeatKey {
-			if frozen, paused := s.link.heartbeatOverride(); paused {
-				value = frozen
-			}
+		if k == linkfault.HeartbeatKey && heartbeatPaused {
+			value = heartbeatFrozen
 		}
 		if asdu := monitoredASDU(meta, value, cotInterrogatedByStation); asdu != nil {
 			c.writeIFrame(asdu) //nolint:errcheck

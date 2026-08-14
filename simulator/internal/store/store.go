@@ -231,6 +231,53 @@ func (s *Store) Restore(snapshot map[m261points.PointKey]float64) {
 	}
 }
 
+// KeyValue is one (point, value) pair for SetBatch.
+type KeyValue struct {
+	Key   m261points.PointKey
+	Value float64
+}
+
+// SetBatch writes every pair in writes (and mirrors each onto its
+// readback twin, same as Set) as one atomic operation with respect to
+// concurrent Get/Set/Snapshot/etc — no concurrent reader ever observes
+// only some of a multi-point batch applied, mirroring Restore's own
+// atomicity for the same reason: a multi-register Modbus FC16 request
+// spanning more than one catalog point must commit as one indivisible
+// step, not several independently-locked Set calls (third review round:
+// a concurrent Snapshot — even one already excluded from racing a
+// reset's own Store.Restore by appgate.Gate — could still observe a
+// batch partially applied, since gate.Op is a *shared* lock and doesn't
+// serialize two concurrent Op holders against each other; only Store's
+// own mutex, held for the whole batch, closes that). Returns false
+// without applying any of the batch if any key isn't a real point —
+// every production caller (commands.Processor.WriteBatch) already
+// validates each one beforehand, so this is a caller-bug guard, not a
+// partial-application path.
+func (s *Store) SetBatch(writes []KeyValue) bool {
+	s.mu.Lock()
+	for _, kv := range writes {
+		if _, ok := s.values[kv.Key]; !ok {
+			s.mu.Unlock()
+			return false
+		}
+	}
+	changed := make([]Change, 0, len(writes)*2)
+	for _, kv := range writes {
+		s.values[kv.Key] = kv.Value
+		changed = append(changed, Change{Key: kv.Key, Value: kv.Value})
+		if rbKey, ok := s.readbackOf[kv.Key]; ok {
+			s.values[rbKey] = kv.Value
+			changed = append(changed, Change{Key: rbKey, Value: kv.Value})
+		}
+	}
+	s.mu.Unlock()
+
+	for _, c := range changed {
+		s.publish(c)
+	}
+	return true
+}
+
 // Subscribe returns a channel of every future Change plus an unsubscribe
 // function. The channel is buffered and best-effort: a subscriber that
 // falls behind has changes dropped rather than blocking writers — general

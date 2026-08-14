@@ -26,6 +26,7 @@ import (
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/appgate"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
@@ -61,7 +62,8 @@ type Server struct {
 
 	link linkState // Task 7 item 2 — see linkstate.go
 
-	gate *appgate.Gate // see SetGate
+	gate      *appgate.Gate          // see SetGate
+	linkCoord *linkfault.Coordinator // see SetLinkCoordinator
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -82,6 +84,16 @@ func New(st *store.Store, cfg Config) *Server {
 // post-reset values. nil (never calling SetGate) disables gating, same
 // as every other gated type in this codebase.
 func (s *Server) SetGate(g *appgate.Gate) { s.gate = g }
+
+// SetLinkCoordinator wires the shared link-fault coordinator (package
+// linkfault): a read that resolves the heartbeat point's value becomes
+// one operation fully serialized against every link mutation (a link
+// operation, POST /reset's own clear) — see linkfault.Coordinator's own
+// doc comment for the torn-view race this closes, and
+// iec104.Server.SetLinkCoordinator's identical comment for the IEC-104
+// counterpart. nil (never calling SetLinkCoordinator) disables
+// coordination, same as every other gated type in this codebase.
+func (s *Server) SetLinkCoordinator(c *linkfault.Coordinator) { s.linkCoord = c }
 
 func (s *Server) opDone() func() {
 	if s.gate == nil {

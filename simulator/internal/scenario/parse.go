@@ -11,6 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/physics"
 )
 
 // ErrMalformed is Parse's sentinel for every load-time rejection —
@@ -111,6 +112,22 @@ func Parse(data []byte) (*Scenario, error) {
 	}
 	if raw.Clock.Speed <= 0 {
 		return nil, fmt.Errorf("%w: clock.speed must be positive, got %v", ErrMalformed, raw.Clock.Speed)
+	}
+	// A finite, positive speed can still make stepInterval/speed overflow
+	// a time.Duration at run time — an extreme value like 1e-300 turns
+	// even a 1s step into an implementation-defined ~1ns real interval
+	// instead of "almost stopped" (third review round, reproduced against
+	// the live simulator; see physics.CheckedPace). This scenario's own
+	// stepInterval isn't known yet at Parse time (it's a Runner
+	// construction parameter, not a scenario field), so this checks
+	// against a generously large stand-in (24h) that would never
+	// legitimately appear as a real stepInterval — anything that
+	// overflows even that bound is rejected now, at load time, rather
+	// than discovered mid-run; physics.Runner.PacedFastForwardLocked
+	// performs the authoritative check against the real stepInterval
+	// every time this scenario actually ticks.
+	if _, err := physics.CheckedPace(24*time.Hour, raw.Clock.Speed); err != nil {
+		return nil, fmt.Errorf("%w: clock.speed %v: %v", ErrMalformed, raw.Clock.Speed, err)
 	}
 	if len(raw.Steps) == 0 {
 		return nil, fmt.Errorf("%w: steps is empty", ErrMalformed)

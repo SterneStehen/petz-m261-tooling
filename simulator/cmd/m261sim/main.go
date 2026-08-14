@@ -18,6 +18,7 @@ import (
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/controlapi"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/faults"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/iec104"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/modbustcp"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/physics"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/scenario"
@@ -106,6 +107,16 @@ func main() {
 	if math.IsNaN(*speed) || math.IsInf(*speed, 0) || *speed <= 0 {
 		log.Fatalf("-speed must be a positive, finite number, got %v", *speed)
 	}
+	// A speed that's individually finite and positive can still make
+	// -physics-step/-speed overflow a time.Duration (an extreme value
+	// like 1e-300 turns a 1s step into an implementation-defined ~1ns
+	// real interval instead of "almost stopped") — reviewed gap: PacedRun
+	// itself has no caller to report this through once running, so it's
+	// caught here, at startup, with a clear message, via the same
+	// checked conversion PacedRun uses internally.
+	if _, err := physics.CheckedPace(*stepInterval, *speed); err != nil {
+		log.Fatalf("-physics-step %s / -speed %v: %v", *stepInterval, *speed, err)
+	}
 
 	// The simulator has exactly one model clock (AGENT-TASK §1.5),
 	// always a *clock.Fake — never clock.Real directly wired into
@@ -129,6 +140,12 @@ func main() {
 	// takes the exclusive side for its whole sequence. See
 	// controlapi.Server.doReset's doc comment for the gap this closes.
 	gate := appgate.New()
+
+	// linkCoord serializes every link-fault operation (POST /link, POST
+	// /link/clear, a scenario's link: step, and doReset's own clear)
+	// against each other and against a heartbeat_pause's own heartbeat
+	// capture — see linkfault.Coordinator's doc comment.
+	linkCoord := linkfault.NewCoordinator()
 
 	st := store.New()
 
@@ -174,6 +191,7 @@ func main() {
 
 	mb := modbustcp.New(st, modbustcp.Config{Addr: *modbusAddr, ByteOrder: order, Commands: cmdProcessor})
 	mb.SetGate(gate)
+	mb.SetLinkCoordinator(linkCoord)
 	if err := mb.Start(); err != nil {
 		log.Fatalf("modbus tcp: %v", err)
 	}
@@ -184,6 +202,7 @@ func main() {
 
 	iec := iec104.New(st, iec104.Config{Addr: *iecAddr, Commands: cmdProcessor})
 	iec.SetGate(gate)
+	iec.SetLinkCoordinator(linkCoord)
 	if err := iec.Start(); err != nil {
 		log.Fatalf("iec104: %v", err)
 	}
@@ -191,7 +210,7 @@ func main() {
 
 	// Task 7: scenario engine and control API.
 	scenarioRunner := scenario.NewRunner(st, injector, cmdProcessor, runner, sharedClock, *stepInterval, iec, mb)
-	scenarioRunner.SetGate(gate)
+	scenarioRunner.SetLinkCoordinator(linkCoord)
 
 	capi := controlapi.New(controlapi.Config{
 		Addr:            cfg.ControlAPI.Bind,
@@ -206,6 +225,7 @@ func main() {
 		ModbusServer:    mb,
 		ScenariosDir:    *scenariosDir,
 		Gate:            gate,
+		LinkCoordinator: linkCoord,
 		StartupSnapshot: startupSnapshot,
 		NewEngine:       newEngine,
 		StartupInstant:  startupInstant,

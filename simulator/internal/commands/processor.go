@@ -263,37 +263,43 @@ func (p *Processor) Write(key m261points.PointKey, value float64) error {
 	return nil
 }
 
-// KeyValue is one already-validated (key, value) pair for WriteBatch.
-type KeyValue struct {
-	Key   m261points.PointKey
-	Value float64
-}
+// KeyValue is one already-validated (key, value) pair for WriteBatch — a
+// type alias (not a new type) for store.KeyValue, so a caller building
+// its own batch for store.Store.SetBatch never needs to convert between
+// two identically-shaped types.
+type KeyValue = store.KeyValue
 
-// WriteBatch commits every pair in writes as a single atomic operation
-// with respect to POST /reset (one gate.Op acquisition for the whole
-// batch, not one per pair) — for a caller (modbustcp's FC16/FC06
-// handler) that has already validated every touched point via Validate
-// and now needs to commit all of them without a concurrent Reset landing
-// partway through. Unlike Write, WriteBatch does *not* validate: it's a
-// low-level commit primitive for a caller that has already done so
-// itself and computed its own "reject the whole request, don't apply it
-// partially" decision beforehand (the same all-or-nothing rule Task 6
-// item 1 requires for a multi-register FC16 write spanning more than one
-// catalog point) — calling it with an unvalidated pair skips Validate
-// entirely, unlike Write.
+// WriteBatch commits every pair in writes as a single atomic operation —
+// for a caller (modbustcp's FC16/FC06 handler) that has already
+// validated every touched point via Validate and now needs to commit all
+// of them without a concurrent Reset, or a concurrent reader, ever
+// observing the batch partially applied. Unlike Write, WriteBatch does
+// *not* validate: it's a low-level commit primitive for a caller that
+// has already done so itself and computed its own "reject the whole
+// request, don't apply it partially" decision beforehand (the same
+// all-or-nothing rule Task 6 item 1 requires for a multi-register FC16
+// write spanning more than one catalog point) — calling it with an
+// unvalidated pair skips Validate entirely, unlike Write.
 //
-// Reviewed gap this closes: applyRegisterWrites used to call Write once
-// per touched point, each taking gate.Op independently — a POST /reset
-// could interleave between two of those calls and observe (or leave) a
-// batch partially committed, even though every point had already passed
-// validation as one all-or-nothing request.
+// Deliberately ungated (does *not* call gate.Op itself, unlike every
+// other mutating method here) — third-review-round fix: the caller
+// (modbustcp.applyRegisterWrites) needs the *entire* transaction —
+// reading each touched point's current value to build the read-modify-
+// write seed for an unaligned FC06 half-write, decoding, Validate, and
+// this final commit — to run under one gate.Op, not just the commit
+// half; WriteBatch taking its own nested gate.Op on top of that outer
+// one is exactly the "outer RLock plus nested inner Op acquisition" the
+// review warned can deadlock against a queued exclusive Reset. The
+// actual Store mutation is also now one store.Store.SetBatch call, not
+// a loop of individual Store.Set calls — SetBatch holds the Store's own
+// mutex for the whole batch, so even a concurrent reader that also holds
+// gate.Op (a shared lock, so it doesn't itself exclude another gate.Op
+// holder) can never observe only part of a multi-point batch applied.
 func (p *Processor) WriteBatch(writes []KeyValue) {
-	done := p.opDone()
-	defer done()
 	for _, kv := range writes {
 		p.applySideEffects(kv.Key, kv.Value)
-		p.store.Set(kv.Key, kv.Value)
 	}
+	p.store.SetBatch(writes)
 }
 
 // applySideEffects updates the Processor's own watchdog/diagnostic state

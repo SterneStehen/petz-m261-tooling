@@ -3,6 +3,7 @@ package controlapi
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -135,23 +136,16 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Errorf("mode: delay requires a positive delay_ms, got %d", req.DelayMS))
 		return
 	}
-	var hbValue float64
-	if req.Mode == string(linkfault.ModeHeartbeatPause) {
-		hbValue, _ = s.cfg.Store.Get(linkfault.HeartbeatKey)
-	}
 	delay := time.Duration(req.DelayMS) * time.Millisecond
-	// gate.Op held for the whole Apply call: protocol: both mutates
-	// iec104's and modbus's link state sequentially, not as one atomic
-	// step — without the gate, a concurrent POST /reset's own (also
-	// sequential) ClearLinkFaults calls could interleave with these two,
-	// leaving one protocol faulted and the other cleared, a combination
-	// neither "reset happened" nor "reset didn't happen" produces on its
-	// own. linkfault.Apply itself never acquires the gate, so this is a
-	// single, non-nested Op — safe per appgate's own reentrant-RLock
-	// warning.
-	release := s.cfg.Gate.Op()
-	err := linkfault.Apply(s.cfg.IECServer, s.cfg.ModbusServer, linkfault.Protocol(req.Protocol), linkfault.Mode(req.Mode), delay, hbValue)
-	release()
+	// linkfault.ApplyCoordinated holds LinkCoordinator for the whole
+	// heartbeat-capture-plus-Apply sequence — see its own doc comment for
+	// the races this closes: protocol: both mutating iec104's and
+	// modbus's link state as two independent, uncoordinated calls (which
+	// a concurrent POST /reset's own clear, or another link operation,
+	// could interleave with), and a heartbeat_pause's own current-value
+	// read landing before a concurrent reset, with the eventual Apply
+	// (and its now-stale captured value) landing after.
+	err := linkfault.ApplyCoordinated(s.cfg.LinkCoordinator, s.cfg.Store, s.cfg.IECServer, s.cfg.ModbusServer, linkfault.Protocol(req.Protocol), linkfault.Mode(req.Mode), delay)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err)
 		return
@@ -172,11 +166,9 @@ func (s *Server) handleLinkClear(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Errorf("malformed JSON body: %w", err))
 		return
 	}
-	// See handleLink's identical comment on why this needs one gate.Op
-	// spanning the whole (potentially protocol: both) Apply call.
-	release := s.cfg.Gate.Op()
-	err := linkfault.Apply(s.cfg.IECServer, s.cfg.ModbusServer, linkfault.Protocol(req.Protocol), linkfault.ModeClear, 0, 0)
-	release()
+	// See handleLink's identical comment on why this needs LinkCoordinator
+	// held for the whole (potentially protocol: both) Apply call.
+	err := linkfault.ApplyCoordinated(s.cfg.LinkCoordinator, s.cfg.Store, s.cfg.IECServer, s.cfg.ModbusServer, linkfault.Protocol(req.Protocol), linkfault.ModeClear, 0)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err)
 		return
@@ -248,6 +240,17 @@ func (s *Server) handleScenarioStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.cfg.ScenarioRunner.Start(); err != nil {
+		if errors.Is(err, physics.ErrClockBusy) {
+			// Reviewed gap: this used to fall through to
+			// writeScenarioError's default case (400 invalid_request),
+			// despite this package's own doc comments elsewhere promising
+			// 409 for exactly this conflict (POST /clock/advance's
+			// identical mapping) — a real, expected conflict between two
+			// legitimate requests (another external driver already owns
+			// the clock), not a malformed one.
+			writeError(w, http.StatusConflict, "clock_busy", err)
+			return
+		}
 		writeScenarioError(w, err)
 		return
 	}
@@ -282,6 +285,15 @@ type clockAdvanceRequest struct {
 	BySeconds *int64 `json:"by_seconds"`
 }
 
+// maxAdvanceSeconds is the largest by_seconds that, multiplied by
+// time.Second, still fits in a time.Duration (an int64 count of
+// nanoseconds) — a request past this silently wraps around instead of
+// erroring (Go doesn't panic on integer overflow), which is how a
+// third-review-round reproduction (by_seconds: 36028797018963968) got a
+// 204 without actually advancing the clock at all instead of a clear
+// rejection. ~292 years — far past any legitimate use of this endpoint.
+const maxAdvanceSeconds = int64(math.MaxInt64) / int64(time.Second)
+
 // handleClockAdvance calls physics.Runner.FastForward, which owns its
 // own exclusive drive-lock for the whole request (physics.Runner.
 // TryAcquireDrive/driveMu) — no separate suspend/resume needed here.
@@ -304,6 +316,10 @@ func (s *Server) handleClockAdvance(w http.ResponseWriter, r *http.Request) {
 	}
 	if *req.BySeconds < 0 {
 		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Errorf("by_seconds must be non-negative, got %d", *req.BySeconds))
+		return
+	}
+	if *req.BySeconds > maxAdvanceSeconds {
+		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Errorf("by_seconds %d exceeds the maximum representable duration (%d seconds)", *req.BySeconds, maxAdvanceSeconds))
 		return
 	}
 	total := time.Duration(*req.BySeconds) * time.Second
@@ -352,16 +368,29 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 //  1. Stop the scenario runner and rewind its cursor, keeping its
 //     lifecycle (Load/Start/Stop/ResetPlayback) locked until this whole
 //     function returns (scenario.Runner.LockForReset).
-//  2. Rewind the shared clock (always a *clock.Fake — see main.go) to
+//  2. Claim LinkCoordinator for the rest of this function — see below.
+//  3. Rewind the shared clock (always a *clock.Fake — see main.go) to
 //     StartupInstant.
-//  3. Rebuild physics.Runner's Engine from scratch (same params, same
+//  4. Rebuild physics.Runner's Engine from scratch (same params, same
 //     initial SoC, same RNG seed — NewEngine, not a new random one) and
 //     rebase its dt baseline to StartupInstant.
-//  4. Reset commands.Processor's own internal bookkeeping (watchdog
+//  5. Reset commands.Processor's own internal bookkeeping (watchdog
 //     timer, safe_state_after latch, diagnostics).
-//  5. Restore every Store value to StartupSnapshot as one atomic
+//  6. Restore every Store value to StartupSnapshot as one atomic
 //     operation (store.Store.Restore).
-//  6. Clear every active link fault on both protocol servers.
+//  7. Clear every active link fault on both protocol servers, as one
+//     linkfault.Apply(..., ModeClear) call.
+//
+// LinkCoordinator is held for this whole function, not just step 7 —
+// third-review-round fix: a heartbeat_pause request's own "read the live
+// heartbeat, then Apply" sequence (linkfault.ApplyCoordinated) needs to
+// be excluded from the *entire* window during which this function might
+// change the heartbeat's Store value (step 6) and clear the link servers'
+// own frozen-value bookkeeping (step 7) — holding the coordinator for
+// only step 7 would leave a heartbeat_pause free to capture a stale
+// pre-reset value in the gap right after step 6 restores the Store but
+// before step 7 clears the link servers, producing a pause that survives
+// the reset with a value the just-reset Store no longer has.
 func (s *Server) doReset() error {
 	fc, ok := s.cfg.Clock.(*clock.Fake)
 	if !ok {
@@ -386,6 +415,9 @@ func (s *Server) doReset() error {
 	unlockScenario := s.cfg.ScenarioRunner.LockForReset()
 	defer unlockScenario()
 
+	s.cfg.LinkCoordinator.Lock()
+	defer s.cfg.LinkCoordinator.Unlock()
+
 	release := s.cfg.Gate.Exclusive()
 	defer release()
 
@@ -393,7 +425,11 @@ func (s *Server) doReset() error {
 	s.cfg.PhysicsRunner.Reset(s.cfg.NewEngine(), s.cfg.StartupInstant)
 	s.cfg.Processor.Reset()
 	s.cfg.Store.Restore(s.cfg.StartupSnapshot)
-	s.cfg.IECServer.ClearLinkFaults()
-	s.cfg.ModbusServer.ClearLinkFaults()
+	// linkfault.Apply, not ApplyCoordinated — LinkCoordinator is already
+	// held for this whole function (above); calling ApplyCoordinated here
+	// would try to re-lock the same, non-reentrant mutex.
+	if err := linkfault.Apply(s.cfg.IECServer, s.cfg.ModbusServer, linkfault.ProtocolBoth, linkfault.ModeClear, 0, 0); err != nil {
+		return fmt.Errorf("controlapi: reset: clearing link faults: %w", err)
+	}
 	return nil
 }
