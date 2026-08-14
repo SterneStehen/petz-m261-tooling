@@ -200,6 +200,37 @@ func (s *Store) SnapshotDevice(deviceAddr int) map[m261points.PointKey]float64 {
 	return out
 }
 
+// Restore replaces every point's value with snapshot's as one atomic
+// operation with respect to concurrent Get/Set/GetByIEC/etc — no caller
+// ever observes a partially restored store (Task 7 item 7: reset must be
+// atomic relative to ticks and other API/protocol actions). snapshot is
+// normally a copy of Snapshot() taken once, right after the simulator
+// finished its own startup initialization (commands.Processor's sensible
+// defaults and physics.Runner's initial publish already applied) — this
+// is the single source of truth for "the state right after process
+// start", rather than re-deriving defaults through logic a future change
+// could drift out of sync with. Only publishes a Change for points whose
+// value actually differs from before the restore, so IEC-104 spontaneous
+// transmission reflects the reset like any other write without spamming
+// unchanged points. Keys present in the live store but absent from
+// snapshot are left untouched — callers are expected to pass a full
+// Snapshot(), which by construction has one entry per point already.
+func (s *Store) Restore(snapshot map[m261points.PointKey]float64) {
+	s.mu.Lock()
+	changed := make([]Change, 0, len(snapshot))
+	for k, v := range snapshot {
+		if cur, ok := s.values[k]; !ok || cur != v {
+			s.values[k] = v
+			changed = append(changed, Change{Key: k, Value: v})
+		}
+	}
+	s.mu.Unlock()
+
+	for _, c := range changed {
+		s.publish(c)
+	}
+}
+
 // Subscribe returns a channel of every future Change plus an unsubscribe
 // function. The channel is buffered and best-effort: a subscriber that
 // falls behind has changes dropped rather than blocking writers — general

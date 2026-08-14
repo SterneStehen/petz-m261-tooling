@@ -1,0 +1,20 @@
+# AGENT-TASK.md, Task 7 item 6: "SoC violation" — discharging must stop
+# once SoC reaches Minimum Discharge SOC (Task 6 item 4), not continue
+# past it. minimum_discharge_soc is set to 49.5% (0.5% below the
+# simulator's 50% starting SoC) specifically so the threshold is crossed
+# within commands.Processor's default watchdog window (zero_after, 60s —
+# Task 6 item 5): at 100 kW discharge, 0.5% of 261 kWh usable capacity
+# (~1.3 kWh) takes ~47s, comfortably inside that window, so this
+# scenario demonstrates the SoC limit stopping dispatch on its own, not
+# the watchdog timing out first for an unrelated reason.
+name: soc_violation
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+steps:
+  - at: 0s
+    write: {device: EMS, point: set_operating_mode, value: 2}
+  - at: 1s
+    write: {device: EMS, point: minimum_discharge_soc, value: 49.5}
+  - at: 2s
+    write: {device: EMS, point: set_active_power_kw, value: 100}
+  - at: 55s
+    expect: {device: BMS, point: soc, max: 49.5}

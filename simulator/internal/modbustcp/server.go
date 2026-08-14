@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
@@ -56,6 +57,8 @@ type Server struct {
 	quit   chan struct{}
 	connMu sync.Mutex
 	conns  map[net.Conn]struct{}
+
+	link linkState // Task 7 item 2 — see linkstate.go
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -105,6 +108,14 @@ func (s *Server) acceptLoop() {
 		if err != nil {
 			return // listener closed by Close(), or a fatal accept error either way
 		}
+		if s.link.dropped() {
+			// Task 7 item 2's drop mode refuses new connections for as
+			// long as it's active, not just the ones open when it was
+			// set — close immediately, never register or hand off to
+			// handleConn.
+			conn.Close() //nolint:errcheck
+			continue
+		}
 		s.connMu.Lock()
 		s.conns[conn] = struct{}{}
 		s.connMu.Unlock()
@@ -126,6 +137,15 @@ func (s *Server) handleConn(conn net.Conn) {
 		req, err := readMBAPFrame(conn)
 		if err != nil {
 			return // client disconnected, or malformed frame — either way, drop this connection
+		}
+		if s.link.hanging() {
+			// Task 7 item 2's hang mode: connection stays open (no
+			// Close, unlike drop), but this request — and every other
+			// one received while still hanging — never gets a response.
+			continue
+		}
+		if d := s.link.responseDelay(); d > 0 {
+			time.Sleep(d) // I/O-layer latency simulation, not a business-logic time decision
 		}
 		resp := s.handleRequest(req)
 		if _, err := conn.Write(resp); err != nil {

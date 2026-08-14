@@ -3,6 +3,7 @@ package physics
 import (
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
@@ -26,6 +27,8 @@ import (
 // remains responsible only for clipping to what's physically possible
 // right now (SoC headroom, thermal derating), per its own doc comment.
 type Runner struct {
+	mu sync.Mutex // guards engine and last — see Tick and Reset
+
 	engine   *Engine
 	store    *store.Store
 	clock    clock.Clock
@@ -52,7 +55,14 @@ func NewRunner(engine *Engine, st *store.Store, clk clock.Clock, cmds *commands.
 // since NewRunner on the first call, and writes the result into the
 // store. A non-positive elapsed duration (clock hasn't moved, or moved
 // backwards) is a no-op rather than stepping with zero/negative dt.
+//
+// Locked against Reset (Task 7 item 7): a concurrent Reset must never
+// interleave with a Tick in progress — either the whole Tick completes
+// against the pre-reset engine, or Reset completes first and this Tick
+// runs against the freshly reset one, never a mix of both.
 func (r *Runner) Tick() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	now := r.clock.Now()
 	dt := now.Sub(r.last)
 	r.last = now
@@ -62,6 +72,8 @@ func (r *Runner) Tick() {
 	r.step(dt)
 }
 
+// step assumes r.mu is already held (Tick's caller, or Reset's own
+// writeState below via NewRunner's construction-time call pattern).
 func (r *Runner) step(dt time.Duration) {
 	state := r.engine.State() // this tick's starting BMS headroom/SoC, before Step
 	activePower, reactivePower := r.commands.ResolvePower(
@@ -76,6 +88,24 @@ func (r *Runner) step(dt time.Duration) {
 	r.engine.SetMeterDirectionInverted(direction != 0)
 
 	r.engine.Step(dt, activePower, reactivePower)
+	r.writeState()
+}
+
+// Reset replaces the running Engine with a fresh one (Task 7 item 7:
+// physics returns to its initial SoC/temperature/energy/heartbeat and
+// the *same* RNG seed, not a new random one — engine must already be
+// physics.New(sameParams, sameInitialSOCPercent) the caller originally
+// used, so reset reproduces the same simulated future a fresh process
+// start would) and rebases the dt baseline to now, so the next Tick
+// computes a sane (small, non-negative) dt instead of one spanning
+// however long the simulator had been running before the reset.
+// Mutually exclusive with Tick via the same lock — see Tick's doc
+// comment.
+func (r *Runner) Reset(engine *Engine, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.engine = engine
+	r.last = now
 	r.writeState()
 }
 
@@ -104,6 +134,58 @@ func (r *Runner) Run(stepInterval time.Duration, stop <-chan struct{}) {
 			r.Tick()
 		}
 	}
+}
+
+// Rebase sets the dt baseline for the next Tick to now, without touching
+// the running Engine at all — unlike Reset, which also replaces the
+// Engine. Used when something external moved the shared clock by a large
+// jump (Task 7's scenario engine setting the clock to a scenario's
+// declared clock.start) and the very next Tick must compute a small, sane
+// dt from that new baseline instead of one spanning however long it's
+// been since the previous Tick.
+func (r *Runner) Rebase(now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.last = now
+}
+
+// FastForward advances the shared clock from its current value up to
+// current+total, calling Tick once per stepInterval-sized increment
+// along the way (the final increment may be shorter) rather than one
+// coarse jump — Task 7 item 8: a jump big enough to silently skip
+// heartbeat increments would fail "no gaps in the model-time heartbeat
+// sequence" by construction, no matter how the caller phrases the
+// request. Used directly by the 72-hour acceptance test and by Task 7's
+// POST /clock/advance; the scenario engine (package scenario) drives its
+// own, interruptible version of the same increment-then-Tick loop instead
+// of calling this, so Stop() can take effect between increments — but
+// the increment size and the "Tick once per increment, never a bigger
+// jump" rule are identical either way.
+//
+// Requires the Clock this Runner was built with to be a *clock.Fake —
+// fast-forwarding a real wall clock has no meaning, and returns an error
+// rather than silently doing nothing.
+func (r *Runner) FastForward(total, stepInterval time.Duration) error {
+	fc, ok := r.clock.(*clock.Fake)
+	if !ok {
+		return fmt.Errorf("physics: FastForward requires a *clock.Fake clock, got %T", r.clock)
+	}
+	if total < 0 {
+		return fmt.Errorf("physics: FastForward total must be non-negative, got %s", total)
+	}
+	if stepInterval <= 0 {
+		return fmt.Errorf("physics: FastForward stepInterval must be positive, got %s", stepInterval)
+	}
+	target := fc.Now().Add(total)
+	for fc.Now().Before(target) {
+		next := fc.Now().Add(stepInterval)
+		if next.After(target) {
+			next = target
+		}
+		fc.Set(next)
+		r.Tick()
+	}
+	return nil
 }
 
 func (r *Runner) set(device, slug string, value float64) {

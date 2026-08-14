@@ -1218,3 +1218,62 @@ func TestDemandControlAndLoadTrackingWriteUpdatesStoreAndReadbackRegardless(t *t
 		}
 	}
 }
+
+// --- Reset (Task 7 item 7) -------------------------------------------------
+
+// TestResetClearsWatchdogLatchAndDiagnostics dirties every piece of
+// internal state Reset is documented to clear, then confirms all three
+// are gone: the watchdog timer (a fresh Remote-mode dispatch after Reset
+// must not immediately look stale just because a write happened long
+// before Reset), the safe_state_after latch, and accumulated Diagnostics.
+func TestResetClearsWatchdogLatchAndDiagnostics(t *testing.T) {
+	p, clk := newProcessorWithWatchdog(t, commands.WatchdogSafeStateAfter, 10*time.Second)
+
+	// Latch the watchdog.
+	clk.Advance(10 * time.Second)
+	if active, _ := p.ResolvePower(clk.Now(), 130.5, 130.5, 50, false, false); active != 0 {
+		t.Fatalf("setup: dispatch after timeout = %v, want 0 (latched)", active)
+	}
+
+	// Accumulate a Diagnostic (Trip, accepted_but_unsupported).
+	dangerousP, _, _ := newAllowDangerousProcessor(t)
+	if err := dangerousP.Write(emsKey("trip"), 1); err != nil {
+		t.Fatalf("Write(trip, 1): %v", err)
+	}
+	if len(dangerousP.Diagnostics()) == 0 {
+		t.Fatal("setup: expected at least one Diagnostic after Write(trip, 1)")
+	}
+	dangerousP.Reset()
+	if got := dangerousP.Diagnostics(); len(got) != 0 {
+		t.Errorf("Diagnostics() after Reset = %v, want empty", got)
+	}
+
+	p.Reset()
+
+	// Watchdog: re-entering Remote and writing a fresh setpoint must
+	// dispatch immediately — if the latch or timer had survived Reset,
+	// this would still read 0.
+	setMode(t, p, modeRemote)
+	if err := p.Write(emsKey("set_active_power_kw"), 40); err != nil {
+		t.Fatal(err)
+	}
+	if active, _ := p.ResolvePower(clk.Now(), 130.5, 130.5, 50, false, false); active != 40 {
+		t.Errorf("dispatch immediately after Reset + fresh Remote setpoint = %v, want 40 (watchdog/latch cleared)", active)
+	}
+}
+
+// TestResetDoesNotTouchStore confirms Reset's documented scope: it resets
+// the Processor's own internal bookkeeping only — the caller (Task 7's
+// controlapi) is responsible for restoring Store values separately (e.g.
+// store.Store.Restore). A setpoint written before Reset must still read
+// back the same value after.
+func TestResetDoesNotTouchStore(t *testing.T) {
+	p, st, _ := newProcessor(t)
+	if err := p.Write(emsKey("maximum_charge_soc"), 77); err != nil {
+		t.Fatal(err)
+	}
+	p.Reset()
+	if v, _ := st.Get(emsKey("maximum_charge_soc")); v != 77 {
+		t.Errorf("maximum_charge_soc after Reset = %v, want unchanged 77 — Reset must not touch the Store", v)
+	}
+}

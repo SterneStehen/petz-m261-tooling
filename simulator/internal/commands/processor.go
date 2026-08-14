@@ -526,6 +526,28 @@ func (p *Processor) applyPowerLimits(activeKW, socPercent, bmsMaxChargeKW, bmsMa
 	}
 }
 
+// Reset returns the Processor's own internal bookkeeping — not the Store
+// itself, callers restore that separately (e.g. store.Store.Restore) —
+// to what it was immediately after NewProcessor (Task 7 item 7): the
+// watchdog's last-Remote-setpoint timer cleared, the safe_state_after
+// latch released exactly as if the process had just started (not
+// "released as if Remote had just been re-entered" — ResolvePower's own
+// mode-transition detection handles that distinction on its own the next
+// time it runs), every accumulated Diagnostic discarded, and the
+// Remote-mode re-entry tracking reset to its unreachable-until-first-call
+// sentinel.
+func (p *Processor) Reset() {
+	p.mu.Lock()
+	p.lastRemoteSetpointAt = time.Time{}
+	p.safeStateLatched = false
+	p.lastObservedMode = -1
+	p.mu.Unlock()
+
+	p.diagMu.Lock()
+	p.diagnostics = nil // matches NewProcessor's own unset-until-first-recordDiagnostic state
+	p.diagMu.Unlock()
+}
+
 func (p *Processor) get(slug string) float64 {
 	v, _ := p.store.Get(emsKey(slug))
 	return v

@@ -1,0 +1,21 @@
+# AGENT-TASK.md, Task 7 item 6: "loss of connection to EMS" — distinct
+# from link_loss_iec104_modbus.yaml's general connectivity-drop demo.
+# This one specifically exercises the consequence of losing contact with
+# EMS long enough that a live Remote-mode dispatch can no longer be
+# refreshed: commands.Processor's watchdog (Task 6 item 5; default
+# watchdog.mode=zero_after, watchdog.timeout_s=60) zeroes dispatched
+# power once the last Set Active Power write goes stale, exactly what
+# happens operationally if the link to EMS drops mid-dispatch.
+name: ems_link_loss
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+steps:
+  - at: 0s
+    write: {device: EMS, point: set_operating_mode, value: 2}
+  - at: 1s
+    write: {device: EMS, point: set_active_power_kw, value: -50}
+  - at: 2s
+    link: {protocol: both, mode: drop}
+  - at: 65s
+    expect: {device: EMS, point: last_charge_discharge_power_kw, value: 0}
+  - at: 66s
+    link: {protocol: both, mode: clear}

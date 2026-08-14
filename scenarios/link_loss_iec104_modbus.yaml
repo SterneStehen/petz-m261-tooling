@@ -1,0 +1,16 @@
+# AGENT-TASK.md, Task 7 item 6: replaces the removed "cloud loss" item —
+# the cloud platform is explicitly out of scope (§0, AGENT-CODE-REVIEW.md
+# "Role and boundaries"). Demonstrates a general protocol connectivity
+# failure (drop, item 2) on both protocols at once and recovery via
+# link: clear.
+name: link_loss_iec104_modbus
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+steps:
+  - at: 0s
+    write: {device: EMS, point: set_operating_mode, value: 2}
+  - at: 1s
+    link: {protocol: both, mode: drop}
+  - at: 2s
+    link: {protocol: both, mode: clear}
+  - at: 3s
+    expect: {device: EMS, point: online_status, value: 1}

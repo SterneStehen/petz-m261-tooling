@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
@@ -124,6 +125,15 @@ func (s *Server) handleReadRegisters(unitID byte, pdu []byte, class int) []byte 
 		if !ok {
 			meta := m261points.Points[slot.key]
 			val, _ := s.store.Get(slot.key)
+			if slot.key == linkfault.HeartbeatKey {
+				// Task 7 item 2's heartbeat_pause: this protocol's
+				// clients stop seeing the counter move, even though it
+				// keeps incrementing underneath in the Store — see
+				// linkState.heartbeatOverride.
+				if frozen, paused := s.link.heartbeatOverride(); paused {
+					val = frozen
+				}
+			}
 			enc = encodeRegisterPair(val, meta, s.cfg.ByteOrder)
 			cache[slot.key] = enc
 		}

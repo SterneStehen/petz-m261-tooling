@@ -412,3 +412,163 @@ func TestMultipleCommonAddressesHandledIndependently(t *testing.T) {
 		}
 	}
 }
+
+// --- Task 7 item 2: link faults --------------------------------------------
+
+// heartbeatIOA is EMS Periodic Heartbeat Indicator's IEC-104 address
+// (iec104_addr 16400), verified against the real catalog.
+const heartbeatIOA = 16400
+
+// giValue runs a general interrogation on an already-STARTDT'd connection
+// and returns the M_ME_NC_1 value for the given IOA, or (0, false) if it
+// wasn't present in the response. Always drains all the way through
+// activation termination, even after finding ioa — leaving unread
+// trailing frames in the socket buffer would corrupt a later call on the
+// same connection (its sendI would race the still-pending response of
+// this call).
+func giValue(c *rawClient, commonAddr, ioa int) (float32, bool) {
+	c.sendI(rawGeneralInterrogation(commonAddr))
+	value, found := float32(0), false
+	for {
+		asdu := c.nextI()
+		typeID, cot := asdu[0], asdu[2]
+		if typeID == 100 && cot == cotActivationTermination {
+			return value, found
+		}
+		if typeID == 100 {
+			continue
+		}
+		gotIOA := int(asdu[6]) | int(asdu[7])<<8 | int(asdu[8])<<16
+		if typeID == typeMMENC1 && gotIOA == ioa {
+			value, found = decodeFloat32(asdu[9:13]), true
+		}
+	}
+}
+
+func TestIEC104LinkDropClosesExistingAndRefusesNewConnections(t *testing.T) {
+	st := store.New()
+	srv, addr := startServer(t, st)
+	c := dialRaw(t, addr)
+	c.startDT()
+
+	srv.SetDrop()
+
+	c.nc.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := c.nc.Read(make([]byte, 1)); err == nil {
+		t.Error("read on a connection open before SetDrop succeeded, want an error (connection force-closed)")
+	}
+
+	nc2, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+	if err == nil {
+		defer nc2.Close()
+		nc2.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		if _, rerr := nc2.Read(make([]byte, 1)); rerr == nil {
+			t.Error("new connection accepted and answered while drop is active, want refused")
+		}
+	}
+
+	srv.ClearLinkFaults()
+	c2 := dialRaw(t, addr)
+	c2.startDT() // must complete normally now — fails the test (via t.Fatalf) otherwise
+}
+
+func TestIEC104LinkHangSendsNoResponse(t *testing.T) {
+	st := store.New()
+	srv, addr := startServer(t, st)
+	c := dialRaw(t, addr)
+	c.startDT()
+
+	srv.SetHang()
+	c.sendI(rawGeneralInterrogation(emsCommonAddr))
+	c.nc.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := c.nc.Read(make([]byte, 1)); err == nil {
+		t.Error("read while hanging returned data, want a timeout (no response of any kind)")
+	}
+
+	srv.ClearLinkFaults()
+	c2 := dialRaw(t, addr)
+	c2.startDT()
+	if _, ok := giValue(c2, emsCommonAddr, 16389); !ok {
+		// desired_active_power_kw, always present — just proving a fresh
+		// connection works normally once hang is cleared.
+		t.Error("GI on a fresh connection after ClearLinkFaults saw no telemetry")
+	}
+}
+
+func TestIEC104LinkDelayDelaysResponse(t *testing.T) {
+	st := store.New()
+	srv, addr := startServer(t, st)
+	c := dialRaw(t, addr)
+	c.startDT()
+
+	const delay = 200 * time.Millisecond
+	srv.SetDelay(delay)
+
+	start := time.Now()
+	c.sendI(rawGeneralInterrogation(emsCommonAddr))
+	c.nextI() // the activation confirmation — first frame back
+	if elapsed := time.Since(start); elapsed < delay {
+		t.Errorf("first response frame arrived after %s, want at least %s (SetDelay)", elapsed, delay)
+	}
+	// Drain the rest of this GI so it doesn't bleed into other assertions.
+	for {
+		asdu := c.nextI()
+		if asdu[0] == 100 && asdu[2] == cotActivationTermination {
+			break
+		}
+	}
+
+	srv.ClearLinkFaults()
+	start = time.Now()
+	c.sendI(rawGeneralInterrogation(emsCommonAddr))
+	c.nextI()
+	if elapsed := time.Since(start); elapsed >= delay {
+		t.Errorf("first response frame after ClearLinkFaults took %s, want well under %s (delay cleared)", elapsed, delay)
+	}
+}
+
+func TestIEC104LinkHeartbeatPauseFreezesGeneralInterrogation(t *testing.T) {
+	st := store.New()
+	heartbeatKey := m261points.PointKey{Device: "EMS", Slug: "ems_periodic_heartbeat_indicator"}
+	st.Set(heartbeatKey, 10)
+	srv, addr := startServer(t, st)
+	c := dialRaw(t, addr)
+	c.startDT()
+
+	srv.SetHeartbeatPause(10)
+	st.Set(heartbeatKey, 99) // the live simulator keeps incrementing underneath
+
+	got, ok := giValue(c, emsCommonAddr, heartbeatIOA)
+	if !ok {
+		t.Fatal("GI response didn't include the heartbeat point")
+	}
+	if got != 10 {
+		t.Errorf("heartbeat via GI while paused = %v, want the frozen value 10 (live Store value is 99)", got)
+	}
+
+	srv.ClearLinkFaults()
+	got, ok = giValue(c, emsCommonAddr, heartbeatIOA)
+	if !ok {
+		t.Fatal("GI response after ClearLinkFaults didn't include the heartbeat point")
+	}
+	if got != 99 {
+		t.Errorf("heartbeat via GI after ClearLinkFaults = %v, want the live value 99", got)
+	}
+}
+
+func TestIEC104LinkHeartbeatPauseSuppressesSpontaneousTransmission(t *testing.T) {
+	st := store.New()
+	heartbeatKey := m261points.PointKey{Device: "EMS", Slug: "ems_periodic_heartbeat_indicator"}
+	srv, addr := startServer(t, st)
+	c := dialRaw(t, addr)
+	c.startDT()
+	time.Sleep(20 * time.Millisecond) // let the STARTDT_CON settle before relying on "started"
+
+	srv.SetHeartbeatPause(0)
+	st.Set(heartbeatKey, 1) // would normally trigger a spontaneous M_ME_NC_1
+
+	c.nc.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := c.nc.Read(make([]byte, 1)); err == nil {
+		t.Error("received a frame after a Store change to a paused heartbeat point, want none (suppressed)")
+	}
+}

@@ -7,9 +7,11 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
@@ -40,6 +42,8 @@ type Server struct {
 
 	connMu sync.Mutex
 	conns  map[*clientConn]struct{}
+
+	link linkState // Task 7 item 2 — see linkstate.go
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -88,6 +92,12 @@ func (s *Server) acceptLoop() {
 		if err != nil {
 			return
 		}
+		if s.link.dropped() {
+			// Task 7 item 2's drop mode refuses new connections for as
+			// long as it's active — close immediately, never register.
+			nc.Close() //nolint:errcheck
+			continue
+		}
 		c := &clientConn{srv: s, nc: nc}
 		s.connMu.Lock()
 		s.conns[c] = struct{}{}
@@ -107,6 +117,17 @@ func (s *Server) spontaneousLoop(changes <-chan store.Change) {
 		meta, ok := m261points.Points[c.Key]
 		if !ok {
 			continue
+		}
+		if c.Key == linkfault.HeartbeatKey {
+			// Task 7 item 2's heartbeat_pause: this protocol's clients
+			// stop seeing the counter move, even though it keeps
+			// incrementing (and publishing Changes) underneath in the
+			// Store — general interrogation (handleGeneralInterrogation)
+			// is the one place a client sees it again, still frozen,
+			// until cleared.
+			if _, paused := s.link.heartbeatOverride(); paused {
+				continue
+			}
 		}
 		asdu := monitoredASDU(meta, c.Value, cotSpontaneous)
 		if asdu == nil {
@@ -259,6 +280,16 @@ func (s *Server) handleConn(c *clientConn) {
 		if err != nil {
 			return
 		}
+		if s.link.hanging() {
+			// Task 7 item 2's hang mode: connection stays open, but this
+			// frame — and every other one received while still hanging —
+			// gets no reply of any kind (no S-frame ack, no U-frame
+			// confirmation, no ASDU response).
+			continue
+		}
+		if d := s.link.responseDelay(); d > 0 {
+			time.Sleep(d) // I/O-layer latency simulation, not a business-logic time decision
+		}
 		switch f.format {
 		case formatU:
 			switch f.uType {
@@ -320,7 +351,13 @@ func (s *Server) handleGeneralInterrogation(c *clientConn, hdr asduHeader, objs 
 	})
 	for _, k := range keys {
 		meta := m261points.Points[k]
-		if asdu := monitoredASDU(meta, snap[k], cotInterrogatedByStation); asdu != nil {
+		value := snap[k]
+		if k == linkfault.HeartbeatKey {
+			if frozen, paused := s.link.heartbeatOverride(); paused {
+				value = frozen
+			}
+		}
+		if asdu := monitoredASDU(meta, value, cotInterrogatedByStation); asdu != nil {
 			c.writeIFrame(asdu) //nolint:errcheck
 		}
 	}

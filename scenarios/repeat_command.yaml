@@ -1,0 +1,14 @@
+# AGENT-TASK.md, Task 7 item 6: "repeat command" — the exact same
+# setpoint write sent twice must be idempotent: no error, and the store
+# ends up at the value both writes agreed on.
+name: repeat_command
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+steps:
+  - at: 0s
+    write: {device: EMS, point: set_operating_mode, value: 2}
+  - at: 1s
+    write: {device: EMS, point: set_active_power_kw, value: -20}
+  - at: 2s
+    write: {device: EMS, point: set_active_power_kw, value: -20}
+  - at: 3s
+    expect: {device: EMS, point: set_active_power_kw, value: -20}

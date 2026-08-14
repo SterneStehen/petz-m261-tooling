@@ -270,3 +270,150 @@ func TestNewRunnerPublishesInitialStateImmediately(t *testing.T) {
 		t.Errorf("online_status immediately after NewRunner = %v, want 1", online)
 	}
 }
+
+// TestResetReseedsEngineDeterministically is Task 7 item 7's core
+// requirement: reset must reproduce the same simulated future a fresh
+// process start would, not just some valid one — same RNG seed, not a
+// new random one. Cell voltage bias (drawn once from the RNG at
+// construction, per-cell, never touched again) is a direct, deterministic
+// fingerprint of the seed: a Reset engine and a freshly constructed one
+// built from the identical params/initial SoC must produce byte-identical
+// bias, proving Reset didn't silently reseed.
+func TestResetReseedsEngineDeterministically(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	proc := newTestProcessor(t, st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+	clk.Advance(10 * time.Second)
+	r.Tick() // drift the engine away from its freshly-constructed state
+
+	clk.Advance(time.Hour) // simulate a long-running process before reset
+	r.Reset(New(DefaultParams(), 50), clk.Now())
+
+	got := get(t, st, "BMS", "battery_total_voltage_v")
+
+	// A wholly independent, freshly constructed Runner built the same way
+	// NewRunner was originally built above must land on the exact same
+	// voltage — both derive it from the same RNG seed via the same
+	// construction path, so if Reset had reseeded randomly, this would
+	// not match (or would match only by 1-in-huge-odds coincidence).
+	st2 := store.New()
+	clk2 := clock.NewFake(time.Now())
+	NewRunner(New(DefaultParams(), 50), st2, clk2, newTestProcessor(t, st2, clk2))
+	want := get(t, st2, "BMS", "battery_total_voltage_v")
+
+	if got != want {
+		t.Errorf("battery_total_voltage_v after Reset = %v, want %v (same RNG seed as a fresh start)", got, want)
+	}
+}
+
+// TestResetRebasesDtBaseline proves Reset doesn't leave the next Tick
+// computing dt across however long the simulator had been running before
+// the reset — a large stale dt would apply an entire "missing" period's
+// worth of energy/thermal change in one Step, right after reset claims to
+// have returned to a known-good initial state.
+func TestResetRebasesDtBaseline(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	proc := newTestProcessor(t, st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+	clk.Advance(24 * time.Hour) // a long gap with no Tick at all
+	r.Reset(New(DefaultParams(), 50), clk.Now())
+
+	hbBeforeTick := get(t, st, "EMS", "ems_periodic_heartbeat_indicator")
+	clk.Advance(time.Second)
+	r.Tick()
+	hbAfterTick := get(t, st, "EMS", "ems_periodic_heartbeat_indicator")
+
+	if hbAfterTick != hbBeforeTick+1 {
+		t.Errorf("heartbeat after one 1s Tick post-Reset = %v (was %v), want exactly +1 — dt baseline wasn't rebased to Reset's own now", hbAfterTick, hbBeforeTick)
+	}
+}
+
+// TestRebaseDoesNotReplaceEngine distinguishes Rebase from Reset: only
+// the dt baseline moves, SoC/temperature/energy (the running Engine's own
+// state) is untouched.
+func TestRebaseDoesNotReplaceEngine(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	proc := newTestProcessor(t, st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+	if err := proc.Write(m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}, -50); err != nil {
+		t.Fatalf("Write(set_active_power_kw, -50): %v", err)
+	}
+	clk.Advance(time.Minute)
+	r.Tick()
+	socBeforeRebase := get(t, st, "BMS", "soc")
+
+	clk.Advance(time.Hour)
+	r.Rebase(clk.Now())
+	socAfterRebase := get(t, st, "BMS", "soc")
+
+	if socAfterRebase != socBeforeRebase {
+		t.Errorf("SoC changed from %v to %v across Rebase alone (no Tick in between) — Rebase must not touch Engine state", socBeforeRebase, socAfterRebase)
+	}
+
+	// And the next Tick's dt is measured from Rebase's now, not from the
+	// last real Tick an hour "ago" — a 1s Tick should look like a 1s Tick,
+	// not a ~1-hour one.
+	hbBefore := get(t, st, "EMS", "ems_periodic_heartbeat_indicator")
+	clk.Advance(time.Second)
+	r.Tick()
+	hbAfter := get(t, st, "EMS", "ems_periodic_heartbeat_indicator")
+	if hbAfter != hbBefore+1 {
+		t.Errorf("heartbeat after one 1s Tick post-Rebase = %v (was %v), want exactly +1", hbAfter, hbBefore)
+	}
+}
+
+// TestFastForwardTicksOncePerStepInterval is Task 7 item 8's "no gaps"
+// requirement at its most direct: HeartbeatCounter increments exactly
+// once per Engine.Step call, so advancing total=10s at stepInterval=1s
+// must produce exactly 10 Ticks, not one coarse jump.
+func TestFastForwardTicksOncePerStepInterval(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	proc := newTestProcessor(t, st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+	if err := r.FastForward(10*time.Second, time.Second); err != nil {
+		t.Fatalf("FastForward: %v", err)
+	}
+
+	if hb := get(t, st, "EMS", "ems_periodic_heartbeat_indicator"); hb != 10 {
+		t.Errorf("heartbeat after FastForward(10s, 1s) = %v, want exactly 10 (one per stepInterval, no gaps)", hb)
+	}
+}
+
+// TestFastForwardHandlesNonMultipleTotal proves the final, shorter
+// increment (when total isn't an exact multiple of stepInterval) still
+// results in exactly one extra Tick, not a skipped or double-counted one.
+func TestFastForwardHandlesNonMultipleTotal(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	proc := newTestProcessor(t, st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+	if err := r.FastForward(2500*time.Millisecond, time.Second); err != nil {
+		t.Fatalf("FastForward: %v", err)
+	}
+	if hb := get(t, st, "EMS", "ems_periodic_heartbeat_indicator"); hb != 3 {
+		t.Errorf("heartbeat after FastForward(2.5s, 1s) = %v, want 3 (1s, 1s, then a final 0.5s increment)", hb)
+	}
+}
+
+// TestFastForwardRequiresFakeClock proves fast-forwarding against a real
+// clock — which cannot be told to report a specific future time — fails
+// clearly instead of silently doing nothing or panicking.
+func TestFastForwardRequiresFakeClock(t *testing.T) {
+	st := store.New()
+	clk := clock.Real{}
+	proc := newTestProcessor(t, st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+	if err := r.FastForward(time.Second, time.Second); err == nil {
+		t.Error("FastForward with a clock.Real succeeded, want an error")
+	}
+}

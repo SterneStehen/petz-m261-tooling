@@ -316,3 +316,141 @@ func TestUnitIDRouting(t *testing.T) {
 		t.Fatalf("unit 2 read returned EMS's value: %v", regs)
 	}
 }
+
+// --- Task 7 item 2: link faults --------------------------------------------
+//
+// heartbeatWireAddr is EMS Periodic Heartbeat Indicator's wire address
+// (modbus_addr 30031, class 4 — 30031-30001=30), verified against the
+// real catalog.
+const heartbeatWireAddr = 30
+
+func newClientWithTimeout(t *testing.T, addr string, unit byte, timeout time.Duration) gomodbus.Client {
+	t.Helper()
+	handler := gomodbus.NewTCPClientHandler(addr)
+	handler.SlaveId = unit
+	handler.Timeout = timeout
+	if err := handler.Connect(); err != nil {
+		t.Fatalf("client Connect: %v", err)
+	}
+	t.Cleanup(func() { handler.Close() })
+	return gomodbus.NewClient(handler)
+}
+
+func TestLinkDropClosesExistingAndRefusesNewConnections(t *testing.T) {
+	st := store.New()
+	srv, addr := startServer(t, st, m261points.BigEndian)
+	client := newClient(t, addr, emsUnit)
+	if _, err := client.ReadInputRegisters(8, 2); err != nil {
+		t.Fatalf("read before drop: %v", err)
+	}
+
+	srv.SetDrop()
+
+	// The already-open connection must be force-closed, not merely left
+	// unanswered — the very next request on it fails outright.
+	if _, err := client.ReadInputRegisters(8, 2); err == nil {
+		t.Error("read on a connection open before SetDrop succeeded, want an error (connection force-closed)")
+	}
+
+	// A brand new connection attempt must also be refused while drop is
+	// active.
+	handler := gomodbus.NewTCPClientHandler(addr)
+	handler.SlaveId = emsUnit
+	handler.Timeout = 500 * time.Millisecond
+	if err := handler.Connect(); err == nil {
+		defer handler.Close()
+		if _, rerr := gomodbus.NewClient(handler).ReadInputRegisters(8, 2); rerr == nil {
+			t.Error("new connection accepted and answered while drop is active, want refused")
+		}
+	}
+
+	srv.ClearLinkFaults()
+	client2 := newClient(t, addr, emsUnit)
+	if _, err := client2.ReadInputRegisters(8, 2); err != nil {
+		t.Errorf("read after ClearLinkFaults: %v, want a normal successful read", err)
+	}
+}
+
+func TestLinkHangSendsNoResponse(t *testing.T) {
+	st := store.New()
+	srv, addr := startServer(t, st, m261points.BigEndian)
+	client := newClientWithTimeout(t, addr, emsUnit, 300*time.Millisecond)
+
+	srv.SetHang()
+	if _, err := client.ReadInputRegisters(8, 2); err == nil {
+		t.Error("read while hanging succeeded, want a client-side timeout (no response at all)")
+	}
+
+	srv.ClearLinkFaults()
+	client2 := newClient(t, addr, emsUnit)
+	if _, err := client2.ReadInputRegisters(8, 2); err != nil {
+		t.Errorf("read after ClearLinkFaults: %v, want a normal successful read", err)
+	}
+}
+
+func TestLinkDelayDelaysResponse(t *testing.T) {
+	st := store.New()
+	srv, addr := startServer(t, st, m261points.BigEndian)
+	client := newClientWithTimeout(t, addr, emsUnit, 2*time.Second)
+
+	const delay = 200 * time.Millisecond
+	srv.SetDelay(delay)
+
+	start := time.Now()
+	if _, err := client.ReadInputRegisters(8, 2); err != nil {
+		t.Fatalf("read while delayed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < delay {
+		t.Errorf("read returned after %s, want at least %s (SetDelay)", elapsed, delay)
+	}
+
+	srv.ClearLinkFaults()
+	start = time.Now()
+	if _, err := client.ReadInputRegisters(8, 2); err != nil {
+		t.Fatalf("read after ClearLinkFaults: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= delay {
+		t.Errorf("read after ClearLinkFaults took %s, want well under %s (delay cleared)", elapsed, delay)
+	}
+}
+
+func TestLinkHeartbeatPauseFreezesReadValue(t *testing.T) {
+	st := store.New()
+	heartbeatKey := m261points.PointKey{Device: "EMS", Slug: "ems_periodic_heartbeat_indicator"}
+	st.Set(heartbeatKey, 10)
+	srv, addr := startServer(t, st, m261points.BigEndian)
+	client := newClient(t, addr, emsUnit)
+
+	srv.SetHeartbeatPause(10)
+	st.Set(heartbeatKey, 99) // the "live" simulator keeps incrementing underneath
+
+	regs, err := client.ReadInputRegisters(heartbeatWireAddr, 2)
+	if err != nil {
+		t.Fatalf("ReadInputRegisters(heartbeat): %v", err)
+	}
+	if got := int32(binary.BigEndian.Uint32(regs)); got != 10 {
+		t.Errorf("heartbeat read while paused = %v, want the frozen value 10 (live Store value is 99)", got)
+	}
+
+	srv.ClearLinkFaults()
+	regs, err = client.ReadInputRegisters(heartbeatWireAddr, 2)
+	if err != nil {
+		t.Fatalf("ReadInputRegisters(heartbeat) after clear: %v", err)
+	}
+	if got := int32(binary.BigEndian.Uint32(regs)); got != 99 {
+		t.Errorf("heartbeat read after ClearLinkFaults = %v, want the live value 99", got)
+	}
+}
+
+func TestLinkFaultModesAreIndependent(t *testing.T) {
+	st := store.New()
+	srv, _ := startServer(t, st, m261points.BigEndian)
+
+	srv.SetDelay(50 * time.Millisecond)
+	if srv.link.dropped() || srv.link.hanging() {
+		t.Error("SetDelay alone unexpectedly also set drop or hang")
+	}
+	if d := srv.link.responseDelay(); d != 50*time.Millisecond {
+		t.Errorf("responseDelay() = %v, want 50ms", d)
+	}
+}

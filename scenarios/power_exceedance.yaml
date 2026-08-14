@@ -1,0 +1,13 @@
+# AGENT-TASK.md, Task 7 item 6: "power exceedance" — a Set Active Power
+# request (500 kW) far above System Maximum Discharge Power (default
+# 130.5 kW, §4.8 nameplate — Task 6 item 4) must be clipped at dispatch,
+# not executed literally.
+name: power_exceedance
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+steps:
+  - at: 0s
+    write: {device: EMS, point: set_operating_mode, value: 2}
+  - at: 1s
+    write: {device: EMS, point: set_active_power_kw, value: 500}
+  - at: 5s
+    expect: {device: EMS, point: last_charge_discharge_power_kw, max: 130.5}

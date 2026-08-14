@@ -182,3 +182,122 @@ func countDevice(device string) int {
 	}
 	return n
 }
+
+// TestRestoreReturnsToSnapshot is Task 7 item 7's core building block:
+// take a snapshot, dirty the store, Restore, and the store must be
+// byte-for-byte (well, float-for-float) back to the snapshot — including
+// points nothing else touched, not just the one deliberately dirtied.
+func TestRestoreReturnsToSnapshot(t *testing.T) {
+	s := New()
+	key := m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}
+	baseline := s.Snapshot()
+
+	s.Set(key, -42)
+	if v, _ := s.Get(key); v != -42 {
+		t.Fatalf("Set didn't take effect before Restore, got %v", v)
+	}
+
+	s.Restore(baseline)
+
+	got := s.Snapshot()
+	if len(got) != len(baseline) {
+		t.Fatalf("Snapshot after Restore has %d points, want %d", len(got), len(baseline))
+	}
+	for k, want := range baseline {
+		if got[k] != want {
+			t.Errorf("after Restore, %v = %v, want %v", k, got[k], want)
+		}
+	}
+}
+
+// TestRestorePublishesOnlyChangedPoints proves Restore doesn't spam every
+// subscriber with len(snapshot) Changes when only one point actually
+// differed — it would defeat IEC-104 spontaneous transmission's whole
+// point (only telling clients what actually moved) if reset looked like
+// every one of 1513 points changing at once.
+func TestRestorePublishesOnlyChangedPoints(t *testing.T) {
+	s := New()
+	// A telemetry point, deliberately — a setpoint's Set also mirrors
+	// onto its readback twin (a second point), which would make this
+	// test about readback mirroring instead of about Restore's own
+	// change-filtering.
+	key := m261points.PointKey{Device: "BMS", Slug: "soc"}
+	baseline := s.Snapshot()
+	s.Set(key, -42)
+
+	ch, unsubscribe := s.Subscribe()
+	defer unsubscribe()
+
+	s.Restore(baseline)
+
+	select {
+	case c := <-ch:
+		if c.Key != key || c.Value != 0 {
+			t.Fatalf("got Change %+v, want {%v 0}", c, key)
+		}
+	default:
+		t.Fatal("expected exactly one Change (the point Restore actually changed), got none")
+	}
+	select {
+	case c := <-ch:
+		t.Fatalf("got an unexpected second Change %+v — Restore must only publish points that actually changed", c)
+	default:
+	}
+}
+
+// TestRestoreIsAtomicUnderConcurrentAccess is Task 7 item 7's atomicity
+// requirement: a concurrent reader must never observe a store where some
+// points already reflect the restored snapshot and others still hold
+// their pre-Restore values — every point here starts at 0 and the
+// snapshot sets every point to the same sentinel, so a single Snapshot()
+// call that contains both 0 and sentinel proves a torn (non-atomic)
+// Restore. A per-key Get loop can't detect this on its own — each
+// individual key is always internally consistent (0 or sentinel), only
+// the aggregate across keys can be torn — so this repeatedly takes a
+// full Snapshot() concurrently with Restore instead.
+func TestRestoreIsAtomicUnderConcurrentAccess(t *testing.T) {
+	s := New()
+	const sentinel = 12345.0
+	snapshot := s.Snapshot()
+	for k := range snapshot {
+		snapshot[k] = sentinel
+	}
+
+	torn := make(chan struct{}, 1)
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			snap := s.Snapshot()
+			sawZero, sawSentinel := false, false
+			for _, v := range snap {
+				switch v {
+				case 0:
+					sawZero = true
+				case sentinel:
+					sawSentinel = true
+				}
+			}
+			if sawZero && sawSentinel {
+				select {
+				case torn <- struct{}{}:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	s.Restore(snapshot)
+	close(stop)
+
+	select {
+	case <-torn:
+		t.Fatal("observed a torn Restore: a single Snapshot() contained both pre- and post-Restore values")
+	default:
+	}
+}
