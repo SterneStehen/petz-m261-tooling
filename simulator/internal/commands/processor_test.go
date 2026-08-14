@@ -332,6 +332,47 @@ func TestValidateDecimalScaleBoundary(t *testing.T) {
 	}
 }
 
+// TestWriteRejectsNearIntegerButFractionalI16Value is the third review's
+// required negative case for snapToIntegerWithinTolerance: the tolerance
+// must be tight enough, in absolute (ULP) terms, that a value merely
+// close to an integer -- not a division-rounding artifact of one -- is
+// still rejected as fractional, not silently snapped to that integer.
+//
+// This is exactly the failure mode the earlier 1e-9-relative-tolerance
+// version had: 1e-9 * |raw| is about 3.28e-5 at raw=32767, and
+// 32767.00001 is only 1e-5 away from 32767 -- inside that window, so the
+// old code snapped it to 32767 and accepted it. Measured in the ULPs the
+// fixed version actually bounds tolerance by, 32767.00001 sits roughly
+// 2.75 million float64 ULPs from 32767 -- nothing like the single-ULP gap
+// a real division rounding error produces (see
+// TestValidateDecimalScaleBoundary) -- so it must be rejected outright.
+//
+// Uses scale=1 (system_maximum_charge_power's real, unmodified catalog
+// scale, like TestWriteI16ExactBoundaries) rather than a fixture: at
+// scale=1, raw == value exactly (division by 1 is exact, no float64
+// rounding of its own), so this isolates the tolerance check itself from
+// any scale-division rounding, which is deliberately exercised separately
+// above. The negative boundary (-32767.00001, the same magnitude mirrored
+// across zero) is included rather than assumed: float64 ULP spacing is
+// symmetric around zero, but snapToIntegerWithinTolerance's use of
+// math.Nextafter(rounded, +Inf) for a negative rounded is exactly the
+// kind of sign-handling detail worth a direct assertion instead of a
+// belief.
+func TestWriteRejectsNearIntegerButFractionalI16Value(t *testing.T) {
+	for _, v := range []float64{32767.00001, -32767.00001} {
+		p, st, _ := newProcessor(t)
+		before, _ := st.Get(emsKey("system_maximum_charge_power"))
+		if err := p.Write(emsKey("system_maximum_charge_power"), v); err == nil {
+			t.Errorf("Write(system_maximum_charge_power, %v) accepted a value ~1e-5 off an integer as if it were that integer", v)
+		} else if !errors.Is(err, commands.ErrInvalidValue) {
+			t.Errorf("value %v: error = %v, want ErrInvalidValue", v, err)
+		}
+		if after, _ := st.Get(emsKey("system_maximum_charge_power")); after != before {
+			t.Errorf("value %v: store changed to %v after a rejected write, want unchanged %v", v, after, before)
+		}
+	}
+}
+
 func TestValidateRangeMinOnly(t *testing.T) {
 	p, st, _ := newProcessor(t)
 	key := emsKey("anti_reverse_power_margin_kw")

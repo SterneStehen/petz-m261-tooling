@@ -133,14 +133,19 @@ func (p *Processor) Validate(key m261points.PointKey, value float64) error {
 // logical I16 domain the catalog actually declares). No clamping, no
 // wrapping, no silent rounding of a genuinely fractional engineering
 // value: 1.4 at scale=1 is rejected outright, never silently treated as
-// enum value 1 or truncated to 1. Integrality is checked with a small
-// tolerance rather than exact equality (see integralityDelta) — a
-// decimal, non-power-of-two scale like 0.1 makes raw = value/scale land a
-// few ULPs off the true integer even when the mathematical quotient is
-// exact (3276.7/0.1 evaluates to 32766.999999999996 in float64, not
-// 32767.0) — exact equality would reject that valid boundary. The
-// tolerance is tight enough that any actually-fractional value (0.4 away
-// from the nearest integer, not 1e-12) still fails it.
+// enum value 1 or truncated to 1. Integrality is checked with a small,
+// fixed-ULP-count tolerance rather than exact equality (see
+// snapToIntegerWithinTolerance / integralityToleranceULPs) — a decimal,
+// non-power-of-two scale like 0.1 makes raw = value/scale land one float64
+// ULP off the true integer even when the mathematical quotient is exact
+// (3276.7/0.1 evaluates to 32766.999999999996 in float64, not 32767.0) —
+// exact equality would reject that valid boundary. The tolerance is
+// measured in ULPs, not a fixed or relative epsilon, specifically because
+// a relative epsilon loose enough to absorb that division's rounding
+// error at small magnitudes is, at the I16 boundary (raw≈32767), loose
+// enough to also swallow a genuinely fractional value like 32767.00001 as
+// if it were the integer 32767 — snapToIntegerWithinTolerance's own doc
+// comment has the measurements.
 //
 // Enum: only for points the catalog actually gives an Enum for (25 of
 // 148). A point without one isn't checked against a list that doesn't
@@ -530,27 +535,57 @@ func (p *Processor) getInt(slug string) int {
 	return int(math.Round(p.get(slug)))
 }
 
-// integralityRelativeTolerance bounds how far raw = engineering_value /
-// scale may sit from the nearest integer and still be treated as exactly
-// that integer, as a fraction of raw's own magnitude (floored at 1, so
-// the tolerance near zero doesn't collapse to zero itself). A single
-// float64 division introduces error on the order of one ULP relative to
-// the result (~2.22e-16); 1e-9 is about seven orders of magnitude more
-// generous than that — comfortably absorbing the rounding noise a
-// decimal, non-power-of-two scale like 0.1 introduces (3276.7/0.1 = 32767
-// mathematically, but 32766.999999999996 in float64) — while staying
-// many orders of magnitude tighter than any engineering value with
-// genuine fractional intent (1.4 at scale=1 is 0.4 away from its nearest
-// integer, not 1e-9 of anything close to it).
-const integralityRelativeTolerance = 1e-9
+// integralityToleranceULPs bounds how far raw = engineering_value / scale
+// may sit from the nearest integer, in units of one float64 ULP at that
+// integer's own magnitude, and still be treated as exactly that integer.
+//
+// A single float64 division rounds its mathematically exact result to the
+// nearest representable float64 — introducing error of at most (and, by
+// direct measurement across the scales/values this codebase actually
+// divides by, exactly) one ULP relative to the true quotient. That's what
+// turns a decimal, non-power-of-two scale like 0.1 into a value one ULP
+// off the integer it mathematically equals (3276.7/0.1 == 32766.999999999996
+// in float64 — one ULP below the true 32767; 0.7/0.001 and 3276.7/0.001
+// measure the same one-ULP gap).
+//
+// A *relative* tolerance — this package's first approach, 1e-9 * |raw| —
+// cannot express that bound correctly across magnitudes: tight enough to
+// reject a genuinely fractional value near raw=1 (1e-9 of 1), it widens
+// to roughly nine million ULPs at the I16 boundary (raw≈32767), which is
+// loose enough to silently accept an actually-fractional value like
+// 32767.00001 (measured at ~2.75 million ULPs away — well inside that
+// nine-million-ULP window) as if it were the integer 32767. A small,
+// fixed ULP count doesn't have that problem: it's exactly as tight, in
+// the unit that actually bounds division rounding error, at every
+// magnitude raw can take — including far outside the I16 domain, for the
+// hypothetical non-I16 enum point this same helper also serves.
+//
+// 4 is a small integer multiple of the one-ULP error actually measured,
+// leaving headroom for a future compounding rounding step (e.g. a scale
+// itself reaching this division after its own decimal-literal round-trip)
+// without approaching the ~2.75-million-ULP distance of a genuinely
+// fractional value at the same magnitude — the two are separated by six
+// orders of magnitude, so this margin is not a close call.
+const integralityToleranceULPs = 4
 
 // snapToIntegerWithinTolerance reports whether raw is within
-// integralityRelativeTolerance of an integer and, if so, returns that
-// integer (as a float64, still to be range/domain-checked by the
+// integralityToleranceULPs float64 ULPs of an integer and, if so, returns
+// that integer (as a float64, still to be range/domain-checked by the
 // caller) — never the caller's job to re-derive the rounding decision.
 func snapToIntegerWithinTolerance(raw float64) (rounded float64, ok bool) {
 	rounded = math.Round(raw)
-	tolerance := integralityRelativeTolerance * math.Max(1, math.Abs(raw))
+	if raw == rounded {
+		return rounded, true
+	}
+	// ulp is the gap to the next float64 above rounded — the size of one
+	// "last place" step at rounded's own magnitude. math.Nextafter, not a
+	// fixed epsilon, so this scales correctly whether rounded is 1 or
+	// 1e30 (relevant because this helper is also reached, via the Enum
+	// branch, for a hypothetical non-I16 — including F32-range — enum
+	// point). Sign of rounded doesn't need special-casing: float64
+	// spacing is symmetric around zero.
+	ulp := math.Nextafter(rounded, math.Inf(1)) - rounded
+	tolerance := integralityToleranceULPs * ulp
 	if math.Abs(raw-rounded) > tolerance {
 		return 0, false
 	}
