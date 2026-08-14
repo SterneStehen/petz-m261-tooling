@@ -7,6 +7,7 @@ package main
 import (
 	"flag"
 	"log"
+	"math"
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
@@ -57,7 +58,10 @@ func commandsConfigFrom(cfg config.Config, nominalPowerKW float64) commands.Conf
 func main() {
 	modbusAddr := flag.String("modbus-addr", ":502", "Modbus TCP listen address")
 	iecAddr := flag.String("iec104-addr", ":2404", "IEC-104 listen address")
-	controlAddr := flag.String("control-addr", "127.0.0.1:8081", "control API listen address (Task 7) -- loopback by default, per AGENT-TASK §1.3")
+	controlAddr := flag.String(
+		"control-addr", "",
+		"override control_api.bind from the config file (default from config: 127.0.0.1:8081, loopback-only per AGENT-TASK §1.3)",
+	)
 	configPath := flag.String("config", "simulator/config/m261sim.yaml", "path to the simulator config file (AGENT-TASK §7 parameters)")
 	byteOrderOverride := flag.String(
 		"modbus-byte-order", "",
@@ -81,14 +85,26 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if *controlAddr != "" {
+		cfg.ControlAPI.Bind = *controlAddr
+		if err := cfg.Validate(); err != nil {
+			log.Fatal(err)
+		}
+	}
 	if *stepInterval <= 0 {
 		// PacedRun/time.NewTicker treat a non-positive interval as a
 		// silent no-op rather than a panic; fail fast here instead, with
 		// a clear message before anything is listening.
 		log.Fatalf("-physics-step must be positive, got %s", *stepInterval)
 	}
-	if *speed <= 0 {
-		log.Fatalf("-speed must be positive, got %v", *speed)
+	// math.IsNaN/IsInf checked explicitly, not just <= 0: every
+	// comparison against NaN is false in Go ("NaN <= 0" doesn't reject
+	// it), and +Inf also passes a bare <= 0 check — both would otherwise
+	// reach physics.Runner.PacedRun's own realInterval computation
+	// (stepInterval/speed) as a silently broken ticker interval instead
+	// of failing fast here with a clear message.
+	if math.IsNaN(*speed) || math.IsInf(*speed, 0) || *speed <= 0 {
+		log.Fatalf("-speed must be a positive, finite number, got %v", *speed)
 	}
 
 	// The simulator has exactly one model clock (AGENT-TASK §1.5),
@@ -102,7 +118,8 @@ func main() {
 	// clock behave like ordinary wall-clock time by default: it advances
 	// the fake clock at -speed model-seconds per real second, on its own,
 	// whenever nothing else (a running scenario, an in-flight POST
-	// /clock/advance) has claimed it via SuspendPacing.
+	// /clock/advance) currently owns driving it (physics.Runner.
+	// TryAcquireDrive).
 	startupInstant := time.Now()
 	sharedClock := clock.NewFake(startupInstant)
 
@@ -156,6 +173,7 @@ func main() {
 	startupSnapshot := st.Snapshot()
 
 	mb := modbustcp.New(st, modbustcp.Config{Addr: *modbusAddr, ByteOrder: order, Commands: cmdProcessor})
+	mb.SetGate(gate)
 	if err := mb.Start(); err != nil {
 		log.Fatalf("modbus tcp: %v", err)
 	}
@@ -165,6 +183,7 @@ func main() {
 	)
 
 	iec := iec104.New(st, iec104.Config{Addr: *iecAddr, Commands: cmdProcessor})
+	iec.SetGate(gate)
 	if err := iec.Start(); err != nil {
 		log.Fatalf("iec104: %v", err)
 	}
@@ -172,9 +191,10 @@ func main() {
 
 	// Task 7: scenario engine and control API.
 	scenarioRunner := scenario.NewRunner(st, injector, cmdProcessor, runner, sharedClock, *stepInterval, iec, mb)
+	scenarioRunner.SetGate(gate)
 
 	capi := controlapi.New(controlapi.Config{
-		Addr:            *controlAddr,
+		Addr:            cfg.ControlAPI.Bind,
 		Store:           st,
 		Injector:        injector,
 		Processor:       cmdProcessor,

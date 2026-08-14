@@ -43,3 +43,12 @@ commands:
   allow_dangerous:
     value: false
     unconfirmed: true
+
+# Task 7 item 3: the control API's own listen address. Not a
+# manufacturer-unconfirmed value like everything above — no such API
+# exists in the real M261 at all, so there's nothing on-site testing
+# could confirm it against — just an ordinary application setting.
+# Loopback-only by default (AGENT-TASK §1.3). -control-addr (m261sim
+# flag) overrides this without editing the file.
+control_api:
+  bind: 127.0.0.1:8081

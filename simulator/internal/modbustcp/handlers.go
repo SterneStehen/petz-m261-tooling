@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
@@ -88,6 +89,11 @@ func (s *Server) handleReadBits(unitID byte, pdu []byte) []byte {
 	if qty == 0 || qty > 2000 {
 		return exceptionPDU(pdu[0], excIllegalDataValue)
 	}
+	// One gate.Op for the whole response, not one per point read below —
+	// see SetGate's doc comment for the mixed pre-/post-reset read this
+	// prevents.
+	done := s.opDone()
+	defer done()
 	byteCount := (qty + 7) / 8
 	bits := make([]byte, byteCount)
 	for i := 0; i < int(qty); i++ {
@@ -113,6 +119,9 @@ func (s *Server) handleReadRegisters(unitID byte, pdu []byte, class int) []byte 
 	if qty == 0 || qty > 125 {
 		return exceptionPDU(pdu[0], excIllegalDataValue)
 	}
+	// One gate.Op for the whole response — see handleReadBits.
+	done := s.opDone()
+	defer done()
 
 	buf := make([]byte, int(qty)*2)
 	cache := make(map[m261points.PointKey][]byte)
@@ -231,10 +240,18 @@ func (s *Server) applyRegisterWrites(unit int, start uint16, regs [][]byte) byte
 		}
 		decoded[key] = val
 	}
-	for _, key := range order {
-		if s.cfg.Commands != nil {
-			s.cfg.Commands.Write(key, decoded[key]) //nolint:errcheck // already validated above; Write can only fail Validate's own check
-		} else {
+	// Commit as one batch (commands.Processor.WriteBatch), not one Write
+	// call per touched point — a multi-register FC16 request must commit
+	// atomically with respect to a concurrent POST /reset, the same
+	// all-or-nothing guarantee already enforced above for validation.
+	if s.cfg.Commands != nil {
+		writes := make([]commands.KeyValue, len(order))
+		for i, key := range order {
+			writes[i] = commands.KeyValue{Key: key, Value: decoded[key]}
+		}
+		s.cfg.Commands.WriteBatch(writes)
+	} else {
+		for _, key := range order {
 			s.store.Set(key, decoded[key])
 		}
 	}

@@ -207,6 +207,59 @@ func TestRealConfigFileDeclaresTask6Defaults(t *testing.T) {
 	}
 }
 
+// TestDefaultControlAPIBindIsLoopback is Task 7 item 3's default:
+// control_api.bind must default to loopback-only, matching AGENT-TASK
+// §1.3's "no hardcoded IPs besides 127.0.0.1 and config values" rule.
+func TestDefaultControlAPIBindIsLoopback(t *testing.T) {
+	cfg := Default()
+	if cfg.ControlAPI.Bind != "127.0.0.1:8081" {
+		t.Errorf("control_api.bind default = %q, want 127.0.0.1:8081", cfg.ControlAPI.Bind)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Default() failed its own Validate(): %v", err)
+	}
+}
+
+// TestLoadParsesControlAPISection proves control_api.bind is a real,
+// loadable YAML key — the reviewed fix for the second round's rejected
+// pushback (an earlier version left this flag-only, matching
+// -modbus-addr/-iec104-addr; the review held that, unlike those two,
+// this isn't a manufacturer-unconfirmed register-map value, so it
+// belongs in this file like every other ordinary setting here).
+func TestLoadParsesControlAPISection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m261sim.yaml")
+	writeFile(t, path, "control_api:\n  bind: 0.0.0.0:9999\n")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ControlAPI.Bind != "0.0.0.0:9999" {
+		t.Errorf("control_api.bind = %q, want 0.0.0.0:9999", cfg.ControlAPI.Bind)
+	}
+}
+
+func TestValidateRejectsEmptyControlAPIBind(t *testing.T) {
+	cfg := Default()
+	cfg.ControlAPI.Bind = ""
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate with control_api.bind = \"\" returned nil error")
+	}
+}
+
+// TestRealConfigFileDeclaresControlAPIBind is
+// TestRealConfigFileLoadsAndValidates's control_api complement — the
+// shipped config file itself, not a synthetic one.
+func TestRealConfigFileDeclaresControlAPIBind(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "config", "m261sim.yaml"))
+	if err != nil {
+		t.Fatalf("Load(simulator/config/m261sim.yaml): %v", err)
+	}
+	if cfg.ControlAPI.Bind != "127.0.0.1:8081" {
+		t.Errorf("shipped control_api.bind = %q, want 127.0.0.1:8081", cfg.ControlAPI.Bind)
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

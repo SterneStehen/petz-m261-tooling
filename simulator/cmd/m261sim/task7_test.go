@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -398,6 +399,156 @@ func TestResetDoesNotRequireProtocolClientReconnect(t *testing.T) {
 	if _, ok := iecClient.waitForFloat(16400); !ok {
 		// 16400 = EMS Periodic Heartbeat Indicator's IOA, always present.
 		t.Error("general interrogation on the same IEC-104 connection after reset returned nothing")
+	}
+}
+
+// TestResetIsAtomicAgainstConcurrentProtocolReads is Blocker 2's real-
+// protocol half: a real Modbus FC03 read and a real IEC-104 general
+// interrogation, both racing a real POST /reset, over actual TCP
+// connections — not the in-process controlapi harness's own GET /state
+// equivalent. Both servers now take gate.Op around their whole read
+// (modbustcp.Server.handleReadRegisters, iec104.Server.
+// handleGeneralInterrogation), so every response observed here must be
+// either fully pre-reset or fully post-reset, never a value combination
+// no single instant ever had.
+func TestResetIsAtomicAgainstConcurrentProtocolReads(t *testing.T) {
+	sim := newTask7Sim(t)
+	key := m261points.PointKey{Device: "EMS", Slug: "maximum_charge_soc"}
+	preResetValue, _ := sim.store.Get(key)
+	const dirty = 88.0
+	if err := sim.processor.Write(key, dirty); err != nil {
+		t.Fatal(err)
+	}
+
+	mbHandler := gomodbus.NewTCPClientHandler(sim.mb.Addr().String())
+	mbHandler.SlaveId = 1
+	mbHandler.Timeout = 5 * time.Second
+	if err := mbHandler.Connect(); err != nil {
+		t.Fatalf("modbus Connect: %v", err)
+	}
+	t.Cleanup(func() { mbHandler.Close() })
+	mbClient := gomodbus.NewClient(mbHandler)
+	const wireAddr = 18 // maximum_charge_soc: F32, modbus_addr 40019 -> wire 40019-40001
+
+	const n = 30
+	var wg sync.WaitGroup
+	wg.Add(2 * n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			regs, err := mbClient.ReadHoldingRegisters(wireAddr, 2)
+			if err != nil {
+				t.Errorf("ReadHoldingRegisters: %v", err)
+				return
+			}
+			got := math.Float32frombits(binary.BigEndian.Uint32(regs))
+			if float64(got) != dirty && float64(got) != preResetValue {
+				t.Errorf("Modbus read = %v, want either %v (pre-reset) or %v (post-reset default)", got, dirty, preResetValue)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			c := dialRawIEC(t, sim.iec.Addr().String())
+			c.startDT()
+			c.sendGeneralInterrogation(1)    // EMS
+			got, ok := c.waitForFloat(16400) // EMS Periodic Heartbeat Indicator's IOA, always present
+			if !ok {
+				t.Error("general interrogation returned nothing for the heartbeat IOA")
+			}
+			_ = got // presence, not value, is what a torn/aborted response would fail
+		}()
+	}
+	resp := postJSON(t, sim.apiURL("/reset"), nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("POST /reset: status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	wg.Wait()
+}
+
+// TestFC16BatchWriteAtomicAgainstConcurrentReset is Blocker 2's FC16
+// half: a single Modbus FC16 request spanning two adjacent catalog
+// points (EMS/set_active_power_kw and EMS/set_reactive_power_kvar,
+// wire-adjacent — see commands.Processor.WriteBatch's doc comment)
+// racing a real POST /reset. Before WriteBatch, applyRegisterWrites
+// committed each touched point through a *separate* Processor.Write/
+// gate.Op call, so a reset could interleave between them and leave one
+// point at its newly-written value while the other had already been
+// reset back to its default — read back here as a same-request register
+// pair that must always agree with each other, never split.
+func TestFC16BatchWriteAtomicAgainstConcurrentReset(t *testing.T) {
+	sim := newTask7Sim(t)
+	if err := sim.processor.Write(m261points.PointKey{Device: "EMS", Slug: "set_operating_mode"}, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	mbHandler := gomodbus.NewTCPClientHandler(sim.mb.Addr().String())
+	mbHandler.SlaveId = 1
+	mbHandler.Timeout = 5 * time.Second
+	if err := mbHandler.Connect(); err != nil {
+		t.Fatalf("modbus Connect: %v", err)
+	}
+	t.Cleanup(func() { mbHandler.Close() })
+	mbClient := gomodbus.NewClient(mbHandler)
+
+	// wire 152-153 = set_active_power_kw (40153), wire 154-155 =
+	// set_reactive_power_kvar (40155) — one contiguous 4-register FC16
+	// request spans both points.
+	const wireAddr = 152
+	const activeKW, reactiveKvar = 42.5, -17.5
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint32(buf[0:4], math.Float32bits(activeKW))
+	binary.BigEndian.PutUint32(buf[4:8], math.Float32bits(reactiveKvar))
+
+	preActiveBits, err := mbClient.ReadHoldingRegisters(wireAddr, 2)
+	if err != nil {
+		t.Fatalf("ReadHoldingRegisters (setup, active): %v", err)
+	}
+	preReactiveBits, err := mbClient.ReadHoldingRegisters(wireAddr+2, 2)
+	if err != nil {
+		t.Fatalf("ReadHoldingRegisters (setup, reactive): %v", err)
+	}
+	preActive := float64(math.Float32frombits(binary.BigEndian.Uint32(preActiveBits)))
+	preReactive := float64(math.Float32frombits(binary.BigEndian.Uint32(preReactiveBits)))
+
+	const n = 30
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := mbClient.WriteMultipleRegisters(wireAddr, 4, buf); err != nil {
+				// A rejected write (e.g. mode reset mid-flight, or a
+				// transient race with the concurrent reset closing/
+				// reopening nothing — reset never disconnects clients)
+				// is not itself a failure here; only a *split* commit is.
+				return
+			}
+		}()
+	}
+	resp := postJSON(t, sim.apiURL("/reset"), nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("POST /reset: status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	wg.Wait()
+
+	activeBits, err := mbClient.ReadHoldingRegisters(wireAddr, 2)
+	if err != nil {
+		t.Fatalf("ReadHoldingRegisters (final, active): %v", err)
+	}
+	reactiveBits, err := mbClient.ReadHoldingRegisters(wireAddr+2, 2)
+	if err != nil {
+		t.Fatalf("ReadHoldingRegisters (final, reactive): %v", err)
+	}
+	active := math.Float32frombits(binary.BigEndian.Uint32(activeBits))
+	reactive := math.Float32frombits(binary.BigEndian.Uint32(reactiveBits))
+
+	bothWritten := float64(active) == activeKW && float64(reactive) == reactiveKvar
+	bothDefault := float64(active) == preActive && float64(reactive) == preReactive
+	if !bothWritten && !bothDefault {
+		t.Errorf("active=%v reactive=%v after racing FC16 writes vs reset — want both at the written values (%v, %v) or both at their pre-write defaults (%v, %v), never a split pair",
+			active, reactive, activeKW, reactiveKvar, preActive, preReactive)
 	}
 }
 

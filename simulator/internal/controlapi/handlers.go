@@ -12,6 +12,7 @@ import (
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/clock"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/faults"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/physics"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/scenario"
 )
 
@@ -33,7 +34,15 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown_device", fmt.Errorf("unknown device %q", device))
 		return
 	}
+	// gate.Op held only around the snapshot capture — see
+	// iec104.Server.handleGeneralInterrogation's identical comment for
+	// why that's enough: once Snapshot returns, this response is already
+	// fully determined from one atomically-captured map, so a concurrent
+	// POST /reset can never make it observe a mix of pre- and post-reset
+	// values.
+	release := s.cfg.Gate.Op()
 	snap := s.cfg.Store.Snapshot()
+	release()
 	points := make(map[string]float64, len(snap))
 	for k, v := range snap {
 		if device != "" && k.Device != device {
@@ -131,7 +140,18 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {
 		hbValue, _ = s.cfg.Store.Get(linkfault.HeartbeatKey)
 	}
 	delay := time.Duration(req.DelayMS) * time.Millisecond
+	// gate.Op held for the whole Apply call: protocol: both mutates
+	// iec104's and modbus's link state sequentially, not as one atomic
+	// step — without the gate, a concurrent POST /reset's own (also
+	// sequential) ClearLinkFaults calls could interleave with these two,
+	// leaving one protocol faulted and the other cleared, a combination
+	// neither "reset happened" nor "reset didn't happen" produces on its
+	// own. linkfault.Apply itself never acquires the gate, so this is a
+	// single, non-nested Op — safe per appgate's own reentrant-RLock
+	// warning.
+	release := s.cfg.Gate.Op()
 	err := linkfault.Apply(s.cfg.IECServer, s.cfg.ModbusServer, linkfault.Protocol(req.Protocol), linkfault.Mode(req.Mode), delay, hbValue)
+	release()
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err)
 		return
@@ -152,7 +172,11 @@ func (s *Server) handleLinkClear(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Errorf("malformed JSON body: %w", err))
 		return
 	}
+	// See handleLink's identical comment on why this needs one gate.Op
+	// spanning the whole (potentially protocol: both) Apply call.
+	release := s.cfg.Gate.Op()
 	err := linkfault.Apply(s.cfg.IECServer, s.cfg.ModbusServer, linkfault.Protocol(req.Protocol), linkfault.ModeClear, 0, 0)
+	release()
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err)
 		return
@@ -258,10 +282,13 @@ type clockAdvanceRequest struct {
 	BySeconds *int64 `json:"by_seconds"`
 }
 
-// handleClockAdvance suspends physics.Runner's own real-time pacing for
-// the duration of the request (physics.Runner.SuspendPacing) — without
-// this, PacedRun's independent ticks could interleave with FastForward's
-// own, making the exact tick sequence Task 7 item 8 needs unpredictable.
+// handleClockAdvance calls physics.Runner.FastForward, which owns its
+// own exclusive drive-lock for the whole request (physics.Runner.
+// TryAcquireDrive/driveMu) — no separate suspend/resume needed here.
+// FastForward returns physics.ErrClockBusy, mapped to 409 (not 400: this
+// is a real conflict with another legitimate in-flight operation — a
+// running scenario or a concurrent advance — not a malformed request),
+// rather than blocking or silently interleaving with it.
 func (s *Server) handleClockAdvance(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
@@ -281,9 +308,11 @@ func (s *Server) handleClockAdvance(w http.ResponseWriter, r *http.Request) {
 	}
 	total := time.Duration(*req.BySeconds) * time.Second
 
-	resume := s.cfg.PhysicsRunner.SuspendPacing()
-	defer resume()
 	if err := s.cfg.PhysicsRunner.FastForward(total, s.cfg.StepInterval); err != nil {
+		if errors.Is(err, physics.ErrClockBusy) {
+			writeError(w, http.StatusConflict, "clock_busy", err)
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid_request", err)
 		return
 	}
@@ -320,8 +349,9 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 // could land between two steps and observe/produce neither the pre- nor
 // the post-reset state.
 //
-//  1. Stop the scenario runner, blocking until it has actually exited
-//     (scenario.Runner.Stop's guarantee).
+//  1. Stop the scenario runner and rewind its cursor, keeping its
+//     lifecycle (Load/Start/Stop/ResetPlayback) locked until this whole
+//     function returns (scenario.Runner.LockForReset).
 //  2. Rewind the shared clock (always a *clock.Fake — see main.go) to
 //     StartupInstant.
 //  3. Rebuild physics.Runner's Engine from scratch (same params, same
@@ -339,14 +369,22 @@ func (s *Server) doReset() error {
 	}
 
 	// Stop the scenario runner first, *outside* the exclusive gate
-	// section below — ResetPlayback blocks until the run() goroutine has
+	// section below — LockForReset blocks until the run() goroutine has
 	// actually exited (scenario.Runner.Stop's guarantee), and that
 	// goroutine's own in-flight TickOnce/Write/Inject call needs the
 	// gate's shared side to complete. Acquiring the exclusive side first
 	// would deadlock: this function holding it and waiting on the
 	// goroutine, the goroutine blocked acquiring the shared side this
 	// function is holding exclusively.
-	s.cfg.ScenarioRunner.ResetPlayback()
+	//
+	// Unlike the ResetPlayback this used to call, LockForReset keeps the
+	// scenario lifecycle locked (not just stopped) until unlockScenario
+	// runs — closing a reviewed gap where a POST /scenario/start racing
+	// in right after the stop, but before the rest of this function had
+	// finished resetting physics/Store/link state, could start a new run
+	// against state still being reset out from under it.
+	unlockScenario := s.cfg.ScenarioRunner.LockForReset()
+	defer unlockScenario()
 
 	release := s.cfg.Gate.Exclusive()
 	defer release()

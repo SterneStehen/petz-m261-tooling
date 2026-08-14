@@ -99,6 +99,16 @@ func Parse(data []byte) (*Scenario, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: clock.start: %v", ErrMalformed, err)
 	}
+	// speed <= 0 alone doesn't reject NaN (every comparison against NaN
+	// is false in Go, so "NaN <= 0" is false and a YAML .nan literal
+	// would slip through) or +Inf (Inf <= 0 is also false) — both are
+	// checked explicitly, matching physics.validSpeed's identical guard
+	// on the -speed flag (main.go) for the same reason: a scenario's own
+	// clock.speed reaches the exact same physics.Runner.
+	// PacedFastForwardLocked call that flag ultimately feeds.
+	if math.IsNaN(raw.Clock.Speed) || math.IsInf(raw.Clock.Speed, 0) {
+		return nil, fmt.Errorf("%w: clock.speed must be finite, got %v", ErrMalformed, raw.Clock.Speed)
+	}
 	if raw.Clock.Speed <= 0 {
 		return nil, fmt.Errorf("%w: clock.speed must be positive, got %v", ErrMalformed, raw.Clock.Speed)
 	}

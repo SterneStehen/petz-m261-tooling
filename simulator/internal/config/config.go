@@ -102,11 +102,25 @@ type CommandsConfig struct {
 	AllowDangerous BoolParam `yaml:"allow_dangerous"`
 }
 
+// ControlAPIConfig is control_api.bind — the address Task 7's control
+// API listens on (AGENT-TASK.md, Task 7 item 3). Unlike every other §7
+// parameter above, this isn't a manufacturer-unconfirmed register-map
+// value: no such API exists in the real M261 at all, so there's nothing
+// to confirm against on-site — it's an ordinary application setting that
+// belongs in this file for the same reason as the rest, so an operator
+// can repoint it without a rebuild. -control-addr (main.go) remains
+// available as a flag override, matching -modbus-byte-order's
+// relationship to modbus.byte_order.
+type ControlAPIConfig struct {
+	Bind string `yaml:"bind"`
+}
+
 type Config struct {
-	Modbus   ModbusConfig   `yaml:"modbus"`
-	Watchdog WatchdogConfig `yaml:"watchdog"`
-	Modes    ModesConfig    `yaml:"modes"`
-	Commands CommandsConfig `yaml:"commands"`
+	Modbus     ModbusConfig     `yaml:"modbus"`
+	Watchdog   WatchdogConfig   `yaml:"watchdog"`
+	Modes      ModesConfig      `yaml:"modes"`
+	Commands   CommandsConfig   `yaml:"commands"`
+	ControlAPI ControlAPIConfig `yaml:"control_api"`
 }
 
 // Default returns every §7 parameter declared so far at its documented
@@ -134,6 +148,12 @@ func Default() Config {
 		},
 		Commands: CommandsConfig{
 			AllowDangerous: BoolParam{Value: false, Unconfirmed: true},
+		},
+		ControlAPI: ControlAPIConfig{
+			// Loopback-only default, per AGENT-TASK §1.3: code doesn't
+			// hardcode IPs other than 127.0.0.1 and config values, and
+			// this is the config value.
+			Bind: "127.0.0.1:8081",
 		},
 	}
 }
@@ -173,6 +193,9 @@ func (c Config) Validate() error {
 	}
 	if err := c.Modes.Priority.validate("modes.priority"); err != nil {
 		return err
+	}
+	if c.ControlAPI.Bind == "" {
+		return fmt.Errorf("config: control_api.bind must not be empty")
 	}
 	return nil
 }

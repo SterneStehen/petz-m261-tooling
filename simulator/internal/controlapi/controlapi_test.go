@@ -24,20 +24,43 @@ import (
 // fakeLinkTarget mirrors the one in package scenario's own tests — see
 // its doc comment. Duplicated rather than exported from either package:
 // each is a small, test-only detail of its own package.
+//
+// Guarded by its own mutex (unlike the real modbustcp/iec104 linkState,
+// this doesn't need one for production correctness — a test double is
+// normally driven from one goroutine) because
+// TestResetIsAtomicAgainstConcurrentLinkBothAction deliberately drives it
+// from many: gate.Op is a *shared* lock (multiple ordinary link actions
+// are meant to run genuinely concurrently, serialized only against a
+// POST /reset's Exclusive section, never against each other), so two
+// concurrent POST /link requests reaching this same fake target is a
+// real, intended possibility this file's own tests must not introduce a
+// spurious data race for.
 type fakeLinkTarget struct {
+	mu                  sync.Mutex
 	drop, hang, cleared bool
 	delay               time.Duration
 	hbValue             float64
 	hbSet               bool
 }
 
-func (f *fakeLinkTarget) SetDrop()                 { f.drop = true }
-func (f *fakeLinkTarget) SetHang()                 { f.hang = true }
-func (f *fakeLinkTarget) SetDelay(d time.Duration) { f.delay = d }
-func (f *fakeLinkTarget) SetHeartbeatPause(v float64) {
-	f.hbValue, f.hbSet = v, true
+func (f *fakeLinkTarget) SetDrop() { f.mu.Lock(); f.drop = true; f.mu.Unlock() }
+func (f *fakeLinkTarget) SetHang() { f.mu.Lock(); f.hang = true; f.mu.Unlock() }
+func (f *fakeLinkTarget) SetDelay(d time.Duration) {
+	f.mu.Lock()
+	f.delay = d
+	f.mu.Unlock()
 }
-func (f *fakeLinkTarget) ClearLinkFaults() { *f = fakeLinkTarget{cleared: true} }
+func (f *fakeLinkTarget) SetHeartbeatPause(v float64) {
+	f.mu.Lock()
+	f.hbValue, f.hbSet = v, true
+	f.mu.Unlock()
+}
+func (f *fakeLinkTarget) ClearLinkFaults() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.drop, f.hang, f.delay, f.hbValue, f.hbSet = false, false, 0, 0, false
+	f.cleared = true
+}
 
 type harness struct {
 	store          *store.Store
@@ -558,6 +581,41 @@ func TestClockAdvanceRequiresBySeconds(t *testing.T) {
 	}
 }
 
+// TestClockAdvanceConflictsWithRunningScenario is the "pacer-handoff-vs
+// -scenario-start" case from the second review round: a scenario claims
+// physics.Runner's drive lock for its whole run (Start to Stop/
+// completion), so a POST /clock/advance landing while one is running
+// must be rejected with 409 clock_busy — never silently interleave its
+// own ticks with the scenario's, and never block until the scenario
+// happens to finish.
+func TestClockAdvanceConflictsWithRunningScenario(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do(t, "POST", "/scenario/load", map[string]any{"yaml": `
+name: long
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
+steps:
+  - at: 1h
+    write: {device: EMS, point: set_operating_mode, value: 2}
+`})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("scenario/load status = %d, body = %s", resp.StatusCode, body)
+	}
+	resp, body = h.do(t, "POST", "/scenario/start", nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("scenario/start status = %d, body = %s", resp.StatusCode, body)
+	}
+	t.Cleanup(func() { h.scenarioRunner.Stop() })
+
+	resp, body = h.do(t, "POST", "/clock/advance", map[string]any{"by_seconds": 1})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("clock/advance status while scenario running = %d, want 409, body = %s", resp.StatusCode, body)
+	}
+	e := decodeError(t, body)
+	if e.Error.Code != "clock_busy" {
+		t.Errorf("error code = %q, want clock_busy", e.Error.Code)
+	}
+}
+
 // --- POST /reset ------------------------------------------------------------
 
 // TestResetFromDirtyState is Task 7 item 7's acceptance criterion in
@@ -683,4 +741,103 @@ func TestResetDoesNotDisconnectClients(t *testing.T) {
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("GET /state after reset: status = %d, body = %s", resp2.StatusCode, body2)
 	}
+}
+
+// TestResetIsAtomicAgainstConcurrentStateReads is Blocker 2 from the
+// second review round: GET /state used to read Store.Snapshot with no
+// gate at all, so a request landing partway through POST /reset's
+// six-step sequence could observe a state no single instant before or
+// after reset ever actually had (e.g. physics already rebuilt but Store
+// not yet fully restored). GET /state now takes gate.Op around its own
+// Snapshot call, making that impossible: every response is a complete,
+// internally consistent snapshot from either strictly before or strictly
+// after the whole reset, verified here by racing many concurrent readers
+// against one real POST /reset under -race and checking each response's
+// specific dirtied point is one of exactly the two valid values, never
+// anything else.
+func TestResetIsAtomicAgainstConcurrentStateReads(t *testing.T) {
+	h := newHarness(t)
+	key := m261points.PointKey{Device: "EMS", Slug: "maximum_charge_soc"}
+	preResetValue, _ := h.store.Get(key)
+	const dirty = 77.0
+	if err := h.processor.Write(key, dirty); err != nil {
+		t.Fatalf("dirty write: %v", err)
+	}
+
+	type result struct {
+		status int
+		value  float64
+		ok     bool
+	}
+	const n = 50
+	results := make(chan result, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			resp, body := h.do(t, "GET", "/state", nil)
+			if resp.StatusCode != http.StatusOK {
+				results <- result{status: resp.StatusCode}
+				return
+			}
+			var decoded struct {
+				Points map[string]float64 `json:"points"`
+			}
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Errorf("decode GET /state response: %v", err)
+				return
+			}
+			v, ok := decoded.Points["EMS/maximum_charge_soc"]
+			results <- result{status: resp.StatusCode, value: v, ok: ok}
+		}()
+	}
+	resp, body := h.do(t, "POST", "/reset", nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("reset status = %d, body = %s", resp.StatusCode, body)
+	}
+	wg.Wait()
+	close(results)
+
+	for r := range results {
+		if r.status != http.StatusOK {
+			t.Errorf("GET /state status = %d, want 200", r.status)
+			continue
+		}
+		if !r.ok {
+			t.Error("EMS/maximum_charge_soc missing from GET /state response")
+			continue
+		}
+		if r.value != dirty && r.value != preResetValue {
+			t.Errorf("EMS/maximum_charge_soc = %v, want either %v (pre-reset dirty) or %v (post-reset default) — never anything else", r.value, dirty, preResetValue)
+		}
+	}
+}
+
+// TestResetIsAtomicAgainstConcurrentLinkBothAction is Blocker 2's link
+// half: POST /link with protocol: both mutates iec104's and modbus's
+// link state sequentially, not as one atomic step, and so did POST
+// /reset's own ClearLinkFaults calls — without a gate.Op spanning the
+// whole Apply call, the two sequential pairs could interleave and leave
+// one protocol faulted while the other was cleared, a combination
+// neither "reset happened" nor "reset didn't happen" produces on its
+// own. Raced under -race; the meaningful assertion is that this never
+// panics/data-races and every request completes, since the exact timing
+// of which side wins is inherently non-deterministic.
+func TestResetIsAtomicAgainstConcurrentLinkBothAction(t *testing.T) {
+	h := newHarness(t)
+	var wg sync.WaitGroup
+	const n = 20
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			h.do(t, "POST", "/link", map[string]any{"protocol": "both", "mode": "drop"})
+		}()
+	}
+	resp, body := h.do(t, "POST", "/reset", nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("reset status = %d, body = %s", resp.StatusCode, body)
+	}
+	wg.Wait()
 }

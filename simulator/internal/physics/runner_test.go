@@ -1,6 +1,9 @@
 package physics
 
 import (
+	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -424,5 +427,138 @@ func TestFastForwardRequiresFakeClock(t *testing.T) {
 
 	if err := r.FastForward(time.Second, time.Second); err == nil {
 		t.Error("FastForward with a clock.Real succeeded, want an error")
+	}
+}
+
+// TestConcurrentFastForwardIsLinearizable is the regression test for the
+// reviewed linearizability bug: two concurrent FastForward(1s, ...)
+// calls each used to read fc.Now() and independently compute their own
+// target before either had ticked, so both landed on the same target —
+// whichever ticked there first silently discarded the other caller's
+// entire requested advance (measured against the pre-driveMu version: 8
+// concurrent +1s advances produced ~1.07s of total movement, not 8s, and
+// every caller still received a nil error).
+//
+// The fix (driveMu, TryAcquireDrive) makes concurrent drivers of the
+// clock mutually exclusive via fail-fast contention instead of silent
+// interleaving: every one of n concurrent FastForward(1s, ...) calls
+// either advances the clock by the full, exact 1s it asked for, or gets
+// ErrClockBusy immediately — never a nil error with a silently short/
+// lost advance, and never two callers' advances merged into fewer total
+// seconds than the number of successes claims. This is a deliberate
+// fail-fast design (not an attempt to make every concurrent call
+// eventually succeed serialized behind a queue — the same ErrClockBusy
+// -> 409 idiom is already how this codebase resolves every other
+// clock-ownership conflict, Task 7 item 2's control-API precedent), so
+// the test doesn't assert exactly one success: Go's scheduler can just
+// as validly run several of these n goroutines one after another with no
+// true overlap at all, each with its own full, uncontended success — the
+// property that actually detects the reviewed bug (two callers each
+// computing target from the same stale fc.Now() read, so the second to
+// tick there silently discards the first's already-"succeeded" advance)
+// is total movement == successes x 1s, checked below.
+func TestConcurrentFastForwardIsLinearizable(t *testing.T) {
+	const n = 8
+	for iter := 0; iter < 20; iter++ {
+		st := store.New()
+		start := time.Now()
+		clk := clock.NewFake(start)
+		proc := newTestProcessor(t, st, clk)
+		r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+		var wg sync.WaitGroup
+		var succeeded, busy int32
+		ready := make(chan struct{})
+		wg.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				defer wg.Done()
+				<-ready // released together, to maximize genuine overlap
+				if err := r.FastForward(time.Second, time.Second); err != nil {
+					if !errors.Is(err, ErrClockBusy) {
+						t.Errorf("FastForward error = %v, want nil or ErrClockBusy", err)
+						return
+					}
+					atomic.AddInt32(&busy, 1)
+					return
+				}
+				atomic.AddInt32(&succeeded, 1)
+			}()
+		}
+		close(ready)
+		wg.Wait()
+
+		if succeeded < 1 {
+			t.Fatalf("iter %d: 0 of %d concurrent FastForward calls succeeded, want at least 1", iter, n)
+		}
+		if succeeded+busy != n {
+			t.Fatalf("iter %d: succeeded=%d busy=%d, want they sum to %d", iter, succeeded, busy, n)
+		}
+		want := time.Duration(succeeded) * time.Second
+		if got := clk.Now().Sub(start); got != want {
+			t.Fatalf("iter %d: clock advanced by %v after %d successful calls, want exactly %v (no lost/merged advances)", iter, got, succeeded, want)
+		}
+	}
+}
+
+// TestFastForwardBusyWhileDriveHeld proves FastForward fails immediately
+// with ErrClockBusy — never blocks, never silently ticks anyway — while
+// something else (modeled here directly via TryAcquireDrive, standing in
+// for a running scenario) already owns driving the clock, and that a
+// FastForward issued after ReleaseDrive succeeds normally once the
+// conflict is gone.
+func TestFastForwardBusyWhileDriveHeld(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	proc := newTestProcessor(t, st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+	if !r.TryAcquireDrive() {
+		t.Fatal("TryAcquireDrive on a fresh Runner returned false")
+	}
+	if err := r.FastForward(time.Second, time.Second); !errors.Is(err, ErrClockBusy) {
+		t.Fatalf("FastForward while drive held: err = %v, want ErrClockBusy", err)
+	}
+	r.ReleaseDrive()
+
+	if err := r.FastForward(time.Second, time.Second); err != nil {
+		t.Fatalf("FastForward after ReleaseDrive: %v, want success", err)
+	}
+}
+
+// TestPacedRunSkipsTickWhileDriveHeld proves PacedRun's own real-time
+// ticks are skipped (not queued, not silently interleaved), not run,
+// while something else owns driveMu — the property scenario.Runner's
+// whole-run TryAcquireDrive hold (Start to Stop/completion) depends on
+// to keep PacedRun from racing a running scenario's own advances.
+func TestPacedRunSkipsTickWhileDriveHeld(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	proc := newTestProcessor(t, st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+	if !r.TryAcquireDrive() {
+		t.Fatal("TryAcquireDrive on a fresh Runner returned false")
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.PacedRun(5*time.Millisecond, 1, stop)
+	}()
+	time.Sleep(40 * time.Millisecond)
+	close(stop)
+	<-done
+
+	if hb := get(t, st, "EMS", "ems_periodic_heartbeat_indicator"); hb != 0 {
+		t.Errorf("heartbeat = %v after ~40ms of PacedRun with driveMu externally held, want 0 (every tick attempt skipped)", hb)
+	}
+
+	r.ReleaseDrive()
+	if err := r.TickOnce(5 * time.Millisecond); err != nil {
+		t.Fatalf("TickOnce after ReleaseDrive: %v", err)
+	}
+	if hb := get(t, st, "EMS", "ems_periodic_heartbeat_indicator"); hb != 1 {
+		t.Errorf("heartbeat = %v after ReleaseDrive + one TickOnce, want 1", hb)
 	}
 }

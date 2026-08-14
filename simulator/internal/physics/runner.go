@@ -1,10 +1,10 @@
 package physics
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
@@ -13,6 +13,14 @@ import (
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
+
+// ErrClockBusy is returned by FastForward/PacedFastForward, and by
+// TryAcquireDrive's caller convention, when something else (another
+// FastForward/PacedFastForward call, or an active scenario run) already
+// owns driving the clock — controlapi maps this to 409, not 500 or 400:
+// it's a real, expected conflict between two legitimate requests, not a
+// malformed one.
+var ErrClockBusy = errors.New("physics: clock is already being driven by another operation")
 
 // Runner is the glue between an Engine and the shared store, added per
 // code review: without it, m261sim served static zero values — nothing
@@ -39,13 +47,30 @@ type Runner struct {
 
 	gate *appgate.Gate // see SetGate
 
-	// pacingSuspendCount > 0 means PacedRun must not tick right now —
-	// something else (a running scenario, an in-flight POST
-	// /clock/advance) already owns advancing the clock. A count, not a
-	// bool: SuspendPacing is safe to call from more than one concurrent
-	// suspender without one's Resume prematurely re-arming PacedRun while
-	// the other still needs it suspended.
-	pacingSuspendCount atomic.Int32
+	// driveMu is held for the *entire duration* of one logical clock-
+	// driving operation — a FastForward/PacedFastForward call, or an
+	// active scenario run (Start to Stop/completion) — never just
+	// per-tick. This is what makes two big operations mutually exclusive
+	// instead of silently interleaving or racing.
+	//
+	// Reviewed regression this fixes: the previous version only made
+	// each individual TickOnce atomic, not the *sequence* of ticks one
+	// logical FastForward/scenario run makes. Two concurrent
+	// FastForward(1s, ...) calls each read fc.Now() and computed their
+	// own target independently — if both read the clock before either
+	// had ticked, both computed the *same* target, and whichever ticked
+	// there first made the other's own loop condition already false,
+	// silently discarding its caller's requested advance (measured: 8
+	// concurrent +1s advances produced ~1.07s of total movement, not
+	// 8s). Likewise a Reset could land between two TickOnce calls inside
+	// one FastForward, because each individual TickOnce only held
+	// gate.Op for its own single tick, not for the whole loop.
+	//
+	// PacedRun deliberately does *not* hold driveMu across ticks — each
+	// of its own ticks is independently attempted (TryLock, do one tick,
+	// unlock) so a scenario or an advance can always preempt it between
+	// ticks rather than PacedRun blocking them.
+	driveMu sync.Mutex
 }
 
 // SetGate wires the process-wide reset-atomicity gate (see package
@@ -140,16 +165,12 @@ func (r *Runner) Reset(engine *Engine, now time.Time) {
 
 // TickOnce advances the shared *clock.Fake by exactly d and steps the
 // engine once, as a single atomic operation (one gate.Op, one r.mu
-// critical section covering both the clock advance and the step) — the
-// one primitive every clock-advancing caller (the real-time background
-// pacer PacedRun, POST /clock/advance, and the scenario engine) funnels
-// through, so none of them can ever race each other: whichever caller's
-// TickOnce acquires r.mu first completes its whole
-// advance-then-observe-then-step before any other can begin. Reviewed
-// gap this closes: the previous version let a caller read fc.Now(),
-// compute a target, call fc.Set(target), and only then call Tick()
-// separately — three uncoordinated steps a concurrent caller could
-// interleave with.
+// critical section covering both the clock advance and the step) — a
+// standalone single-tick primitive for direct/test use and for
+// PacedRun's own per-tick attempts. FastForward/PacedFastForward do
+// *not* build on this for their own multi-tick loops — see driveMu's
+// doc comment for why one gate.Op per tick isn't enough to make a whole
+// multi-tick operation atomic, only each individual tick.
 //
 // Requires the Clock this Runner was built with to be a *clock.Fake —
 // advancing a real wall clock by a caller-chosen amount has no meaning,
@@ -176,62 +197,68 @@ func (r *Runner) TickOnce(d time.Duration) error {
 	return nil
 }
 
+// TryAcquireDrive/ReleaseDrive let a caller that needs to own the clock
+// across more than one tick — currently only the scenario engine, for
+// its whole run from Start to Stop/completion — hold the same exclusive
+// ownership FastForward/PacedFastForward give themselves internally for
+// their own duration (driveMu's own doc comment has the full rationale).
+// TryAcquireDrive never blocks: it returns false immediately if
+// something else already owns driving the clock, so the caller can fail
+// its own request clearly (e.g. controlapi mapping this to 409) instead
+// of silently queuing behind an unrelated operation of unknown duration.
+func (r *Runner) TryAcquireDrive() bool { return r.driveMu.TryLock() }
+func (r *Runner) ReleaseDrive()         { r.driveMu.Unlock() }
+
 // PacedRun blocks, advancing the shared clock (which must be a
-// *clock.Fake — see TickOnce) by stepInterval*speed once per real
-// stepInterval of wall-clock time, until stop is closed — the
-// "live"/default-running mode: an operator watching the simulator with
-// no scenario loaded and no manual POST /clock/advance in flight sees
-// model time advance at speed x real time (speed=1 is real-time pace),
-// exactly as AGENT-TASK.md's Task 7 item 4 clock.speed field describes
-// for a scenario's own playback. Because every advance funnels through
-// the same TickOnce as POST /clock/advance and the scenario engine
-// (appgate-serialized against Reset, and mutually exclusive with them by
-// virtue of all three sharing this Runner's own r.mu), PacedRun,
-// a running scenario, and a manual advance can safely coexist in the
-// same process without corrupting the model-time sequence — whichever's
-// TickOnce call lands first for a given increment simply goes first.
+// *clock.Fake) in stepInterval-sized ticks, spaced stepInterval/speed
+// apart in real time, until stop is closed — the "live"/default-running
+// mode: an operator watching the simulator with no scenario loaded and
+// no manual POST /clock/advance in flight sees model time advance at
+// speed x real time (speed=1 is real-time pace). Deliberately ticks in
+// fixed stepInterval increments regardless of speed, the same tick
+// granularity FastForward/PacedFastForward use — not one coarse
+// stepInterval*speed jump per real-time tick (a reviewed gap in an
+// earlier version): a single Step() call with a speed-scaled-up dt is
+// not the same physics as many stepInterval-sized ones, and would
+// silently skip per-tick point updates (heartbeat included) that a
+// client polling in real time between ticks would otherwise see.
 //
-// A non-positive stepInterval or speed is a no-op rather than a panic —
-// main.go validates both upfront and fails fast before starting
-// anything, but PacedRun doesn't assume every caller does that.
+// Each tick is independently attempted (TryAcquireDrive, do one tick,
+// ReleaseDrive) rather than holding driveMu across ticks — a scenario or
+// a manual advance can always preempt PacedRun between its ticks; a busy
+// driveMu just means this particular tick is skipped, not that PacedRun
+// blocks anything.
+//
+// A non-positive or non-finite stepInterval/speed is a no-op rather than
+// a panic or a runaway ticker — main.go validates both upfront and fails
+// fast before starting anything, but PacedRun doesn't assume every
+// caller does that.
 func (r *Runner) PacedRun(stepInterval time.Duration, speed float64, stop <-chan struct{}) {
-	if stepInterval <= 0 || speed <= 0 {
+	if stepInterval <= 0 || !validSpeed(speed) {
 		return
 	}
-	advance := time.Duration(float64(stepInterval) * speed)
-	ticker := time.NewTicker(stepInterval)
+	realInterval := time.Duration(float64(stepInterval) / speed)
+	if realInterval <= 0 {
+		realInterval = time.Nanosecond // extreme speed: tick as fast as the ticker/scheduler allow, never zero/negative
+	}
+	ticker := time.NewTicker(realInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-stop:
 			return
 		case <-ticker.C:
-			if r.pacingSuspended() {
+			if !r.TryAcquireDrive() {
 				continue // a scenario or a manual POST /clock/advance owns the clock right now
 			}
-			r.TickOnce(advance) //nolint:errcheck // this Runner's own clock is always a *clock.Fake when PacedRun is used; see main.go
+			r.TickOnce(stepInterval) //nolint:errcheck // this Runner's own clock is always a *clock.Fake when PacedRun is used; see main.go
+			r.ReleaseDrive()
 		}
 	}
 }
 
-func (r *Runner) pacingSuspended() bool { return r.pacingSuspendCount.Load() > 0 }
-
-// SuspendPacing tells PacedRun to stop ticking the shared clock on its
-// own until the returned resume function is called — used by the
-// scenario engine (for the duration of a run) and by POST
-// /clock/advance (for the duration of one request) so that whichever of
-// them is actively driving the clock doesn't have PacedRun's own
-// real-time-paced ticks interleaved with its own, which would make the
-// exact tick count/sequence either of them promises (Task 7 item 8's "no
-// gaps" requirement, or a scenario's own deterministic step timing)
-// unpredictable. Safe to call from more than one concurrent suspender —
-// see pacingSuspendCount's own doc comment.
-func (r *Runner) SuspendPacing() (resume func()) {
-	r.pacingSuspendCount.Add(1)
-	var once sync.Once
-	return func() {
-		once.Do(func() { r.pacingSuspendCount.Add(-1) })
-	}
+func validSpeed(speed float64) bool {
+	return speed > 0 && !math.IsNaN(speed) && !math.IsInf(speed, 0)
 }
 
 // Rebase sets the dt baseline for the next Tick to now, without touching
@@ -241,8 +268,10 @@ func (r *Runner) SuspendPacing() (resume func()) {
 // declared clock.start) and the very next Tick must compute a small, sane
 // dt from that new baseline instead of one spanning however long it's
 // been since the previous Tick. Only called from within
-// controlapi.Server.doReset's own exclusive gate section (see appgate) —
-// never independently gated itself, unlike TickOnce/Tick.
+// controlapi.Server.doReset's own exclusive gate section (see appgate),
+// or by the scenario engine while it already holds driveMu (via
+// TryAcquireDrive) — never independently gated/drive-locked itself,
+// unlike TickOnce/FastForward.
 func (r *Runner) Rebase(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -250,39 +279,141 @@ func (r *Runner) Rebase(now time.Time) {
 }
 
 // FastForward advances the shared clock from its current value up to
-// current+total, calling TickOnce once per stepInterval-sized increment
-// along the way (the final increment may be shorter) rather than one
-// coarse jump — Task 7 item 8: a jump big enough to silently skip
-// heartbeat increments would fail "no gaps in the model-time heartbeat
-// sequence" by construction, no matter how the caller phrases the
-// request. Used directly by the 72-hour acceptance test and by Task 7's
-// POST /clock/advance; the scenario engine (package scenario) drives its
-// own, interruptible version of the same TickOnce-per-increment loop
-// instead of calling this, so Stop() can take effect between increments
-// — but the increment size and the "TickOnce once per increment, never a
-// bigger jump" rule are identical either way.
+// current+total, ticking once per stepInterval-sized increment along the
+// way (the final increment may be shorter) rather than one coarse jump —
+// Task 7 item 8: a jump big enough to silently skip heartbeat increments
+// would fail "no gaps in the model-time heartbeat sequence" by
+// construction, no matter how the caller phrases the request.
+//
+// The whole call — target computation through the last tick — runs under
+// one TryAcquireDrive/ReleaseDrive pair and one gate.Op/r.mu hold, not
+// per tick: returns ErrClockBusy immediately (never blocks) if a
+// scenario or another FastForward/PacedFastForward is already driving
+// the clock, and blocks Reset (which needs gate.Exclusive) until this
+// entire call — not just its next tick — has finished. See driveMu's own
+// doc comment for the concurrent-advance/advance-vs-reset regressions
+// this closes.
 func (r *Runner) FastForward(total, stepInterval time.Duration) error {
+	_, err := r.fastForward(total, stepInterval, 0, nil)
+	return err
+}
+
+// PacedFastForward is FastForward's real-time-paced counterpart —
+// scenario.Runner's own primitive for a loaded Scenario's clock.speed
+// (AGENT-TASK.md, Task 7 item 5), moved here rather than left in package
+// scenario so that business logic never itself calls time.Now/time.Sleep
+// (AGENT-TASK §1.5): this is the same "outermost driving loop" exception
+// PacedRun's own real ticker already relies on, not a carve-out invented
+// for this method. Identical to FastForward — one drive/gate/engine lock
+// held for the whole call, ErrClockBusy if already owned — except each
+// tick is additionally paced stepInterval/speed apart in real time
+// (interruptible via stop, returning completed=false if stop fires
+// before total is reached). Never affects the resulting physics state:
+// the sequence of dt values applied to the engine is identical regardless
+// of speed, only how far apart in real time each one lands — so a
+// scenario run at speed=1 and the same scenario at any faster speed
+// still produce the same final Store state.
+func (r *Runner) PacedFastForward(total, stepInterval time.Duration, speed float64, stop <-chan struct{}) (completed bool, err error) {
+	if !validSpeed(speed) {
+		return false, fmt.Errorf("physics: PacedFastForward speed must be positive and finite, got %v", speed)
+	}
+	if !r.TryAcquireDrive() {
+		return false, ErrClockBusy
+	}
+	defer r.ReleaseDrive()
+	return r.fastForwardLocked(total, stepInterval, speed, stop)
+}
+
+// PacedFastForwardLocked is PacedFastForward's variant for a caller that
+// already holds this Runner's drive lock for a larger enclosing
+// operation spanning more than this one call — currently only the
+// scenario engine, which acquires driveMu once for its whole run (Start
+// to Stop/completion, via TryAcquireDrive) and calls this once per step
+// instead of PacedFastForward, which would otherwise try to reacquire
+// the same driveMu this goroutine already holds: sync.Mutex isn't
+// reentrant, so that would either deadlock the goroutine against itself
+// or (via TryLock) incorrectly report ErrClockBusy against its own
+// caller. See driveMu's own doc comment for why the *whole* run, not
+// just each individual advanceTo call, needs to be one held operation.
+func (r *Runner) PacedFastForwardLocked(total, stepInterval time.Duration, speed float64, stop <-chan struct{}) (completed bool, err error) {
+	if !validSpeed(speed) {
+		return false, fmt.Errorf("physics: PacedFastForwardLocked speed must be positive and finite, got %v", speed)
+	}
+	return r.fastForwardLocked(total, stepInterval, speed, stop)
+}
+
+// fastForward acquires driveMu for FastForward/PacedFastForward's own
+// single-call duration, then delegates to fastForwardLocked.
+func (r *Runner) fastForward(total, stepInterval time.Duration, speed float64, stop <-chan struct{}) (completed bool, err error) {
+	if !r.TryAcquireDrive() {
+		return false, ErrClockBusy
+	}
+	defer r.ReleaseDrive()
+	return r.fastForwardLocked(total, stepInterval, speed, stop)
+}
+
+// fastForwardLocked is FastForward/PacedFastForward/PacedFastForwardLocked's
+// shared implementation, assuming the caller already holds driveMu (either
+// fastForward/PacedFastForward itself, for their own call's duration, or
+// the scenario engine, across its whole run — see PacedFastForwardLocked's
+// doc comment). speed == 0 means unpaced (FastForward's case); stop == nil
+// means not interruptible (FastForward's case, and also true whenever a
+// paced caller doesn't need interruption).
+func (r *Runner) fastForwardLocked(total, stepInterval time.Duration, speed float64, stop <-chan struct{}) (completed bool, err error) {
 	if total < 0 {
-		return fmt.Errorf("physics: FastForward total must be non-negative, got %s", total)
+		return false, fmt.Errorf("physics: FastForward total must be non-negative, got %s", total)
 	}
 	if stepInterval <= 0 {
-		return fmt.Errorf("physics: FastForward stepInterval must be positive, got %s", stepInterval)
+		return false, fmt.Errorf("physics: FastForward stepInterval must be positive, got %s", stepInterval)
 	}
 	fc, ok := r.clock.(*clock.Fake)
 	if !ok {
-		return fmt.Errorf("physics: FastForward requires a *clock.Fake clock, got %T", r.clock)
+		return false, fmt.Errorf("physics: FastForward requires a *clock.Fake clock, got %T", r.clock)
 	}
+
+	done := r.opDone() // held for the *whole* operation — Reset can't interleave with any single tick of it
+	defer done()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	target := fc.Now().Add(total)
 	for fc.Now().Before(target) {
+		if stop != nil {
+			select {
+			case <-stop:
+				return false, nil
+			default:
+			}
+		}
 		next := stepInterval
 		if remaining := target.Sub(fc.Now()); remaining < next {
 			next = remaining
 		}
-		if err := r.TickOnce(next); err != nil {
-			return err
+		if speed > 0 {
+			pace := time.Duration(float64(next) / speed)
+			if pace > 0 {
+				if stop != nil {
+					timer := time.NewTimer(pace)
+					select {
+					case <-timer.C:
+					case <-stop:
+						timer.Stop()
+						return false, nil
+					}
+				} else {
+					time.Sleep(pace)
+				}
+			}
+		}
+		fc.Advance(next)
+		now := fc.Now()
+		dt := now.Sub(r.last)
+		r.last = now
+		if dt > 0 {
+			r.step(dt)
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func (r *Runner) set(device, slug string, value float64) {

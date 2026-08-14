@@ -1,7 +1,9 @@
 package scenario_test
 
 import (
+	"errors"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -47,6 +49,16 @@ func newHarness(t *testing.T) *harness {
 
 func newHarnessWithSOC(t *testing.T, initialSOC float64) *harness {
 	t.Helper()
+	// A coarse stepInterval (rather than the production 1s default) keeps
+	// these tests, several of which span up to an hour of scenario at:
+	// offsets, fast under -race — correctness here is about execution
+	// order and timing relative to at:, never about exact tick counts
+	// (that's physics.TestFastForward*'s job, in package physics).
+	return newHarnessWithSOCAndStep(t, initialSOC, 5*time.Minute)
+}
+
+func newHarnessWithSOCAndStep(t *testing.T, initialSOC float64, stepInterval time.Duration) *harness {
+	t.Helper()
 	st := store.New()
 	clk := clock.NewFake(time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC))
 	proc, err := commands.NewProcessor(st, clk, commands.DefaultConfig())
@@ -56,12 +68,7 @@ func newHarnessWithSOC(t *testing.T, initialSOC float64) *harness {
 	pr := physics.NewRunner(physics.New(physics.DefaultParams(), initialSOC), st, clk, proc)
 	inj := faults.NewInjector(st)
 	iec, mb := &fakeLinkTarget{}, &fakeLinkTarget{}
-	// A coarse stepInterval (rather than the production 1s default) keeps
-	// these tests, several of which span up to an hour of scenario at:
-	// offsets, fast under -race — correctness here is about execution
-	// order and timing relative to at:, never about exact tick counts
-	// (that's physics.TestFastForward*'s job, in package physics).
-	r := scenario.NewRunner(st, inj, proc, pr, clk, 5*time.Minute, iec, mb)
+	r := scenario.NewRunner(st, inj, proc, pr, clk, stepInterval, iec, mb)
 	return &harness{store: st, injector: inj, processor: proc, physics: pr, clk: clk, iec: iec, mb: mb, runner: r}
 }
 
@@ -392,18 +399,30 @@ steps:
 // scenario, differing only in clock.speed, must land on the identical
 // final Store state — see scenario.Runner's own doc comment for why this
 // holds unconditionally (Speed is never consulted by execution itself).
+//
+// Reviewed gap this closes: an earlier version compared two large speeds
+// (100000 vs 1000000) against each other, never against literal
+// clock.speed: 1 (AGENT-TASK.md, Task 7 item 5's actual acceptance
+// criterion, "speed: 1 and speed > 1 give the same final state") — a bug
+// that only manifested relative to genuine real-time pacing (e.g. Speed
+// being silently ignored and every run defaulting to the same internal
+// behavior regardless of value) could pass a "two big speeds agree with
+// each other" comparison without ever exercising real-time pacing at
+// all. This scenario's total span (60ms of model time, a tiny
+// stepInterval) keeps a literal speed: 1 run's real-time pacing well
+// under a second instead of requiring an actual multi-second sleep.
 func TestRunnerAcceleratedAndNormalSpeedGiveSameFinalState(t *testing.T) {
 	run := func(speed int) map[m261points.PointKey]float64 {
-		h := newHarness(t)
+		h := newHarnessWithSOCAndStep(t, 50, 20*time.Millisecond)
 		yaml := `
 name: speed-test
 clock: {start: "2026-08-12T00:00:00+03:00", speed: ` + strconv.Itoa(speed) + `}
 steps:
-  - at: 0s
+  - at: 0ms
     write: {device: EMS, point: set_operating_mode, value: 2}
-  - at: 5s
+  - at: 20ms
     write: {device: EMS, point: set_active_power_kw, value: -50}
-  - at: 30s
+  - at: 60ms
     fault: {device: BMS, point: cell_temperature_too_high, value: 1}
 `
 		if err := h.runner.Load(mustParse(t, yaml)); err != nil {
@@ -419,7 +438,7 @@ steps:
 		return h.store.Snapshot()
 	}
 
-	slow := run(100000)
+	slow := run(1) // literal clock.speed: 1 — real-time pacing, not just "another large speed"
 	fast := run(1000000)
 
 	if len(slow) != len(fast) {
@@ -430,4 +449,170 @@ steps:
 			t.Errorf("%v: speed=1 -> %v, speed=60 -> %v, want equal", k, v, fast[k])
 		}
 	}
+}
+
+// TestLoadRejectedWhileRunningUnderConcurrency is the regression test
+// for the reviewed Load-vs-Start race: an earlier version of Load
+// checked running, released its lock to dry-validate the incoming
+// scenario, and only re-acquired the lock to install it — a concurrent
+// Start landing in that window could begin running the *old* scenario
+// while Load was still deciding whether to accept a new one, and Load's
+// eventual install would then silently replace the running scenario's
+// state out from under it. lifecycleMu (held across Load's entire body,
+// including validation) closes this by construction; this test stresses
+// the interleaving many times under -race rather than trying to hit one
+// exact window by timing.
+func TestLoadRejectedWhileRunningUnderConcurrency(t *testing.T) {
+	h := newHarness(t)
+	mustLoad(t, h.runner, `
+name: long
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
+steps:
+  - at: 1h
+    write: {device: EMS, point: set_operating_mode, value: 2}
+`)
+	other := mustParse(t, `
+name: other
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
+steps:
+  - at: 0s
+    write: {device: EMS, point: set_operating_mode, value: 1}
+`)
+
+	for i := 0; i < 50; i++ {
+		if err := h.runner.Start(); err != nil {
+			t.Fatalf("iter %d: Start: %v", i, err)
+		}
+		// Load must either be rejected outright (scenario still running)
+		// or — if it happens to land after Start's own run already
+		// finished — succeed; either is a valid outcome of the race, but
+		// it must never silently corrupt Cursor/loaded-scenario state
+		// (checked below by asserting the runner is left in one
+		// consistent, well-defined state either way).
+		err := h.runner.Load(other)
+		if err != nil && !errors.Is(err, scenario.ErrLoadWhileRunning) {
+			t.Fatalf("iter %d: Load returned %v, want nil or ErrLoadWhileRunning", i, err)
+		}
+		h.runner.Stop()
+		if h.runner.Running() {
+			t.Fatalf("iter %d: Running() = true after Stop, want false", i)
+		}
+		if c := h.runner.Cursor(); c < 0 {
+			t.Fatalf("iter %d: Cursor = %d, want >= 0", i, c)
+		}
+		h.runner.ResetPlayback()
+		mustLoad(t, h.runner, `
+name: long
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
+steps:
+  - at: 1h
+    write: {device: EMS, point: set_operating_mode, value: 2}
+`)
+	}
+}
+
+// TestStartFailsWhileDriveHeldExternally proves Start claims
+// physics.Runner's drive lock *before* touching the clock (Clock.Set/
+// Rebase), and fails cleanly with physics.ErrClockBusy — leaving
+// haveStart/the clock untouched — if something else (modeled directly
+// via TryAcquireDrive, standing in for a concurrent POST /clock/advance
+// or another scenario run) already owns it. Reviewed ordering bug this
+// guards: a previous version rebased the clock *before* claiming
+// ownership, so a concurrent driver could observe or itself produce a dt
+// computed against the wrong baseline.
+func TestStartFailsWhileDriveHeldExternally(t *testing.T) {
+	h := newHarness(t)
+	mustLoad(t, h.runner, `
+name: solo
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
+steps:
+  - at: 0s
+    write: {device: EMS, point: set_operating_mode, value: 2}
+`)
+	before := h.clk.Now()
+
+	if !h.physics.TryAcquireDrive() {
+		t.Fatal("TryAcquireDrive on a fresh physics.Runner returned false")
+	}
+	err := h.runner.Start()
+	if !errors.Is(err, physics.ErrClockBusy) {
+		t.Fatalf("Start while drive externally held: err = %v, want physics.ErrClockBusy", err)
+	}
+	if h.runner.Running() {
+		t.Error("Running() = true after a failed Start, want false")
+	}
+	if !h.clk.Now().Equal(before) {
+		t.Errorf("clock moved to %v after a failed Start, want unchanged (%v)", h.clk.Now(), before)
+	}
+	h.physics.ReleaseDrive()
+
+	if err := h.runner.Start(); err != nil {
+		t.Fatalf("Start after ReleaseDrive: %v, want success", err)
+	}
+	waitUntilStopped(t, h.runner)
+	if err := h.runner.LastError(); err != nil {
+		t.Fatalf("scenario failed: %v", err)
+	}
+}
+
+// TestConcurrentLoadStartStopResetPlaybackNeverRace fuzzes all four
+// lifecycle entry points against each other concurrently and repeatedly
+// — the reviewed requirement that Load/Start/Stop/ResetPlayback fully
+// serialize against each other (lifecycleMu) — asserting only that
+// nothing panics, no method call ever blocks forever, and Cursor/
+// Running/Loaded stay within their well-defined ranges throughout. Run
+// under -race, this also catches any data race the lock design missed,
+// not just deadlocks/panics.
+func TestConcurrentLoadStartStopResetPlaybackNeverRace(t *testing.T) {
+	h := newHarness(t)
+	s := mustParse(t, `
+name: fuzz
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
+steps:
+  - at: 0s
+    write: {device: EMS, point: set_operating_mode, value: 2}
+  - at: 1s
+    write: {device: EMS, point: set_operating_mode, value: 1}
+`)
+	mustLoad(t, h.runner, `
+name: fuzz
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000}
+steps:
+  - at: 0s
+    write: {device: EMS, point: set_operating_mode, value: 2}
+`)
+
+	const workers = 6
+	const iterations = 30
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				switch (w + i) % 4 {
+				case 0:
+					h.runner.Load(s) //nolint:errcheck // any of {nil, ErrLoadWhileRunning} is valid under concurrency
+				case 1:
+					h.runner.Start() //nolint:errcheck // any of {nil, ErrNoScenarioLoaded, ErrAlreadyRunning, physics.ErrClockBusy} is valid
+				case 2:
+					h.runner.Stop()
+				case 3:
+					h.runner.ResetPlayback()
+				}
+				if c := h.runner.Cursor(); c < 0 {
+					t.Errorf("worker %d iter %d: Cursor = %d, want >= 0", w, i, c)
+				}
+			}
+		}(w)
+	}
+
+	waitDone := make(chan struct{})
+	go func() { wg.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("concurrent Load/Start/Stop/ResetPlayback fuzzing did not finish within 30s — likely deadlocked")
+	}
+	h.runner.Stop() // leave the runner quiesced for t.Cleanup
 }

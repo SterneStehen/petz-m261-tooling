@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/appgate"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
@@ -44,6 +45,8 @@ type Server struct {
 	conns  map[*clientConn]struct{}
 
 	link linkState // Task 7 item 2 — see linkstate.go
+
+	gate *appgate.Gate // see SetGate
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -53,6 +56,22 @@ func New(st *store.Store, cfg Config) *Server {
 		quit:  make(chan struct{}),
 		conns: make(map[*clientConn]struct{}),
 	}
+}
+
+// SetGate wires the process-wide reset-atomicity gate (package appgate):
+// a whole General Interrogation response, once set, becomes one shared
+// (Op) operation against it, so controlapi.Server.doReset's exclusive
+// section can never interleave partway through one — a client GI'ing
+// mid-reset would otherwise see a response that mixes some pre-reset and
+// some post-reset values. nil (never calling SetGate) disables gating,
+// same as every other gated type in this codebase.
+func (s *Server) SetGate(g *appgate.Gate) { s.gate = g }
+
+func (s *Server) opDone() func() {
+	if s.gate == nil {
+		return func() {}
+	}
+	return s.gate.Op()
 }
 
 func (s *Server) Start() error {
@@ -344,7 +363,19 @@ func (s *Server) handleGeneralInterrogation(c *clientConn, hdr asduHeader, objs 
 
 	c.writeIFrame(buildCICNA1(hdr.CommonAddr, cotActivationCon, qoi)) //nolint:errcheck
 
+	// gate.Op held only around the snapshot capture, not the write loop
+	// below: once SnapshotDevice returns, this response is already fully
+	// determined from one consistent, atomically-captured map, immune to
+	// anything that mutates the Store afterward — holding the gate any
+	// longer than that would needlessly block a concurrent POST /reset
+	// behind this connection's own TCP write speed. What this closes:
+	// without it, this read could start after only *part* of POST
+	// /reset's six-step sequence had run (see doReset), returning a
+	// response that mixes pre- and post-reset values no single instant
+	// ever actually existed in.
+	done := s.opDone()
 	snap := s.store.SnapshotDevice(hdr.CommonAddr)
+	done()
 	keys := make([]m261points.PointKey, 0, len(snap))
 	for k := range snap {
 		keys = append(keys, k)

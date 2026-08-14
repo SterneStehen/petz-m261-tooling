@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/appgate"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/commands"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
@@ -59,6 +60,8 @@ type Server struct {
 	conns  map[net.Conn]struct{}
 
 	link linkState // Task 7 item 2 — see linkstate.go
+
+	gate *appgate.Gate // see SetGate
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -69,6 +72,22 @@ func New(st *store.Store, cfg Config) *Server {
 		quit:  make(chan struct{}),
 		conns: make(map[net.Conn]struct{}),
 	}
+}
+
+// SetGate wires the process-wide reset-atomicity gate (package appgate):
+// a whole FC01-04 read response, once set, becomes one shared (Op)
+// operation against it, so controlapi.Server.doReset's exclusive section
+// can never interleave partway through one — a client polling mid-reset
+// would otherwise see a read that mixes some pre-reset and some
+// post-reset values. nil (never calling SetGate) disables gating, same
+// as every other gated type in this codebase.
+func (s *Server) SetGate(g *appgate.Gate) { s.gate = g }
+
+func (s *Server) opDone() func() {
+	if s.gate == nil {
+		return func() {}
+	}
+	return s.gate.Op()
 }
 
 // Start binds the listener and begins serving in the background. Safe to

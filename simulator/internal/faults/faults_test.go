@@ -134,3 +134,48 @@ func TestClearRejectsNonAlarmClass(t *testing.T) {
 		t.Errorf("Clear(%v) = %v, want ErrNotAlarmClass", key, err)
 	}
 }
+
+// TestInjectRestrictsNoEnumAlarmPointsToBoolean is the reviewed fix: the
+// three real class:alarm points with no catalog enum
+// (EMS/custom_prompt_1/2/3) are wire-Boolean on both protocols (a Modbus
+// discrete input, IEC-104 M_SP_NA_1) — a value like 2 used to pass the
+// general [0, 255] U8 range check and land in the Store, even though no
+// protocol readback can ever report anything but 0 or 1 for it, silently
+// disagreeing with whatever Inject just wrote.
+func TestInjectRestrictsNoEnumAlarmPointsToBoolean(t *testing.T) {
+	noEnumAlarms := []m261points.PointKey{
+		{Device: "EMS", Slug: "custom_prompt_1"},
+		{Device: "EMS", Slug: "custom_prompt_2"},
+		{Device: "EMS", Slug: "custom_prompt_3"},
+	}
+	for _, key := range noEnumAlarms {
+		meta, ok := m261points.Points[key]
+		if !ok {
+			t.Fatalf("%v not found in the real catalog — fixture assumption broken", key)
+		}
+		if meta.Class != m261points.ClassAlarm {
+			t.Fatalf("%v is class %s, want alarm — fixture assumption broken", key, meta.Class)
+		}
+		if meta.Enum != nil {
+			t.Fatalf("%v unexpectedly has an enum — fixture assumption broken, this test needs a no-enum alarm point", key)
+		}
+
+		st := store.New()
+		inj := faults.NewInjector(st)
+
+		for _, v := range []float64{0, 1} {
+			if err := inj.Inject(key, v); err != nil {
+				t.Errorf("Inject(%v, %v) = %v, want nil (0 and 1 are the Boolean domain)", key, v, err)
+			}
+		}
+		before, _ := st.Get(key)
+		for _, v := range []float64{2, 7, 255, -1, 0.5} {
+			if err := inj.Inject(key, v); !errors.Is(err, faults.ErrInvalidValue) {
+				t.Errorf("Inject(%v, %v) = %v, want ErrInvalidValue (outside {0, 1})", key, v, err)
+			}
+		}
+		if after, _ := st.Get(key); after != before {
+			t.Errorf("%v changed from %v to %v after a rejected Inject", key, before, after)
+		}
+	}
+}

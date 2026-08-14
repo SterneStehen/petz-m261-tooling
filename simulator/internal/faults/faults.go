@@ -98,14 +98,18 @@ func (i *Injector) Validate(key m261points.PointKey, value float64) error {
 // Every real alarm point is U8 (verified against the whole catalog, not
 // assumed) — representability is checked against a fixed [0, 255]
 // integer domain unconditionally, not only when the point happens to
-// have an enum: without this, a point with no enum (three real ones —
-// EMS/custom_prompt_1/2/3) would silently accept a value like 0.5,
-// writing it to the Store while every protocol readback (a boolean
-// discrete input for Modbus, M_SP_NA_1 for IEC-104) reports the point as
-// simply "set" (nonzero) — a real Store/protocol disagreement, not a
-// hypothetical one. Enum membership (where the catalog defines one) is
+// have an enum. Enum membership (where the catalog defines one) is
 // checked on top, the same "independent, both apply" layering Task 6
 // item 1 uses for setpoints.
+//
+// A point with *no* enum (three real ones — EMS/custom_prompt_1/2/3) is
+// additionally restricted to exactly {0, 1}, not the full [0, 255]
+// U8 range: both wire representations an alarm can reach — a Modbus
+// discrete input (FC02) and IEC-104 M_SP_NA_1 (single-point information)
+// — are Boolean-only, so any value above 1 written to the Store (2..255
+// would still pass a bare U8-range check) is not a value either protocol
+// can round-trip: a client reads back 1 ("set") no matter which of
+// 2..255 was injected, silently disagreeing with what Inject just wrote.
 func (i *Injector) validateValue(meta m261points.PointMeta, value float64) error {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return fmt.Errorf("%w: %v is not finite", ErrInvalidValue, value)
@@ -121,6 +125,8 @@ func (i *Injector) validateValue(meta m261points.PointMeta, value float64) error
 		if _, ok := meta.Enum[int(rounded)]; !ok {
 			return fmt.Errorf("%w: %v is not one of the allowed enum values %v", ErrInvalidValue, value, meta.Enum)
 		}
+	} else if rounded != 0 && rounded != 1 {
+		return fmt.Errorf("%w: %v is outside the Boolean domain {0, 1} for a no-enum alarm point", ErrInvalidValue, value)
 	}
 	return nil
 }

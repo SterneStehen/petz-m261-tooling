@@ -263,6 +263,39 @@ func (p *Processor) Write(key m261points.PointKey, value float64) error {
 	return nil
 }
 
+// KeyValue is one already-validated (key, value) pair for WriteBatch.
+type KeyValue struct {
+	Key   m261points.PointKey
+	Value float64
+}
+
+// WriteBatch commits every pair in writes as a single atomic operation
+// with respect to POST /reset (one gate.Op acquisition for the whole
+// batch, not one per pair) — for a caller (modbustcp's FC16/FC06
+// handler) that has already validated every touched point via Validate
+// and now needs to commit all of them without a concurrent Reset landing
+// partway through. Unlike Write, WriteBatch does *not* validate: it's a
+// low-level commit primitive for a caller that has already done so
+// itself and computed its own "reject the whole request, don't apply it
+// partially" decision beforehand (the same all-or-nothing rule Task 6
+// item 1 requires for a multi-register FC16 write spanning more than one
+// catalog point) — calling it with an unvalidated pair skips Validate
+// entirely, unlike Write.
+//
+// Reviewed gap this closes: applyRegisterWrites used to call Write once
+// per touched point, each taking gate.Op independently — a POST /reset
+// could interleave between two of those calls and observe (or leave) a
+// batch partially committed, even though every point had already passed
+// validation as one all-or-nothing request.
+func (p *Processor) WriteBatch(writes []KeyValue) {
+	done := p.opDone()
+	defer done()
+	for _, kv := range writes {
+		p.applySideEffects(kv.Key, kv.Value)
+		p.store.Set(kv.Key, kv.Value)
+	}
+}
+
 // applySideEffects updates the Processor's own watchdog/diagnostic state
 // for the handful of setpoints Task 6 models further behavior for. Only
 // called after Validate has already accepted the write.
