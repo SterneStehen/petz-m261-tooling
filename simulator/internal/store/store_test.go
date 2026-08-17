@@ -301,3 +301,28 @@ func TestRestoreIsAtomicUnderConcurrentAccess(t *testing.T) {
 	default:
 	}
 }
+
+func TestSubscribeBatchesDeliversWholeMutationAndSnapshotBoundary(t *testing.T) {
+	s := New()
+	ch, snap, rev, unsubscribe := s.SubscribeBatchesWithSnapshot()
+	defer unsubscribe()
+	if rev != s.CurrentRevision() || len(snap) != len(m261points.Points) {
+		t.Fatalf("bootstrap snapshot/revision is not self-consistent: rev=%d current=%d points=%d", rev, s.CurrentRevision(), len(snap))
+	}
+	writes := []KeyValue{{Key: m261points.PointKey{Device: "EMS", Slug: "desired_active_power_kw"}, Value: 11}, {Key: m261points.PointKey{Device: "BMS", Slug: "soc"}, Value: 22}}
+	if !s.SetBatch(writes) {
+		t.Fatal("SetBatch failed")
+	}
+	batch := <-ch
+	if batch.Revision != rev+1 {
+		t.Fatalf("revision = %d, want %d", batch.Revision, rev+1)
+	}
+	if len(batch.Changes) != len(writes) {
+		t.Fatalf("changes = %d, want %d", len(batch.Changes), len(writes))
+	}
+	for _, change := range batch.Changes {
+		if change.Rev != batch.Revision {
+			t.Fatalf("change has rev %d, batch has %d", change.Rev, batch.Revision)
+		}
+	}
+}

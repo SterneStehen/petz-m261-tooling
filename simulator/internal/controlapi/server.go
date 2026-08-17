@@ -67,6 +67,12 @@ type Config struct {
 	StartupSnapshot map[m261points.PointKey]float64
 	NewEngine       func() *physics.Engine
 	StartupInstant  time.Time
+
+	// PublicConfig is the already-resolved subset of configuration the web
+	// console may display. Each entry retains its source unconfirmed flag.
+	PublicConfig map[string]any
+	// Ready reports whether all simulator listeners are available.
+	Ready func() bool
 }
 
 // Server is the control API's HTTP server.
@@ -75,10 +81,11 @@ type Server struct {
 	validDevices map[string]bool
 	ln           net.Listener
 	hs           *http.Server
+	events       *eventHub
 }
 
 func New(cfg Config) *Server {
-	s := &Server{cfg: cfg, validDevices: make(map[string]bool)}
+	s := &Server{cfg: cfg, validDevices: make(map[string]bool), events: newEventHub(256)}
 	for key := range m261points.Points {
 		s.validDevices[key.Device] = true
 	}
@@ -94,6 +101,17 @@ func New(cfg Config) *Server {
 	mux.HandleFunc("/scenario/stop", s.handleScenarioStop)
 	mux.HandleFunc("/clock/advance", s.handleClockAdvance)
 	mux.HandleFunc("/reset", s.handleReset)
+	mux.HandleFunc("/api/v1/catalog", s.handleV1Catalog)
+	mux.HandleFunc("/api/v1/status", s.handleV1Status)
+	mux.HandleFunc("/api/v1/state", s.handleV1State)
+	mux.HandleFunc("/api/v1/commands", s.handleV1Commands)
+	mux.HandleFunc("/api/v1/scenarios", s.handleV1Scenarios)
+	mux.HandleFunc("/api/v1/scenario/status", s.handleV1ScenarioStatus)
+	mux.HandleFunc("/api/v1/diagnostics", s.handleV1Diagnostics)
+	mux.HandleFunc("/api/v1/events", s.handleV1Events)
+	mux.HandleFunc("/api/v1/demo/prepare", s.handleV1DemoPrepare)
+	mux.HandleFunc("/api/v1/health/live", s.handleV1Live)
+	mux.HandleFunc("/api/v1/health/ready", s.handleV1Ready)
 	mux.HandleFunc("/", s.handleNotFound) // every unregistered path — a JSON 404, not net/http's plain-text default
 
 	s.hs = &http.Server{Handler: mux}

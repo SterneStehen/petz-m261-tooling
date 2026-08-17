@@ -79,6 +79,15 @@ func (p PriorityParam) validate(name string) error {
 type ModbusConfig struct {
 	ByteOrder EnumParam `yaml:"byte_order"`
 }
+type ScalingConfig struct {
+	Source EnumParam `yaml:"source"`
+}
+type SetpointsConfig struct {
+	Apply EnumParam `yaml:"apply"`
+}
+type BatteryConfig struct {
+	CellAddressLayout EnumParam `yaml:"cell_address_layout"`
+}
 
 // WatchdogConfig is §7's watchdog.mode/watchdog.timeout_s — Task 6 item 5:
 // three modes because the real EMS's actual watchdog behavior on a stale
@@ -117,9 +126,12 @@ type ControlAPIConfig struct {
 
 type Config struct {
 	Modbus     ModbusConfig     `yaml:"modbus"`
+	Scaling    ScalingConfig    `yaml:"scaling"`
 	Watchdog   WatchdogConfig   `yaml:"watchdog"`
 	Modes      ModesConfig      `yaml:"modes"`
 	Commands   CommandsConfig   `yaml:"commands"`
+	Setpoints  SetpointsConfig  `yaml:"setpoints"`
+	Battery    BatteryConfig    `yaml:"battery"`
 	ControlAPI ControlAPIConfig `yaml:"control_api"`
 }
 
@@ -135,6 +147,7 @@ func Default() Config {
 				Unconfirmed: true,
 			},
 		},
+		Scaling: ScalingConfig{Source: EnumParam{Value: "override", Allowed: []string{"iec104", "modbus", "override"}, Unconfirmed: true}},
 		Watchdog: WatchdogConfig{
 			Mode: EnumParam{
 				Value:       "zero_after",
@@ -149,6 +162,8 @@ func Default() Config {
 		Commands: CommandsConfig{
 			AllowDangerous: BoolParam{Value: false, Unconfirmed: true},
 		},
+		Setpoints: SetpointsConfig{Apply: EnumParam{Value: "immediate", Allowed: []string{"immediate", "on_restart"}, Unconfirmed: true}},
+		Battery:   BatteryConfig{CellAddressLayout: EnumParam{Value: "single_device", Allowed: []string{"single_device", "multi_device"}, Unconfirmed: true}},
 		ControlAPI: ControlAPIConfig{
 			// Loopback-only default, per AGENT-TASK §1.3: code doesn't
 			// hardcode IPs other than 127.0.0.1 and config values, and
@@ -185,6 +200,9 @@ func (c Config) Validate() error {
 	if err := c.Modbus.ByteOrder.validate("modbus.byte_order"); err != nil {
 		return err
 	}
+	if err := c.Scaling.Source.validate("scaling.source"); err != nil {
+		return err
+	}
 	if err := c.Watchdog.Mode.validate("watchdog.mode"); err != nil {
 		return err
 	}
@@ -192,6 +210,12 @@ func (c Config) Validate() error {
 		return fmt.Errorf("config: watchdog.timeout_s = %d, must be positive", c.Watchdog.TimeoutS.Value)
 	}
 	if err := c.Modes.Priority.validate("modes.priority"); err != nil {
+		return err
+	}
+	if err := c.Setpoints.Apply.validate("setpoints.apply"); err != nil {
+		return err
+	}
+	if err := c.Battery.CellAddressLayout.validate("battery.cell_address_layout"); err != nil {
 		return err
 	}
 	if c.ControlAPI.Bind == "" {

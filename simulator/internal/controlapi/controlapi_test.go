@@ -200,6 +200,43 @@ func decodeError(t *testing.T, body []byte) apiError {
 	return e
 }
 
+func TestV1CatalogStateAndCommands(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do(t, http.MethodGet, "/api/v1/catalog", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("catalog status = %d: %s", resp.StatusCode, body)
+	}
+	var catalog struct {
+		Points []json.RawMessage `json:"points"`
+	}
+	if err := json.Unmarshal(body, &catalog); err != nil || len(catalog.Points) != len(m261points.Points) {
+		t.Fatalf("catalog = %d points, err=%v", len(catalog.Points), err)
+	}
+	resp, body = h.do(t, http.MethodGet, "/api/v1/state", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("state status = %d: %s", resp.StatusCode, body)
+	}
+	var state struct {
+		Revision uint64            `json:"revision"`
+		Points   []json.RawMessage `json:"points"`
+	}
+	if err := json.Unmarshal(body, &state); err != nil || len(state.Points) != len(m261points.Points) {
+		t.Fatalf("state err=%v points=%d", err, len(state.Points))
+	}
+	resp, body = h.do(t, http.MethodPost, "/api/v1/commands", map[string]any{"device": "EMS", "slug": "set_operating_mode", "value": 2})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("command status = %d: %s", resp.StatusCode, body)
+	}
+	resp, body = h.do(t, http.MethodPost, "/api/v1/commands", map[string]any{"device": "BMS", "slug": "soc", "value": 2})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("non-setpoint status = %d: %s", resp.StatusCode, body)
+	}
+	resp, body = h.do(t, http.MethodPost, "/api/v1/demo/prepare", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("demo prepare status = %d: %s", resp.StatusCode, body)
+	}
+}
+
 // --- routing/method/JSON contract ------------------------------------------
 
 func TestUnknownRouteIsJSON404(t *testing.T) {

@@ -42,6 +42,14 @@ type Change struct {
 	Rev uint64
 }
 
+// ChangeBatch is one indivisible Store mutation. A consumer either receives
+// every change produced by Set/SetBatch/Restore or receives none of them and
+// can detect that fact from Revision.
+type ChangeBatch struct {
+	Revision uint64
+	Changes  []Change
+}
+
 // IECAddr is a point's IEC-104 address: ASDU common address (== device
 // address, §4.1) plus information object address.
 type IECAddr struct {
@@ -91,6 +99,10 @@ type Store struct {
 	subMu     sync.Mutex
 	subs      map[int]chan Change
 	nextSubID int
+
+	batchSubMu     sync.Mutex
+	batchSubs      map[int]chan ChangeBatch
+	nextBatchSubID int
 }
 
 // New builds a Store pre-populated (at zero) with every point in
@@ -102,6 +114,7 @@ func New() *Store {
 		modbusIndex: make(map[ModbusAddr]m261points.PointKey, len(m261points.Points)),
 		readbackOf:  make(map[m261points.PointKey]m261points.PointKey),
 		subs:        make(map[int]chan Change),
+		batchSubs:   make(map[int]chan ChangeBatch),
 	}
 
 	byIECAddr := make(map[IECAddr]m261points.PointKey, len(m261points.Points))
@@ -223,6 +236,7 @@ func (s *Store) Set(key m261points.PointKey, value float64) bool {
 		s.values[rbKey] = value
 		changed = append(changed, Change{Key: rbKey, Value: value, Rev: rev})
 	}
+	s.publishBatchLocked(ChangeBatch{Revision: rev, Changes: changed})
 	s.mu.Unlock()
 
 	for _, c := range changed {
@@ -299,6 +313,23 @@ func (s *Store) Snapshot() map[m261points.PointKey]float64 {
 	return out
 }
 
+// SnapshotWithRevision captures values and the Store revision under one read
+// lock. Consumers must use this rather than Snapshot followed by
+// CurrentRevision when establishing a UI synchronisation point.
+func (s *Store) SnapshotWithRevision() (map[m261points.PointKey]float64, uint64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.snapshotLocked(), s.rev
+}
+
+func (s *Store) snapshotLocked() map[m261points.PointKey]float64 {
+	out := make(map[m261points.PointKey]float64, len(s.values))
+	for k, v := range s.values {
+		out[k] = v
+	}
+	return out
+}
+
 // SnapshotDevice returns every point's current value for one device (one
 // IEC-104 common address / Modbus Unit ID) — general interrogation is
 // scoped per common address (Task 4: "correctly handle multiple ASDU
@@ -341,6 +372,7 @@ func (s *Store) Restore(snapshot map[m261points.PointKey]float64) {
 			changed = append(changed, Change{Key: k, Value: v, Rev: rev})
 		}
 	}
+	s.publishBatchLocked(ChangeBatch{Revision: rev, Changes: changed})
 	s.mu.Unlock()
 
 	for _, c := range changed {
@@ -389,6 +421,7 @@ func (s *Store) SetBatch(writes []KeyValue) bool {
 			changed = append(changed, Change{Key: rbKey, Value: kv.Value, Rev: rev})
 		}
 	}
+	s.publishBatchLocked(ChangeBatch{Revision: rev, Changes: changed})
 	s.mu.Unlock()
 
 	for _, c := range changed {
@@ -420,12 +453,67 @@ func (s *Store) Subscribe() (<-chan Change, func()) {
 	return ch, unsubscribe
 }
 
+// SubscribeBatches returns future mutations as atomic batches. Its bounded,
+// best-effort queue drops a whole batch when full; it never exposes a subset
+// of one mutation. This is deliberately independent from Subscribe(), whose
+// per-point contract is retained for IEC-104 spontaneous transmission.
+func (s *Store) SubscribeBatches() (<-chan ChangeBatch, func()) {
+	s.batchSubMu.Lock()
+	defer s.batchSubMu.Unlock()
+	return s.subscribeBatchesLocked()
+}
+
+// SubscribeBatchesWithSnapshot atomically registers the batch subscriber and
+// captures a snapshot/revision. A mutation is therefore either represented in
+// the returned snapshot or queued after it, never lost between the two.
+func (s *Store) SubscribeBatchesWithSnapshot() (<-chan ChangeBatch, map[m261points.PointKey]float64, uint64, func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.batchSubMu.Lock()
+	defer s.batchSubMu.Unlock()
+	var ch <-chan ChangeBatch
+	var unsubscribe func()
+	ch, unsubscribe = s.subscribeBatchesLocked()
+	return ch, s.snapshotLocked(), s.rev, unsubscribe
+}
+
+// subscribeBatchesLocked is called with batchSubMu held. The Store mutex is
+// optionally held too by SubscribeBatchesWithSnapshot (in that order).
+func (s *Store) subscribeBatchesLocked() (<-chan ChangeBatch, func()) {
+	id := s.nextBatchSubID
+	s.nextBatchSubID++
+	ch := make(chan ChangeBatch, subscriberBufferSize)
+	s.batchSubs[id] = ch
+	return ch, func() {
+		s.batchSubMu.Lock()
+		if existing, ok := s.batchSubs[id]; ok {
+			delete(s.batchSubs, id)
+			close(existing)
+		}
+		s.batchSubMu.Unlock()
+	}
+}
+
 func (s *Store) publish(c Change) {
 	s.subMu.Lock()
 	defer s.subMu.Unlock()
 	for _, ch := range s.subs {
 		select {
 		case ch <- c:
+		default:
+		}
+	}
+}
+
+// publishBatchLocked queues the complete batch while the mutation still owns
+// s.mu. This is the ordering primitive used by the SSE bootstrap.
+func (s *Store) publishBatchLocked(batch ChangeBatch) {
+	s.batchSubMu.Lock()
+	defer s.batchSubMu.Unlock()
+	for _, ch := range s.batchSubs {
+		copyChanges := append([]Change(nil), batch.Changes...)
+		select {
+		case ch <- ChangeBatch{Revision: batch.Revision, Changes: copyChanges}:
 		default:
 		}
 	}

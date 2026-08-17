@@ -1,0 +1,52 @@
+openapi: 3.1.0
+info:
+  title: M261 simulator web-console API
+  version: 1.0.0
+paths:
+  /api/v1/catalog:
+    get: {summary: Generated point metadata}
+  /api/v1/status:
+    get: {summary: Simulator/server and display configuration status}
+  /api/v1/state:
+    get: {summary: Atomic point snapshot with Store revision}
+  /api/v1/commands:
+    post:
+      summary: Write one setpoint through commands.Processor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device, slug, value]
+              properties:
+                device: {type: string}
+                slug: {type: string}
+                value: {type: number}
+  /api/v1/scenarios:
+    get: {summary: List bundled scenario files}
+  /api/v1/scenario/status:
+    get: {summary: Loaded scenario, cursor, running state and last error}
+  /api/v1/diagnostics:
+    get: {summary: Structured command diagnostics}
+  /api/v1/events:
+    get:
+      summary: Server-sent event stream; initial_state=true atomically bootstraps snapshot and stream
+      parameters:
+        - name: initial_state
+          in: query
+          required: true
+          schema: {type: boolean, const: true}
+        - name: Last-Event-ID
+          in: header
+          schema: {type: string}
+      responses:
+        '200':
+          description: text/event-stream events: snapshot, telemetry, resync_required
+          content: {text/event-stream: {schema: {type: string}}}
+  /api/v1/demo/prepare:
+    post: {summary: Deterministically reset and validate a guided-demo session}
+  /api/v1/health/live:
+    get: {summary: Process liveness}
+  /api/v1/health/ready:
+    get: {summary: Listener readiness; 503 when unavailable}

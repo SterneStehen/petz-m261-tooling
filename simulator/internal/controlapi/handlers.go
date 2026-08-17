@@ -86,6 +86,8 @@ func (s *Server) handleFaults(w http.ResponseWriter, r *http.Request) {
 		writeFaultsError(w, err)
 		return
 	}
+	rev := s.cfg.Store.CurrentRevision()
+	s.events.publish("fault", s.cfg.Clock.Now(), &rev, map[string]any{"device": key.Device, "slug": key.Slug, "value": *req.Value})
 	writeNoContent(w)
 }
 
@@ -98,6 +100,8 @@ func (s *Server) handleFaultByPath(w http.ResponseWriter, r *http.Request) {
 		writeFaultsError(w, err)
 		return
 	}
+	rev := s.cfg.Store.CurrentRevision()
+	s.events.publish("fault", s.cfg.Clock.Now(), &rev, map[string]any{"device": key.Device, "slug": key.Slug, "value": 0})
 	writeNoContent(w)
 }
 
@@ -376,6 +380,8 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "reset_failed", err)
 		return
 	}
+	rev := s.cfg.Store.CurrentRevision()
+	s.events.publish("reset", s.cfg.Clock.Now(), &rev, map[string]any{})
 	writeNoContent(w)
 }
 

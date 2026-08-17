@@ -6,15 +6,16 @@
 # into the Go source — so that once Stage 0 on-site testing confirms the
 # real value, only this file changes, not the code.
 #
-# scaling.source and battery.cell_address_layout aren't declared yet —
-# they belong to tasks that don't exist yet (no code reads them). Declaring
-# them here first, unused, would just be dead config with an invented
-# default nobody's enforcing.
-
 modbus:
   byte_order:
     value: big
     allowed: [big, little, big_word_swap, little_word_swap]
+    unconfirmed: true
+
+scaling:
+  source:
+    value: override
+    allowed: [iec104, modbus, override]
     unconfirmed: true
 
 # Task 6 item 5: EMS's actual behavior on a stale Remote-mode setpoint
@@ -42,6 +43,18 @@ modes:
 commands:
   allow_dangerous:
     value: false
+    unconfirmed: true
+
+setpoints:
+  apply:
+    value: immediate
+    allowed: [immediate, on_restart]
+    unconfirmed: true
+
+battery:
+  cell_address_layout:
+    value: single_device
+    allowed: [single_device, multi_device]
     unconfirmed: true
 
 # Task 7 item 3: the control API's own listen address. Not a

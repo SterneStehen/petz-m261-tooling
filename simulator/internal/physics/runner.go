@@ -45,6 +45,7 @@ type Runner struct {
 	clock    clock.Clock
 	commands *commands.Processor
 	last     time.Time
+	writes   []store.KeyValue // scratch buffer, protected by mu
 
 	gate *appgate.Gate // see SetGate
 
@@ -577,7 +578,7 @@ func (r *Runner) fastForwardLocked(total, stepInterval time.Duration, speed floa
 }
 
 func (r *Runner) set(device, slug string, value float64) {
-	r.store.Set(m261points.PointKey{Device: device, Slug: slug}, value)
+	r.writes = append(r.writes, store.KeyValue{Key: m261points.PointKey{Device: device, Slug: slug}, Value: value})
 }
 
 func boolToFloat(b bool) float64 {
@@ -596,6 +597,7 @@ func cellTemperatureSlug(n int) string { return fmt.Sprintf("cell_temperature_%0
 // point names in AGENT-TASK's prose.
 func (r *Runner) writeState() {
 	s := r.engine.State()
+	r.writes = r.writes[:0]
 
 	// EMS
 	r.set("EMS", "desired_active_power_kw", s.RequestedPowerKW)
@@ -679,4 +681,9 @@ func (r *Runner) writeState() {
 	r.set("PCS_METER", "phase_b_reverse_active_energy_kwh", s.TotalReverseEnergyKWh/3)
 	r.set("PCS_METER", "phase_c_reverse_active_energy_kwh", s.TotalReverseEnergyKWh/3)
 	r.set("PCS_METER", "online_status", boolToFloat(s.Online))
+	// A physics tick is one Store revision and one visible state change.
+	// SetBatch keeps snapshots and UI subscribers from seeing a half-tick.
+	if !r.store.SetBatch(r.writes) {
+		panic("physics: writeState references a point absent from the generated catalog")
+	}
 }

@@ -56,6 +56,22 @@ func commandsConfigFrom(cfg config.Config, nominalPowerKW float64) commands.Conf
 	}
 }
 
+func publicConfigFrom(cfg config.Config) map[string]any {
+	param := func(value any, unconfirmed bool) map[string]any {
+		return map[string]any{"value": value, "unconfirmed": unconfirmed}
+	}
+	return map[string]any{
+		"modbus.byte_order":           param(cfg.Modbus.ByteOrder.Value, cfg.Modbus.ByteOrder.Unconfirmed),
+		"scaling.source":              param(cfg.Scaling.Source.Value, cfg.Scaling.Source.Unconfirmed),
+		"watchdog.mode":               param(cfg.Watchdog.Mode.Value, cfg.Watchdog.Mode.Unconfirmed),
+		"watchdog.timeout_s":          param(cfg.Watchdog.TimeoutS.Value, cfg.Watchdog.TimeoutS.Unconfirmed),
+		"modes.priority":              param(cfg.Modes.Priority.Value, cfg.Modes.Priority.Unconfirmed),
+		"setpoints.apply":             param(cfg.Setpoints.Apply.Value, cfg.Setpoints.Apply.Unconfirmed),
+		"battery.cell_address_layout": param(cfg.Battery.CellAddressLayout.Value, cfg.Battery.CellAddressLayout.Unconfirmed),
+		"commands.allow_dangerous":    param(cfg.Commands.AllowDangerous.Value, cfg.Commands.AllowDangerous.Unconfirmed),
+	}
+}
+
 func main() {
 	modbusAddr := flag.String("modbus-addr", ":502", "Modbus TCP listen address")
 	iecAddr := flag.String("iec104-addr", ":2404", "IEC-104 listen address")
@@ -229,6 +245,8 @@ func main() {
 		StartupSnapshot: startupSnapshot,
 		NewEngine:       newEngine,
 		StartupInstant:  startupInstant,
+		PublicConfig:    publicConfigFrom(cfg),
+		Ready:           func() bool { return true }, // all three listeners are started before control API is constructed
 	})
 	if err := capi.Start(); err != nil {
 		log.Fatalf("control api: %v", err)
