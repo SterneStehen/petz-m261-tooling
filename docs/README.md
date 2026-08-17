@@ -3,8 +3,14 @@
 This is the operator guide: how to start the simulator, which ports it
 listens on, and how to connect a client to each of them. For what this
 repository is and how the point catalog/codegen pipeline works, see the
-[repository README](../README.md). For the full list of every simulated
-point, see [point-reference.md](point-reference.md).
+[repository README](../README.md).
+
+The full point-by-point reference (every address, type, range, and
+setpoint) is generated locally by `make generate` but is **not** part of
+this repository — it's derived directly from the manufacturer register
+map, which is private/internal material (see the repository README).
+Ask a maintainer with access to the register maps for the current
+reference document if you need one.
 
 ## Quick start: Docker Compose
 
@@ -38,17 +44,21 @@ yourself (private input, not part of this repository).
 
 | Port | Protocol | Default bind | Purpose |
 |---|---|---|---|
-| 502 | Modbus TCP | `:502` (all interfaces) | Functions 02/03/04/06/16 against the shared point store — see [point-reference.md](point-reference.md) for the address of every point. |
+| 502 | Modbus TCP | `:502` (all interfaces) | Functions 02/03/04/06/16 against the shared point store. |
 | 2404 | IEC-104 | `:2404` (all interfaces) | Station/general interrogation, spontaneous transmission, single/setpoint commands. |
 | 8081 | Control API (HTTP/JSON) | `127.0.0.1:8081` (loopback only) | Fault injection, link-fault simulation, scenario playback, clock control, reset — simulator-only, no equivalent on the real M261. |
 
 The control API binds to loopback only by default, deliberately — it is
-an operational/testing surface, not part of the M261's own protocol
-footprint. The bundled `docker-compose.yml` overrides this to
-`0.0.0.0:8081` inside the container (via the `-control-addr` flag, not by
-changing the default) specifically so it's reachable from the host once
-published — see that file's own comment. Running the binary directly, the
-default stays loopback-only unless you pass `-control-addr` yourself.
+an operational/testing surface with no equivalent on the real M261, and
+its endpoints (`/reset`, `/faults`, `/link`, scenario control) are not
+something any host on the network should be able to call. The bundled
+`docker-compose.yml` overrides the *container's* own bind to `0.0.0.0:8081`
+(via the `-control-addr` flag, not by changing the code's own default —
+needed since Docker's port forwarding doesn't arrive as a literal
+loopback connection) but publishes that port to the host as
+`127.0.0.1:8081` specifically so it stays loopback-only end to end — see
+that file's own comment. Running the binary directly, the default stays
+loopback-only unless you pass `-control-addr` yourself.
 
 Every listen address is a flag or a config value — see `m261sim -h` for
 the full list (`-modbus-addr`, `-iec104-addr`, `-control-addr`,
@@ -60,11 +70,10 @@ the full list (`-modbus-addr`, `-iec104-addr`, `-control-addr`,
 ### Modbus TCP
 
 Any standard Modbus TCP master works against `<host>:502`. Unit IDs are
-per-device addresses — see [point-reference.md](point-reference.md) for
-which Unit ID each device uses, and each point's own register/function.
-Example: BMS (unit 34) `soc` is an F32 (2 registers) input register at
-Modbus address 30003 (function 04), 0-based wire address 2. With
-`mbpoll`:
+per-device addresses (the private point reference — see above — has the
+address and register/function for every point). Example: BMS (unit 34)
+`soc` is an F32 (2 registers) input register at Modbus address 30003
+(function 04), 0-based wire address 2. With `mbpoll`:
 
 ```sh
 mbpoll -m tcp -a 34 -t 4 -r 3 -c 2 <host>       # BMS (unit 34) SoC, 2 input registers from 30003
@@ -87,8 +96,8 @@ Any IEC 60870-5-104 master (e.g. `lib60870`, `iec104-python`) can connect
 to `<host>:2404`, send `STARTDT_ACT`, and issue a general interrogation
 (`C_IC_NA_1`) to read every point's current value, or a single/setpoint
 command (`C_SC_NA_1`/`C_SE_NC_1`) to write a setpoint. Point addresses
-(ASDU common address + information object address) are listed per point
-in [point-reference.md](point-reference.md).
+(ASDU common address + information object address) are in the private
+point reference — see above.
 
 ### Control API
 
@@ -125,9 +134,10 @@ Every endpoint returns `204` on success or a JSON `{"error": {"code",
 every parameter the manufacturer hasn't confirmed yet (Modbus byte order,
 watchdog behavior, mode-arbitration priority, whether dangerous commands
 are accepted) — each one carries its own `unconfirmed: true` marker and a
-documented default. See [open-questions.md](open-questions.md) for the
-specific, itemized questions these defaults are standing in for, ready to
-send to the manufacturer as-is.
+documented default. The specific, itemized questions these defaults are
+standing in for are generated locally by `make generate`
+(`catalog.validate_catalog`) but, like the point reference above, are not
+part of this repository — see the repository README.
 
 ## Development
 

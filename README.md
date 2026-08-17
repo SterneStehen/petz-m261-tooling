@@ -9,10 +9,11 @@ project's approved internal channel before generating a catalog.
 
 Running the simulator (launch, ports, connecting a client) is documented
 separately in **[docs/README.md](docs/README.md)** — this file covers the
-repository and its build pipeline. The full list of every simulated point
-is in [docs/point-reference.md](docs/point-reference.md); manufacturer
-questions the register maps alone couldn't answer are in
-[docs/open-questions.md](docs/open-questions.md).
+repository and its build pipeline. `make generate` also produces a full
+point-by-point reference and a list of manufacturer open questions
+locally, but — like `catalog/point_catalog.json` itself — neither is part
+of this repository: both are derived directly from the private register
+maps and stay local-only artifacts (see `.gitignore`).
 
 ## Prerequisites
 

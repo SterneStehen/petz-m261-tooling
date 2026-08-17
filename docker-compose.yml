@@ -4,16 +4,28 @@ services:
     ports:
       - "502:502"
       - "2404:2404"
-      - "8081:8081"
+      # Reviewed BLOCKER: the container listens on 0.0.0.0:8081 (see the
+      # -control-addr override below — needed so the host can reach it at
+      # all, since Docker's port forwarding doesn't arrive as a literal
+      # loopback connection). Publishing that as a bare "8081:8081" binds
+      # the *host* side to every host interface too, not just loopback —
+      # any machine on the same network as the host could then call
+      # /reset, /faults, /link, and scenario control. Binding the
+      # published side explicitly to 127.0.0.1 keeps it reachable from the
+      # host (this repository's own client examples, docs/README.md) while
+      # everyone else on the network gets nothing to connect to.
+      - "127.0.0.1:8081:8081"
     # The control API's own default bind (127.0.0.1:8081, loopback-only —
     # see docs/README.md) would be unreachable from the host even with the
     # port mapping above, since it's inside the container's own network
     # namespace: Docker's port forwarding doesn't arrive as a literal
-    # loopback connection. -control-addr overrides just the bind address,
-    # the documented escape hatch for exactly this (AGENT-TASK §1.3: no
-    # hardcoded non-127.0.0.1 addresses in the *code* — this is a runtime
-    # flag, not a code change). Modbus/IEC-104 already bind every
-    # interface by default and need no override.
+    # loopback connection. -control-addr overrides just the *container's*
+    # bind address, the documented escape hatch for exactly this
+    # (AGENT-TASK §1.3: no hardcoded non-127.0.0.1 addresses in the
+    # *code* — this is a runtime flag, not a code change) — the host-side
+    # publish above is what actually keeps this loopback-only end to end.
+    # Modbus/IEC-104 already bind every interface by default and need no
+    # override.
     command:
       - -config=simulator/config/m261sim.yaml
       - -scenarios-dir=scenarios

@@ -18,9 +18,13 @@ jobs:
       # gen/go/m261points (the generated catalog code the simulator
       # imports) is committed, like any other Go source — this whole job
       # never touches catalog/ or the private manufacturer register maps.
+      # Scoped to tracked *.go files (git ls-files), not a bare "gofmt -l
+      # ." over the whole checkout — see the Makefile's own `lint` target
+      # for why (checks exactly what's actually committed, nothing else).
       - name: gofmt
         run: |
-          out="$(gofmt -l .)"
+          files="$(git ls-files '*.go')"
+          out="$(gofmt -l $files)"
           if [ -n "$out" ]; then
             echo "the following files are not gofmt-clean:"
             echo "$out"

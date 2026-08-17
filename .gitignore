@@ -9,16 +9,23 @@ __pycache__/
 # /docs/ itself is deliberately NOT ignored as a whole directory — git
 # cannot "un-ignore" individual files inside an ignored directory (a
 # documented limitation: it never descends into one to check exceptions),
-# so the two actually-private documents are named directly instead. Task 8's
-# own deliverables (docs/README.md, docs/point-reference.md,
-# docs/open-questions.md) are generated *output* or a plain operator guide,
-# not internal specs or raw register-map data — same "generated output is
-# tracked" convention gen/ already uses — and stay tracked normally.
+# so every actually-private document under docs/ is named directly
+# instead. docs/point-reference.md and docs/open-questions.md are
+# generated straight from catalog/point_catalog.json (Task 8 review:
+# both expose the full derived register map — every point, IEC-104/
+# Modbus address, type, range, and setpoint — which is exactly the kind
+# of internal data this section already keeps local-only elsewhere) and
+# stay private artifacts: `make generate` still writes them locally (see
+# codegen/gen_docs.py, catalog/validate_catalog.py), they are simply
+# never committed. Only docs/README.md (a plain operator guide, no
+# catalog data of its own) is tracked.
 /m261-registermap/
 /catalog/point_catalog.json
 /catalog/validation_report.md
 /docs/AGENT-TASK.md
 /docs/AGENT-CODE-REVIEW.md
+/docs/point-reference.md
+/docs/open-questions.md
 
 # Credentials and local runtime configuration
 .env

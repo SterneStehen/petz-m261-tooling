@@ -37,17 +37,20 @@ run: build
 
 # Task 3's own acceptance criterion, automated: regenerate from scratch
 # and fail if the result differs from what's actually committed. Scoped
-# to the files `generate` actually writes that git tracks (gen/, and
-# Task 8's own docs/point-reference.md — catalog/point_catalog.json and
-# catalog/validation_report.md are private/gitignored, so there is
-# nothing for git to compare there; see README.md for why most CI
-# environments can't run this target at all without the register maps).
+# to gen/ — the only thing `generate` writes that git actually tracks.
+# catalog/point_catalog.json, catalog/validation_report.md,
+# docs/point-reference.md, and docs/open-questions.md are all private/
+# gitignored (Task 8 review: the latter two are just as much a derived
+# view of the private register map as the first two, so they stay local-
+# only artifacts, not committed output) — there is nothing for git to
+# compare there, by design; see README.md for why most CI environments
+# can't run this target at all without the register maps.
 validate: generate
-	@git diff --exit-code -- gen/ docs/point-reference.md || \
+	@git diff --exit-code -- gen/ || \
 		(echo "make generate produced a diff against what's committed -- run 'make generate' and commit the result" && exit 1)
-	@if [ -n "$$(git status --porcelain -- gen/ docs/point-reference.md)" ]; then \
-		echo "make generate produced new untracked/deleted files under gen/ or docs/point-reference.md"; \
-		git status --porcelain -- gen/ docs/point-reference.md; \
+	@if [ -n "$$(git status --porcelain -- gen/)" ]; then \
+		echo "make generate produced new untracked/deleted files under gen/"; \
+		git status --porcelain -- gen/; \
 		exit 1; \
 	fi
 	@echo "make generate: no diff"
@@ -57,9 +60,21 @@ validate: generate
 # stubs for openpyxl/PyYAML, one real pre-existing issue in normalize.py)
 # outside this task's own scope to clean up, so a failure here doesn't
 # fail the target. See docs/README.md.
+#
+# gofmt is scoped to tracked *.go files (git ls-files), not a bare
+# "gofmt -l ." over the whole working tree — a plain "." walk also
+# reaches any local, un-added .go scratch file or (in principle) build
+# output, whose formatting has no bearing on what's actually committed;
+# scoping to git ls-files checks exactly what CI/reviewers actually see.
 lint:
 	$(GO) vet ./...
-	@test -z "$$(gofmt -l .)" || (echo "gofmt: the following files need formatting:" && gofmt -l . && exit 1)
+	@files="$$(git ls-files '*.go')"; \
+	out="$$(gofmt -l $$files)"; \
+	if [ -n "$$out" ]; then \
+		echo "gofmt: the following files need formatting:"; \
+		echo "$$out"; \
+		exit 1; \
+	fi
 	-$(PYTHON) -m mypy catalog codegen
 
 clean:
