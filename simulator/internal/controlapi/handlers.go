@@ -165,6 +165,16 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err)
 		return
 	}
+	// Fifth-review-round fix: called *after* ApplyCoordinated has already
+	// released LinkCoordinator, never while still holding it — see
+	// linkfault.Target.FenceHeartbeat's own doc comment for why (a slow
+	// connection's own transport write must never be able to freeze link
+	// operations for every other connection/protocol). This response
+	// (204) only completes once every heartbeat frame admitted before
+	// this call has actually been sent — the fencing guarantee Task 7
+	// item 2's heartbeat_pause needs.
+	s.cfg.IECServer.FenceHeartbeat()
+	s.cfg.ModbusServer.FenceHeartbeat()
 	writeNoContent(w)
 }
 
@@ -188,6 +198,10 @@ func (s *Server) handleLinkClear(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err)
 		return
 	}
+	// See handleLink's identical comment: fence outside LinkCoordinator's
+	// hold, after it has already been released by ApplyCoordinated.
+	s.cfg.IECServer.FenceHeartbeat()
+	s.cfg.ModbusServer.FenceHeartbeat()
 	writeNoContent(w)
 }
 
@@ -369,16 +383,7 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 // exactly what it was right after the simulator finished its own
 // startup initialization — atomically, at the application level, with
 // respect to physics ticks and every other mutating API/protocol action
-// (AGENT-TASK.md, Task 7 item 7). The whole sequence runs inside one
-// s.cfg.Gate.Exclusive() section (package appgate): every ordinary
-// mutation elsewhere (commands.Processor.Write, faults.Injector.Inject/
-// Clear, physics.Runner.Tick/TickOnce — every one of them takes the
-// gate's shared side) is blocked from starting until this function
-// returns, and this function can't start until every currently in-flight
-// one has finished. Reviewed gap this closes: the previous version ran
-// its six steps with no lock spanning all of them, so a write or a tick
-// could land between two steps and observe/produce neither the pre- nor
-// the post-reset state.
+// (AGENT-TASK.md, Task 7 item 7).
 //
 //  1. Stop the scenario runner and rewind its cursor, keeping its
 //     lifecycle (Load/Start/Stop/ResetPlayback) locked until this whole
@@ -395,8 +400,24 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 //     operation (store.Store.Restore).
 //  7. Clear every active link fault on both protocol servers, as one
 //     linkfault.Apply(..., ModeClear) call.
+//  8. Fence the heartbeat (fifth review round — see FenceHeartbeat's own
+//     doc comment), *after* releasing every lock steps 2-7 ran under:
+//     wait for every heartbeat frame admitted before step 7's clear to
+//     actually be sent, so this function's own 204 can't complete before
+//     that happens, without holding LinkCoordinator or Gate.Exclusive
+//     across a connection's own transport write to do it.
 //
-// LinkCoordinator is held for this whole function, not just step 7 —
+// Steps 1-7 (resetLocked) run inside one s.cfg.Gate.Exclusive() section
+// (package appgate): every ordinary mutation elsewhere (commands.
+// Processor.Write, faults.Injector.Inject/Clear, physics.Runner.Tick/
+// TickOnce — every one of them takes the gate's shared side) is blocked
+// from starting until resetLocked returns, and resetLocked can't start
+// until every currently in-flight one has finished. Reviewed gap this
+// closes: the previous version ran its six steps with no lock spanning
+// all of them, so a write or a tick could land between two steps and
+// observe/produce neither the pre- nor the post-reset state.
+//
+// LinkCoordinator is held for the whole of resetLocked, not just step 7 —
 // third-review-round fix: a heartbeat_pause request's own "read the live
 // heartbeat, then Apply" sequence (linkfault.ApplyCoordinated) needs to
 // be excluded from the *entire* window during which this function might
@@ -430,6 +451,34 @@ func (s *Server) doReset() error {
 	unlockScenario := s.cfg.ScenarioRunner.LockForReset()
 	defer unlockScenario()
 
+	if err := s.resetLocked(fc); err != nil {
+		return err
+	}
+	// Fifth-review-round fix: fencing runs *after* resetLocked has
+	// already released both LinkCoordinator and Gate.Exclusive (it
+	// returned, so its own defers already ran) — never while either is
+	// still held, for the identical reason handleLink/handleLinkClear
+	// fence only after ApplyCoordinated returns: waiting here can take as
+	// long as a connection's own slow transport write, and neither lock
+	// may be held across that. This still gives POST /reset the same
+	// cutoff guarantee a plain heartbeat_pause gets: the 204 response
+	// only completes once every heartbeat frame admitted before this
+	// reset's own clear (step 7 below) has actually been sent, so a
+	// client can never observe a stale, pre-reset heartbeat frame arrive
+	// after the reset was already reported complete.
+	s.cfg.IECServer.FenceHeartbeat()
+	s.cfg.ModbusServer.FenceHeartbeat()
+	return nil
+}
+
+// resetLocked is doReset's own locked section, split out so fencing
+// (above) can run after both locks below are released — see doReset's
+// own comment on why. Everything about the atomicity guarantee this used
+// to provide as part of doReset itself is unchanged: LinkCoordinator and
+// Gate.Exclusive are still both held for this whole sequence, in the
+// same order, for the same reasons described where doReset's own doc
+// comment used to carry this detail.
+func (s *Server) resetLocked(fc *clock.Fake) error {
 	s.cfg.LinkCoordinator.Lock()
 	defer s.cfg.LinkCoordinator.Unlock()
 

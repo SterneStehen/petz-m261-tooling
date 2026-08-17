@@ -223,8 +223,28 @@ func (r *Runner) Load(s *Scenario) error {
 // Processor/Injector internal state — expect:/link: steps aren't
 // value-checked here (expect never mutates; link's protocol/mode/
 // delay_ms enum-shape is already fully checked by Parse).
+//
+// Also validates, for every step in order, that the real-time chunk(s)
+// physics.Runner.PacedFastForwardLocked will actually pace through to
+// reach that step's at: — from the previous step's at: (or 0, for the
+// first step) to this one — are representable at this Runner's *real*
+// stepInterval and the scenario's declared clock.speed (fifth-review-round
+// fix: Parse itself only validates speed is finite/positive syntax now;
+// it can no longer catch a speed that's fine at a small real stepInterval
+// but would overflow/underflow at one, nor reject one that's fine at the
+// real stepInterval but would have overflowed only against an artificial
+// stand-in — see physics.ValidatePacing and parse.go's own doc comment on
+// why that check moved here). A rejection here, like every other
+// validateAll rejection, fails the whole Load before installing s at all
+// — the scenario's first step, even one at: 0s, never executes.
 func (r *Runner) validateAll(s *Scenario) error {
+	var prevAt time.Duration
 	for i, step := range s.Steps {
+		if err := physics.ValidatePacing(step.At-prevAt, r.stepInterval, s.Clock.Speed); err != nil {
+			return fmt.Errorf("scenario: step %d: at: %s: pacing from the previous step: %w", i, step.At, err)
+		}
+		prevAt = step.At
+
 		switch {
 		case step.Write != nil:
 			key := m261points.PointKey{Device: step.Write.Device, Slug: step.Write.Point}
@@ -572,5 +592,17 @@ func (r *Runner) applyLink(l *LinkAction) error {
 	// identical comment for the races this closes (protocol: both vs a
 	// concurrent reset/link operation, heartbeat_pause's capture vs a
 	// concurrent reset).
-	return linkfault.ApplyCoordinated(r.linkCoord, r.store, r.iecTarget, r.modbusTarget, linkfault.Protocol(l.Protocol), linkfault.Mode(l.Mode), delay)
+	if err := linkfault.ApplyCoordinated(r.linkCoord, r.store, r.iecTarget, r.modbusTarget, linkfault.Protocol(l.Protocol), linkfault.Mode(l.Mode), delay); err != nil {
+		return err
+	}
+	// Fifth-review-round fix: see controlapi.Server.handleLink's identical
+	// comment — called after ApplyCoordinated has already released
+	// r.linkCoord, never while still holding it. A scenario's own link:
+	// step must give the same heartbeat-fencing guarantee POST /link
+	// does: this step doesn't complete (the scenario doesn't advance to
+	// its next step) until every heartbeat frame admitted before it has
+	// actually been sent.
+	r.iecTarget.FenceHeartbeat()
+	r.modbusTarget.FenceHeartbeat()
+	return nil
 }

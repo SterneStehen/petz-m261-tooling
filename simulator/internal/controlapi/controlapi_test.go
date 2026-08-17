@@ -63,6 +63,7 @@ func (f *fakeLinkTarget) ClearLinkFaults() {
 	f.drop, f.hang, f.delay, f.hbValue, f.hbSet = false, false, 0, 0, false
 	f.cleared = true
 }
+func (f *fakeLinkTarget) FenceHeartbeat() {}
 
 // linkTargetState is fakeLinkTarget's field values without its mutex --
 // fakeLinkTarget itself must never be copied by value (go vet's copylocks

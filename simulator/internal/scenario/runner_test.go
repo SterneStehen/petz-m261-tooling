@@ -31,6 +31,7 @@ func (f *fakeLinkTarget) SetHang()                  { f.hang = true }
 func (f *fakeLinkTarget) SetDelay(d time.Duration)  { f.delay = d }
 func (f *fakeLinkTarget) SetHeartbeatPause(float64) {}
 func (f *fakeLinkTarget) ClearLinkFaults()          { *f = fakeLinkTarget{cleared: true} }
+func (f *fakeLinkTarget) FenceHeartbeat()           {}
 
 type harness struct {
 	store     *store.Store
@@ -450,6 +451,68 @@ steps:
 		if fast[k] != v {
 			t.Errorf("%v: speed=1 -> %v, speed=60 -> %v, want equal", k, v, fast[k])
 		}
+	}
+}
+
+// TestLoadRejectsScenarioThatWouldOverflowRealStepIntervalPacing is
+// blocker 1's required regression test (fifth review round): Parse itself
+// no longer checks clock.speed against anything but its own syntax
+// (finite, positive — see parse.go's own doc comment); the real
+// speed/stepInterval representability check now runs here, in Load,
+// against the Runner's *real* stepInterval and every real timing chunk
+// between scenario timestamps (physics.ValidatePacing). At
+// stepInterval=1s, the 500ms gap between these two steps is a single
+// 500ms remainder chunk — 500ms/1e9 underflows to a zero real-time pace,
+// which physics.CheckedPace rejects. Load must reject the whole scenario
+// for that, before its own at: 0s step — individually a perfectly legal
+// write — ever executes: verified here not just by Load's return value
+// but by the Store never observing the at: 0s write's effect.
+func TestLoadRejectsScenarioThatWouldOverflowRealStepIntervalPacing(t *testing.T) {
+	h := newHarnessWithSOCAndStep(t, 50, time.Second)
+	s := mustParse(t, `
+name: too-fast-for-real-stepinterval
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1000000000}
+steps:
+  - at: 0s
+    write: {device: EMS, point: set_operating_mode, value: 2}
+  - at: 500ms
+    write: {device: EMS, point: set_active_power_kw, value: -50}
+`)
+	if err := h.runner.Load(s); err == nil {
+		t.Fatal("Load with speed=1e9 at stepInterval=1s (500ms remainder chunk underflows) = nil, want an error")
+	}
+	if h.runner.Loaded() != nil {
+		t.Error("Loaded() != nil after a rejected Load, want nil (nothing installed)")
+	}
+	got, ok := h.store.Get(m261points.PointKey{Device: "EMS", Slug: "set_operating_mode"})
+	if !ok {
+		t.Fatal("set_operating_mode: not found in store")
+	}
+	if got != 0 {
+		t.Errorf("set_operating_mode = %v after a rejected Load, want 0 (unchanged, untouched) -- the at: 0s step must not have executed", got)
+	}
+}
+
+// TestLoadAcceptsValidPacingAtRealStepInterval is blocker 1's accept-side
+// counterpart: speed=1e-6 is representable at this Runner's real
+// stepInterval (1s: CheckedPace(1s, 1e-6) is a 1e15ns pace, well within
+// range) even though it would have overflowed the previous, now-removed
+// Parse-time 24h-surrogate check (CheckedPace(24h, 1e-6) overflows int64
+// nanoseconds) — see TestParseAcceptsExtremelySmallSpeedRegardlessOfRealStepInterval
+// in parse_test.go for the same speed accepted at the Parse layer. Load
+// must accept this scenario; it must not be rejected merely because a
+// stand-in duration Parse no longer even computes would have overflowed.
+func TestLoadAcceptsValidPacingAtRealStepInterval(t *testing.T) {
+	h := newHarnessWithSOCAndStep(t, 50, time.Second)
+	s := mustParse(t, `
+name: extremely-slow-but-valid
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 0.000001}
+steps:
+  - at: 3s
+    write: {device: EMS, point: set_operating_mode, value: 2}
+`)
+	if err := h.runner.Load(s); err != nil {
+		t.Fatalf("Load with speed=1e-6 at stepInterval=1s = %v, want accepted", err)
 	}
 }
 

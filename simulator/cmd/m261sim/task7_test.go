@@ -731,6 +731,76 @@ func TestFC06AndIECWriteToSameSetpointNeverLoseAnUpdate(t *testing.T) {
 	}
 }
 
+// TestNoDeadlockBetweenTickWriteAndResetUnderReversedLockOrder is a
+// broad concurrency smoke test for blocker 3's lock reordering (Gate.Op
+// -> writeMu -> Store lock, fifth review round), run against the *real*,
+// fully-wired objects (physics.Runner.TickOnce, commands.Processor.Write,
+// controlapi's real POST /reset over HTTP) rather than the bare lock
+// primitives commands.TestGateOpOuterWriteMuInnerOrderAvoidsTheThreeWay
+// Deadlock manually orchestrates. It is deliberately *not* relied on as
+// proof of deadlock-freedom by itself — measured directly, undelayed
+// concurrent load essentially never lands in the exact narrow three-way
+// window that test engineers on purpose (confirmed by hand: this test
+// still passed, every time, when the old writeMu-outer order was
+// temporarily restored), which is exactly why the review calls out
+// stress loops as insufficient proof and asks for a deterministic one —
+// commands.TestGateOpOuterWriteMuInnerOrderAvoidsTheThreeWayDeadlock is
+// that proof. What this test adds on top: confidence that the real
+// end-to-end objects, not just the bare locks, cooperate under load
+// without hanging or panicking. It fails fast (5s) instead of relying on
+// t's own much longer default panic-on-timeout to notice a hang.
+func TestNoDeadlockBetweenTickWriteAndResetUnderReversedLockOrder(t *testing.T) {
+	sim := newTask7Sim(t)
+	if err := sim.processor.Write(m261points.PointKey{Device: "EMS", Slug: "set_operating_mode"}, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	const iterations = 200
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			sim.physicsRunner.TickOnce(10 * time.Millisecond) //nolint:errcheck // a busy drive lock just means this tick is skipped -- not a failure here
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		key := m261points.PointKey{Device: "EMS", Slug: "set_active_power_kw"}
+		for i := 0; i < iterations; i++ {
+			sim.processor.Write(key, float64(i%10)) //nolint:errcheck // a rejected write is fine; a hang is the only failure this test checks for
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations/10; i++ {
+			resp, err := http.Post(sim.apiURL("/reset"), "application/json", nil)
+			if err != nil {
+				t.Errorf("POST /reset: %v", err)
+				return
+			}
+			resp.Body.Close()
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Tick/Write/POST-reset did not all finish within 5s (real time) -- likely deadlocked under the Gate.Op -> writeMu -> Store lock order")
+	}
+}
+
 // Test72HourNoGapsInHeartbeat is Task 7 item 8: the 72-hour continuous-
 // monitoring criterion runs on accelerated/fake time — this whole test
 // completes in a few real seconds — and proves no gaps in the *entire*
@@ -943,3 +1013,4 @@ func (*noopLinkTarget) SetHang()                  {}
 func (*noopLinkTarget) SetDelay(time.Duration)    {}
 func (*noopLinkTarget) SetHeartbeatPause(float64) {}
 func (*noopLinkTarget) ClearLinkFaults()          {}
+func (*noopLinkTarget) FenceHeartbeat()           {}

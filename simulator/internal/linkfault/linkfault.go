@@ -48,6 +48,26 @@ type Target interface {
 	// ClearLinkFaults immediately and deterministically removes every
 	// active mode set above — no timeout, no partial clear.
 	ClearLinkFaults()
+	// FenceHeartbeat blocks until every heartbeat frame this target had
+	// already admitted for outbound delivery *before* the most recent
+	// SetHeartbeatPause/ClearLinkFaults call has actually been handed to
+	// its transport — fifth review round: without this, a frame already
+	// resolved as "not paused, deliver value V" could still be sitting
+	// unsent when SetHeartbeatPause's own caller reports the pause as
+	// active, so a client could see V arrive *after* being told the
+	// heartbeat is now frozen. Every caller of Apply/ApplyCoordinated
+	// must call this on both targets after the call returns — never
+	// while still holding a Coordinator, since waiting here can take as
+	// long as one connection's own slow transport write, and a
+	// Coordinator held across that would let one slow/hung peer freeze
+	// link operations for every other connection and protocol (see
+	// iec104.Server.FenceHeartbeat's own doc comment for the concrete
+	// mechanism). Modbus has no outbound push to fence (heartbeat_pause
+	// is resolved fresh on every pull-based read — see modbustcp's own
+	// handleReadRegisters), so its implementation is a no-op; iec104's
+	// spontaneous-transmission loop is the one path that actually needs
+	// this.
+	FenceHeartbeat()
 }
 
 // Protocol is a link fault's target: one of the two protocol servers, or

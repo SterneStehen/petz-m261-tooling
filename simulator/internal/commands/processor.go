@@ -10,7 +10,7 @@
 //
 // A Processor sits in front of store.Store for every EMS setpoint write
 // (protocol servers call Write/Validate instead of the store directly) and
-// is polled once per physics tick (Runner calls ResolvePower) for the
+// is polled once per physics tick (Runner calls ResolveDispatch) for the
 // power Task 5's Engine.Step should actually be given — replacing the raw,
 // unarbitrated store read runner.go used before this package existed.
 package commands
@@ -64,34 +64,58 @@ type Processor struct {
 	// next value and commits it — a full-replace write (Write) or a
 	// partial, register-level read-modify-write (modbustcp's
 	// applyRegisterWrites, via LockWrites/UnlockWrites) — against every
-	// other one. Fourth-review-round fix: gate.Op is a *shared* lock, so
-	// wrapping applyRegisterWrites' whole read-modify-write-validate-
-	// commit transaction in gate.Op (third review round) excluded it from
-	// a concurrent Reset (which needs gate.Exclusive) but never from
-	// another concurrent writer also holding gate.Op — a second FC06/FC16
-	// request touching the same point, or an IEC-104 setpoint write to it,
-	// could still interleave with an in-flight read-modify-write and
-	// produce a classic lost update: the read-modify-write's own read
-	// happens before the other writer's commit, so its own commit (based
-	// on that now-stale read) silently discards the other writer's change
-	// when it lands after. Write acquiring writeMu itself, even though a
-	// full-replace write doesn't need read-then-write protection for its
-	// *own* sake, is what closes the window: it makes every writer
-	// participate in the same mutual-exclusion domain a read-modify-write
-	// needs to be safe, not just protect read-modify-writes from each
-	// other.
+	// other one, *and* against ResolvePower/ResolveDispatch's own read of
+	// the same state (fifth review round). Fourth-review-round fix:
+	// gate.Op is a *shared* lock, so wrapping applyRegisterWrites' whole
+	// read-modify-write-validate-commit transaction in gate.Op (third
+	// review round) excluded it from a concurrent Reset (which needs
+	// gate.Exclusive) but never from another concurrent writer also
+	// holding gate.Op — a second FC06/FC16 request touching the same
+	// point, or an IEC-104 setpoint write to it, could still interleave
+	// with an in-flight read-modify-write and produce a classic lost
+	// update. Write acquiring writeMu itself, even though a full-replace
+	// write doesn't need read-then-write protection for its *own* sake,
+	// is what closes that window: it makes every writer participate in
+	// the same mutual-exclusion domain a read-modify-write needs to be
+	// safe, not just protect read-modify-writes from each other.
+	//
+	// Fifth-review-round fix: this lock's position relative to gate.Op
+	// *inverted*. It used to be the outer lock (writeMu, then gate.Op),
+	// which is exactly backwards for a reader like ResolvePower — Tick
+	// already holds gate.Op (as the shared/Op side) for the whole tick
+	// before ResolvePower ever runs, so ResolvePower acquiring writeMu
+	// under that gate.Op hold, while every writer acquired writeMu
+	// *before* gate.Op, is the textbook AB-BA lock-order inversion: a
+	// concurrent Reset (gate.Exclusive) queued between the two blocks
+	// every *new* gate.Op acquisition (Go's sync.RWMutex gives a waiting
+	// writer priority over new readers) — so a writer already holding
+	// writeMu and now blocked acquiring gate.Op waits on Reset, Reset
+	// waits for Tick's already-held gate.Op to drain, and Tick (inside
+	// ResolvePower) waits on writeMu the blocked writer is holding — a
+	// genuine three-way deadlock, not a hypothetical one (reproduced by
+	// the reviewer). The fix is the order itself, not a workaround:
+	// gate.Op is now always acquired *first* (outer) by every caller —
+	// Write, applyRegisterWrites (via LockWrites), and Tick (before it
+	// ever calls ResolvePower) — and writeMu is always the *inner* lock,
+	// with the Store's own mutex innermost of all
+	// (Gate.Op -> writeMu -> Store lock, matching linkfault.Coordinator's
+	// own documented relationship to gate.Op). Reset keeps using
+	// gate.Exclusive only, unchanged: since nothing acquires gate.Op
+	// *after* already holding writeMu/the Store lock under the new order,
+	// Reset's drain-then-exclude wait can never be blocked by an inner
+	// lock that is itself waiting on Reset.
 	writeMu sync.Mutex
 }
 
 // LockWrites/UnlockWrites let a caller (modbustcp's FC06/FC16 handler)
 // hold the same write-serialization lock Write uses internally, for its
 // own multi-step read-modify-write-validate-commit transaction — see
-// writeMu's own doc comment for the lost-update race this closes. Must
-// be held for the *entire* transaction, from the first read-modify-write
-// seed read through the final WriteBatch commit, exactly like gate.Op
-// already is (third review round) — writeMu is the outer lock, gate.Op
-// the inner one, a fixed order every caller in this codebase follows
-// (mirroring linkfault.Coordinator's own relationship to gate.Op).
+// writeMu's own doc comment for the lost-update race this closes, and for
+// the fifth-review-round lock-order fix this must follow: the caller
+// must acquire gate.Op *first* (outer) and call LockWrites only after —
+// never the other way around — then hold writeMu for the *entire*
+// transaction, from the first read-modify-write seed read through the
+// final WriteBatch commit.
 func (p *Processor) LockWrites()   { p.writeMu.Lock() }
 func (p *Processor) UnlockWrites() { p.writeMu.Unlock() }
 
@@ -290,14 +314,29 @@ func (p *Processor) Write(key m261points.PointKey, value float64) error {
 		log.Printf("commands: rejected write %s/%s = %v: %v", key.Device, key.Slug, value, err)
 		return err
 	}
-	p.writeMu.Lock() // see writeMu's own doc comment — outer lock, ahead of gate.Op
-	defer p.writeMu.Unlock()
-	done := p.opDone()
+	done := p.opDone() // outer lock — see writeMu's own doc comment for the fifth-review-round order fix
 	defer done()
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	p.applySideEffects(key, value)
+	if testBeforeCommit != nil {
+		testBeforeCommit()
+	}
 	p.store.Set(key, value)
 	return nil
 }
+
+// testBeforeCommit, when non-nil, runs from within Write/WriteBatch right
+// after the write's side effects (watchdog bookkeeping, diagnostics) have
+// been applied but before the corresponding Store commit — the exact
+// seam a torn read (a concurrent ResolvePower observing the *new*
+// watchdog state paired with the *old* setpoint value, or vice versa)
+// would have to land in. Exists purely so package-internal tests can
+// force that seam open deterministically (a barrier, not scheduler
+// timing) and prove writeMu now excludes ResolvePower/ResolveDispatch
+// from it — see processor_internal_test.go. Always nil in production;
+// never set outside a test.
+var testBeforeCommit func()
 
 // KeyValue is one already-validated (key, value) pair for WriteBatch — a
 // type alias (not a new type) for store.KeyValue, so a caller building
@@ -333,14 +372,21 @@ type KeyValue = store.KeyValue
 // holder) can never observe only part of a multi-point batch applied.
 //
 // Fourth-review-round addition: the caller must *also* hold writeMu
-// (LockWrites/UnlockWrites) for that same entire transaction, ahead of
-// gate.Op — see writeMu's own doc comment for the lost-update race
-// (another concurrent writer to the same point, not just Reset) this
-// closes. WriteBatch itself still doesn't acquire either lock; it
-// assumes the caller already holds both, in that order.
+// (LockWrites/UnlockWrites) for that same entire transaction — see
+// writeMu's own doc comment for the lost-update race (another concurrent
+// writer to the same point, not just Reset) this closes. Fifth-review-
+// round fix: the caller must acquire gate.Op *before* LockWrites, not
+// after — writeMu is now the inner lock, gate.Op the outer one; see
+// writeMu's own doc comment for the deadlock the previous order (writeMu
+// outer) risked against Tick and Reset. WriteBatch itself still doesn't
+// acquire either lock; it assumes the caller already holds both, in that
+// order.
 func (p *Processor) WriteBatch(writes []KeyValue) {
 	for _, kv := range writes {
 		p.applySideEffects(kv.Key, kv.Value)
+	}
+	if testBeforeCommit != nil {
+		testBeforeCommit()
 	}
 	p.store.SetBatch(writes)
 }
@@ -368,11 +414,23 @@ func (p *Processor) applySideEffects(key m261points.PointKey, value float64) {
 	}
 }
 
-// ResolvePower is Task 6's dispatch decision, called once per physics tick
-// by physics.Runner in place of the raw store read it used before this
-// package existed. bmsMaxChargeKW/bmsMaxDischargeKW/socPercent are the
-// physics engine's own current-tick output (physics.State's
-// MaxChargeableKW/MaxDischargeableKW/SoCPercent); chargeProhibited/
+// ResolvePower is ResolveDispatch's convenience wrapper for every caller
+// that only cares about active/reactive power (every current caller
+// except physics.Runner.step itself, which needs the meter direction
+// too — see ResolveDispatch). Kept as a separate, narrower entry point
+// rather than changing its signature so that the many existing tests and
+// controlapi's own diagnostic use of it don't have to name a return value
+// they have no use for.
+func (p *Processor) ResolvePower(now time.Time, bmsMaxChargeKW, bmsMaxDischargeKW, socPercent float64, chargeProhibited, dischargeProhibited bool) (activeKW, reactiveKW float64) {
+	activeKW, reactiveKW, _ = p.ResolveDispatch(now, bmsMaxChargeKW, bmsMaxDischargeKW, socPercent, chargeProhibited, dischargeProhibited)
+	return activeKW, reactiveKW
+}
+
+// ResolveDispatch is Task 6's dispatch decision, called once per physics
+// tick by physics.Runner.step in place of the raw store read it used
+// before this package existed. bmsMaxChargeKW/bmsMaxDischargeKW/
+// socPercent are the physics engine's own current-tick output (physics.
+// State's MaxChargeableKW/MaxDischargeableKW/SoCPercent); chargeProhibited/
 // dischargeProhibited are physics.State's ChargeProhibited/
 // DischargeProhibited — the engine's own hard 0%/100% SoC boundary flags,
 // checked here explicitly and redundantly with the MaxChargeable/
@@ -380,25 +438,45 @@ func (p *Processor) applySideEffects(key m261points.PointKey, value float64) {
 // used elsewhere in this codebase (e.g. iec104's writePoint re-checking
 // EMS/ClassSetpoint even though address space already guarantees it).
 // Task 5's Engine.Step remains responsible for clipping to what's
-// physically possible right now; ResolvePower is responsible for
+// physically possible right now; ResolveDispatch is responsible for
 // everything upstream of that (mode arbitration, EMS-level limits,
-// watchdog, Power On/Off).
+// watchdog, Power On/Off, meter direction).
 //
-// Holds p.store.RLock() for its *entire* body — fourth-review-round fix:
-// this reads a dozen-plus separate setpoints (set_operating_mode, the
-// Remote-mode power pair, both SoC/power limits, and — in Auto Strategy
-// — up to ten Strategy Periods' worth of schedule fields) across several
-// of its own helper methods (resolvePriorityDriver, scheduleLookup,
+// meterDirectionInverted is Energy Storage Meter Power Direction
+// (physics.Runner.step used to read this separately, via its own
+// unlocked store.Store.Get call, *after* calling ResolvePower — fifth-
+// review-round fix: a single legal FC16 request changing both Set Active
+// Power and this point together could land in the gap between the two
+// reads, so one Tick could apply the *old* power together with the *new*
+// direction, or vice versa, a combination the client never actually
+// requested). Folding it into this same locked snapshot closes that: a
+// tick's power and direction are now read together, under the same
+// writeMu+Store.RLock hold, so they can only ever be the full pre-write
+// pair or the full post-write pair, never a mix.
+//
+// Holds p.writeMu, then p.store.RLock(), for its *entire* body — see
+// writeMu's own doc comment for the fifth-review-round lock-order fix
+// this depends on (gate.Op, held by the caller — Tick — before it ever
+// reaches here, is always the outer lock; writeMu is acquired only after
+// that, never before). Fourth-review-round fix (Store.RLock): this reads
+// a dozen-plus separate setpoints (set_operating_mode, the Remote-mode
+// power pair, both SoC/power limits, and — in Auto Strategy — up to ten
+// Strategy Periods' worth of schedule fields) across several of its own
+// helper methods (resolvePriorityDriver, scheduleLookup,
 // applyPowerLimits), each previously via its own independently-locked
 // store.Store.Get call. A concurrent multi-point Modbus batch commit
 // (store.Store.SetBatch) landing partway through used to be able to mix
 // pre- and post-batch setpoint values into one dispatch decision — e.g.
 // reading the *old* operating mode together with the *new* power
 // setpoint from the same just-committed batch, a combination the client
-// never actually requested. One RLock for the whole call closes that:
-// either this dispatch decision sees the batch fully applied, or not at
-// all, never a mix.
-func (p *Processor) ResolvePower(now time.Time, bmsMaxChargeKW, bmsMaxDischargeKW, socPercent float64, chargeProhibited, dischargeProhibited bool) (activeKW, reactiveKW float64) {
+// never actually requested. One RLock for the whole call closes that;
+// writeMu (fifth review round) additionally excludes a Write/WriteBatch
+// transaction's own watchdog/diagnostic side effects (applySideEffects,
+// applied *before* the Store commit — see Write) from being observed
+// half-done, paired with a setpoint value that doesn't match yet.
+func (p *Processor) ResolveDispatch(now time.Time, bmsMaxChargeKW, bmsMaxDischargeKW, socPercent float64, chargeProhibited, dischargeProhibited bool) (activeKW, reactiveKW float64, meterDirectionInverted bool) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	p.store.RLock()
 	defer p.store.RUnlock()
 
@@ -448,7 +526,15 @@ func (p *Processor) ResolvePower(now time.Time, bmsMaxChargeKW, bmsMaxDischargeK
 	if p.getInt("power_on_off") == 0 {
 		activeKW, reactiveKW = 0, 0
 	}
-	return activeKW, reactiveKW
+
+	// Energy Storage Meter Power Direction (§4.4/Task 5 item 7): read
+	// every call, not just once at startup, since it's a live setpoint a
+	// client can change at any time — folded into this same locked
+	// snapshot, not a separate later read, per this function's own doc
+	// comment.
+	meterDirectionInverted = p.get("energy_storage_meter_power_direction") != 0
+
+	return activeKW, reactiveKW, meterDirectionInverted
 }
 
 // resolvePriorityDriver implements Task 6 item 6: which of Remote, Demand

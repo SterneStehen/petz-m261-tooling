@@ -246,6 +246,30 @@ steps:
 	}
 }
 
+// TestParseAcceptsExtremelySmallSpeedRegardlessOfRealStepInterval is
+// blocker 1's Parse-level regression test (fifth review round): Parse no
+// longer checks clock.speed against anything but its own syntax (finite,
+// positive) — the real speed/stepInterval representability check now
+// lives in scenario.Runner.Load (physics.ValidatePacing), against the
+// Runner's real stepInterval, not an artificial 24h stand-in Parse used
+// to check against. This speed would have overflowed that old surrogate
+// (CheckedPace(24*time.Hour, 1e-6) overflows int64 nanoseconds) even
+// though it's perfectly representable at any real, much smaller
+// stepInterval (see TestLoadAcceptsValidPacingAtRealStepInterval in
+// runner_test.go, at stepInterval=1s) — Parse alone must accept it.
+func TestParseAcceptsExtremelySmallSpeedRegardlessOfRealStepInterval(t *testing.T) {
+	_, err := scenario.Parse([]byte(`
+name: x
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 0.000001}
+steps:
+  - at: 0s
+    write: {device: EMS, point: set_operating_mode, value: 2}
+`))
+	if err != nil {
+		t.Errorf("Parse with speed=1e-6 = %v, want accepted (Parse only checks syntax now)", err)
+	}
+}
+
 func TestParseAcceptsLinkClear(t *testing.T) {
 	s, err := scenario.Parse([]byte(`
 name: x

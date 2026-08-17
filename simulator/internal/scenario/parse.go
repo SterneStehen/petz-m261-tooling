@@ -11,7 +11,6 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
-	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/physics"
 )
 
 // ErrMalformed is Parse's sentinel for every load-time rejection —
@@ -119,22 +118,24 @@ func Parse(data []byte) (*Scenario, error) {
 	if raw.Clock.Speed <= 0 {
 		return nil, fmt.Errorf("%w: clock.speed must be positive, got %v", ErrMalformed, raw.Clock.Speed)
 	}
-	// A finite, positive speed can still make stepInterval/speed overflow
-	// a time.Duration at run time — an extreme value like 1e-300 turns
-	// even a 1s step into an implementation-defined ~1ns real interval
-	// instead of "almost stopped" (third review round, reproduced against
-	// the live simulator; see physics.CheckedPace). This scenario's own
-	// stepInterval isn't known yet at Parse time (it's a Runner
-	// construction parameter, not a scenario field), so this checks
-	// against a generously large stand-in (24h) that would never
-	// legitimately appear as a real stepInterval — anything that
-	// overflows even that bound is rejected now, at load time, rather
-	// than discovered mid-run; physics.Runner.PacedFastForwardLocked
-	// performs the authoritative check against the real stepInterval
-	// every time this scenario actually ticks.
-	if _, err := physics.CheckedPace(24*time.Hour, raw.Clock.Speed); err != nil {
-		return nil, fmt.Errorf("%w: clock.speed %v: %v", ErrMalformed, raw.Clock.Speed, err)
-	}
+	// Deliberately no CheckedPace check against speed here (fifth review
+	// round finding) — Parse only validates *syntax*: clock.speed is
+	// finite and positive. Whether speed/stepInterval actually produces a
+	// representable real-time pace depends on the *real* stepInterval
+	// (a scenario.Runner construction parameter, not a scenario field,
+	// so not known at Parse time) and the real per-step timing chunks
+	// this scenario will actually pace through — checking that here
+	// against an artificial stand-in duration (this package used to check
+	// against a generously large 24h surrogate) is neither necessary
+	// (Runner.Load now performs the authoritative check against the real
+	// stepInterval and every real chunk before installing anything — see
+	// physics.ValidatePacing) nor sufficient: a surrogate larger than
+	// every real chunk can reject a speed that would have been fine at
+	// the real, smaller stepInterval (reproduced: stepInterval=1s,
+	// speed=1e-6 is perfectly representable — CheckedPace(1s, 1e-6)
+	// succeeds — but CheckedPace(24h, 1e-6) overflows int64 nanoseconds
+	// and used to reject this valid scenario at Parse time for a reason
+	// that never actually applied to how it would run).
 	if len(raw.Steps) == 0 {
 		return nil, fmt.Errorf("%w: steps is empty", ErrMalformed)
 	}

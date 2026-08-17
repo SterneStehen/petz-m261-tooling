@@ -163,16 +163,21 @@ func (r *Runner) Tick() {
 // writeState below via NewRunner's construction-time call pattern).
 func (r *Runner) step(dt time.Duration) {
 	state := r.engine.State() // this tick's starting BMS headroom/SoC, before Step
-	activePower, reactivePower := r.commands.ResolvePower(
+	activePower, reactivePower, meterDirectionInverted := r.commands.ResolveDispatch(
 		r.clock.Now(), state.MaxChargeableKW, state.MaxDischargeableKW, state.SoCPercent,
 		state.ChargeProhibited, state.DischargeProhibited,
 	)
-
-	// Energy Storage Meter Power Direction (§4.4/Task 5 item 7): read every
-	// step, not just once at startup, since it's a live setpoint a client
-	// can change at any time.
-	direction, _ := r.store.Get(m261points.PointKey{Device: "EMS", Slug: "energy_storage_meter_power_direction"})
-	r.engine.SetMeterDirectionInverted(direction != 0)
+	// Fifth-review-round fix: Energy Storage Meter Power Direction (§4.4/
+	// Task 5 item 7) used to be read here, separately, via its own
+	// unlocked store.Store.Get call *after* ResolvePower already
+	// returned — a single legal FC16 request changing both Set Active
+	// Power and this point together could land in the gap between the
+	// two reads, so this tick could apply the *old* power together with
+	// the *new* direction (or vice versa), a combination the client never
+	// actually requested. ResolveDispatch now reads both together, under
+	// one lock, as part of the same tick snapshot — see its own doc
+	// comment.
+	r.engine.SetMeterDirectionInverted(meterDirectionInverted)
 
 	r.engine.Step(dt, activePower, reactivePower)
 	r.writeState()
@@ -361,6 +366,54 @@ func CheckedPace(d time.Duration, speed float64) (time.Duration, error) {
 		return 0, fmt.Errorf("physics: %s / %v underflows to a non-positive duration -- speed is too large relative to this interval for a meaningful real-time pace", d, speed)
 	}
 	return pace, nil
+}
+
+// ValidatePacing reports whether every real-time pace fastForwardLocked
+// would ever need to compute while advancing total in stepInterval-sized
+// chunks (the exact chunking FastForward/PacedFastForward/
+// PacedFastForwardLocked themselves use — see fastForwardLocked's own
+// next/remaining loop) is representable, without advancing, sleeping, or
+// touching any clock at all. Fifth-review-round addition: scenario.Runner.
+// Load calls this against the *real* stepInterval it will actually pace
+// with and every real timing chunk between two scenario timestamps,
+// before installing the scenario — so a speed that would later fail
+// CheckedPace mid-run (previously only discoverable once
+// PacedFastForwardLocked itself reached the offending chunk, partway
+// through an already-running scenario) is rejected up front instead.
+//
+// total <= 0 is a no-op (nil) — matches fastForwardLocked's own "already
+// at or past this deadline, nothing to tick" early return; a scenario
+// step whose at: repeats the previous one, or falls exactly on the
+// current clock position, contributes no chunk to check. stepInterval
+// must be positive, matching fastForwardLocked's own requirement.
+//
+// Every "next" value fastForwardLocked's loop can ever produce for a
+// given (total, stepInterval) pair is one of exactly two distinct
+// durations: stepInterval itself, repeated as many whole times as fit in
+// total, and — only if total isn't an exact multiple of stepInterval — one
+// final, strictly smaller remainder (total mod stepInterval) for the last
+// partial chunk. Checking those two values once each, rather than
+// replaying fastForwardLocked's whole loop (which could mean millions of
+// iterations for a long scenario at a fine stepInterval), covers the
+// identical set of pace computations the real run will ever make.
+func ValidatePacing(total, stepInterval time.Duration, speed float64) error {
+	if total <= 0 {
+		return nil
+	}
+	if stepInterval <= 0 {
+		return fmt.Errorf("physics: ValidatePacing stepInterval must be positive, got %s", stepInterval)
+	}
+	if total >= stepInterval {
+		if _, err := CheckedPace(stepInterval, speed); err != nil {
+			return fmt.Errorf("physics: stepInterval chunk %s: %w", stepInterval, err)
+		}
+	}
+	if remainder := total % stepInterval; remainder > 0 {
+		if _, err := CheckedPace(remainder, speed); err != nil {
+			return fmt.Errorf("physics: final remainder chunk %s: %w", remainder, err)
+		}
+	}
+	return nil
 }
 
 // Rebase sets the dt baseline for the next Tick to now, without touching

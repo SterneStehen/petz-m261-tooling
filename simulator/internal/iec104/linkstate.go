@@ -72,15 +72,29 @@ func (s *Server) SetDelay(d time.Duration) {
 	s.link.mu.Unlock()
 }
 
-// SetHeartbeatPause implements linkfault.Target.
+// SetHeartbeatPause implements linkfault.Target. Fifth-review-round
+// fix: also bumps the heartbeat fencing generation (bumpHeartbeatGeneration,
+// heartbeat.go) — every connection's outbound heartbeat queue gets a
+// fresh barrier right after this state change, so a caller that follows
+// this call with FenceHeartbeat (every caller must — see linkfault.
+// Target's own doc comment) is guaranteed that no heartbeat frame
+// admitted before this pause is still unsent by the time FenceHeartbeat
+// returns. Safe to call without linkCoord held (bumpHeartbeatGeneration
+// itself only takes connMu), but every real caller reaches this from
+// within Apply/ApplyCoordinated's own coord.Lock hold in practice.
 func (s *Server) SetHeartbeatPause(frozenValue float64) {
 	s.link.mu.Lock()
 	s.link.hbFrozen = true
 	s.link.hbValue = frozenValue
 	s.link.mu.Unlock()
+	s.bumpHeartbeatGeneration()
 }
 
-// ClearLinkFaults implements linkfault.Target.
+// ClearLinkFaults implements linkfault.Target — see SetHeartbeatPause's
+// own doc comment for the fifth-review-round fencing bump this also
+// performs (relevant here too: POST /reset's own clear must be able to
+// fence out any heartbeat frame admitted just before the reset, exactly
+// like a plain heartbeat_pause activation).
 func (s *Server) ClearLinkFaults() {
 	s.link.mu.Lock()
 	s.link.drop = false
@@ -89,4 +103,5 @@ func (s *Server) ClearLinkFaults() {
 	s.link.hbFrozen = false
 	s.link.hbValue = 0
 	s.link.mu.Unlock()
+	s.bumpHeartbeatGeneration()
 }

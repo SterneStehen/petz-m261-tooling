@@ -246,21 +246,27 @@ func (s *Server) handleWriteMultipleRegisters(unitID byte, pdu []byte) []byte {
 // Reset (the reviewer's explicit warning).
 //
 // Also holds commands.Processor.LockWrites/UnlockWrites for the same
-// whole transaction, *outside* (before) gate.Op — fourth-review-round
-// fix: gate.Op alone only excludes a concurrent Reset, not another
-// concurrent writer (another FC06/FC16 request, or an IEC-104 setpoint
-// write) also holding gate.Op at the same time — see writeMu's own doc
-// comment in package commands for the lost-update race this closes.
-// Nil-guarded (s.cfg.Commands can be nil in tests that predate Task 6
-// and write straight to the store, same as every other s.cfg.Commands
-// check in this file).
+// whole transaction — fourth-review-round fix: gate.Op alone only
+// excludes a concurrent Reset, not another concurrent writer (another
+// FC06/FC16 request, or an IEC-104 setpoint write) also holding gate.Op
+// at the same time — see writeMu's own doc comment in package commands
+// for the lost-update race this closes. Fifth-review-round fix: gate.Op
+// is acquired *first* (outer), LockWrites second (inner) — the previous
+// order (LockWrites, then gate.Op) is exactly the AB-BA inversion
+// writeMu's own doc comment describes: physics.Runner.Tick already holds
+// gate.Op for the whole tick before commands.Processor.ResolveDispatch
+// (which now also needs writeMu) ever runs, so a writer taking writeMu
+// before gate.Op could deadlock against a queued Reset the same way. Nil
+// -guarded (s.cfg.Commands can be nil in tests that predate Task 6 and
+// write straight to the store, same as every other s.cfg.Commands check
+// in this file).
 func (s *Server) applyRegisterWrites(unit int, start uint16, regs [][]byte) byte {
+	done := s.opDone()
+	defer done()
 	if s.cfg.Commands != nil {
 		s.cfg.Commands.LockWrites()
 		defer s.cfg.Commands.UnlockWrites()
 	}
-	done := s.opDone()
-	defer done()
 
 	touched := make(map[m261points.PointKey][]byte)
 	order := make([]m261points.PointKey, 0, len(regs)/2+1)

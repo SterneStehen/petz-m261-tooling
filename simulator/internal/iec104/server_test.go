@@ -5,6 +5,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -618,7 +619,13 @@ func TestIEC104LinkHeartbeatPauseSuppressesSpontaneousTransmission(t *testing.T)
 // guaranteeing both already-queued Changes are only actually processed
 // after the clear. Every spontaneous heartbeat value the client receives
 // afterward must equal the final live value (20) — never the first
-// queued Change's stale payload (10).
+// queued Change's stale payload (10) — and, fifth-review-round addition
+// (admitHeartbeat's duplicate suppression, heartbeat.go): the two queued
+// Changes, once both processed after the clear and both resolving to the
+// identical live value 20, must produce at most *one* spontaneous frame,
+// not two — "paused-era events are still emitted as duplicates after
+// clear" was the review's own wording for exactly this residual gap in
+// round four's fix (which only corrected the *value*, not the count).
 func TestSpontaneousLoopNeverReplaysStaleHeartbeatAfterClear(t *testing.T) {
 	st := store.New()
 	heartbeatKey := m261points.PointKey{Device: "EMS", Slug: "ems_periodic_heartbeat_indicator"}
@@ -641,6 +648,7 @@ func TestSpontaneousLoopNeverReplaysStaleHeartbeatAfterClear(t *testing.T) {
 	coord.Unlock()
 
 	var sawStale bool
+	var heartbeatFrames int
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		c.nc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
@@ -655,11 +663,166 @@ func TestSpontaneousLoopNeverReplaysStaleHeartbeatAfterClear(t *testing.T) {
 		if ioa != heartbeatIOA {
 			continue
 		}
+		heartbeatFrames++
 		if decodeFloat32(asdu[9:13]) == 10 {
 			sawStale = true
 		}
 	}
 	if sawStale {
 		t.Error("received a spontaneous heartbeat update for the stale, paused-era value 10 after a concurrent clear -- a replay of a reading that should have stayed permanently invisible")
+	}
+	if heartbeatFrames > 1 {
+		t.Errorf("received %d spontaneous heartbeat frames after the clear, want at most 1 -- two paused-era Changes resolving to the same live value must not each produce their own duplicate frame", heartbeatFrames)
+	}
+}
+
+// TestFenceHeartbeatWaitsForAnAlreadyAdmittedFrameBeforePauseCompletes is
+// blocker 2's second required deterministic test (fifth review round):
+// "block the outbound send path after it has read 'not paused'; activate
+// pause; release the send path; assert no old heartbeat frame is
+// delivered [after the pause is reported complete]." Round four's own
+// fix (re-resolving "paused?" right before building the ASDU) narrowed
+// the window between that check and the actual socket write, but never
+// closed it: SetHeartbeatPause's own caller could still report the pause
+// active while an already-admitted, pre-pause frame was still sitting
+// unsent. This uses testBeforeHeartbeatSend to hold that exact seam open
+// — a real frame has been admitted (resolved as "not paused", value 42)
+// and dequeued by hbLoop, but not yet handed to sendIfStarted — then
+// activates pause and asserts FenceHeartbeat (every real caller's
+// required post-Apply step) does not return until that frame has
+// actually been sent, never before.
+func TestFenceHeartbeatWaitsForAnAlreadyAdmittedFrameBeforePauseCompletes(t *testing.T) {
+	st := store.New()
+	srv, addr := startServer(t, st)
+	coord := linkfault.NewCoordinator()
+	srv.SetLinkCoordinator(coord)
+	c := dialRaw(t, addr)
+	c.startDT()
+	time.Sleep(20 * time.Millisecond) // let STARTDT_CON settle before relying on "started"
+
+	blockedInSend := make(chan struct{})
+	releaseSend := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseSend) })
+	// Unconditionally released on return, even via t.Fatal (which exits
+	// this goroutine via runtime.Goexit without running the rest of this
+	// function's own body) -- otherwise a failing assertion below would
+	// leave hbLoop permanently parked inside the hook, and t.Cleanup's
+	// srv.Close (which waits for every server goroutine, hbLoop included)
+	// would hang for the rest of the test binary's own timeout instead of
+	// this test failing fast and cleanly.
+	defer release()
+	testBeforeHeartbeatSend = func() {
+		close(blockedInSend)
+		<-releaseSend
+	}
+	defer func() { testBeforeHeartbeatSend = nil }()
+
+	st.Set(linkfault.HeartbeatKey, 42) // admitted while not paused -- queued, then parked at the hook
+	<-blockedInSend                    // hbLoop has dequeued it and is about to call sendIfStarted
+
+	srv.SetHeartbeatPause(999) // activates pause while the admitted frame is still unsent
+
+	fenceDone := make(chan struct{})
+	go func() {
+		defer close(fenceDone)
+		srv.FenceHeartbeat()
+	}()
+
+	select {
+	case <-fenceDone:
+		t.Fatal("FenceHeartbeat returned before the already-admitted heartbeat frame (value 42) was actually sent -- the pause must not be reported complete while an earlier frame is still in flight")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: FenceHeartbeat is still blocked on the barrier's ack.
+	}
+
+	release() // let hbLoop actually send the frame and reach the barrier behind it
+
+	select {
+	case <-fenceDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("FenceHeartbeat did not return within 2s after releasing the blocked send -- deadlocked, or lost the barrier ack")
+	}
+
+	c.nc.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	asdu, isIFrame, more := c.tryNextI()
+	if !more || !isIFrame || asdu[0] != typeMMENC1 {
+		t.Fatalf("expected a spontaneous heartbeat I-frame once the send was released, got isIFrame=%v more=%v", isIFrame, more)
+	}
+	ioa := int(asdu[6]) | int(asdu[7])<<8 | int(asdu[8])<<16
+	if ioa != heartbeatIOA {
+		t.Fatalf("IOA = %d, want the heartbeat point's IOA %d", ioa, heartbeatIOA)
+	}
+	if got := decodeFloat32(asdu[9:13]); got != 42 {
+		t.Errorf("delivered heartbeat value = %v, want 42 (the pre-pause admitted value) -- it must be sent, not silently discarded, just strictly before the fence returns", got)
+	}
+}
+
+// TestFenceHeartbeatWaitsForAnAlreadyAdmittedFrameBeforeClearCompletes is
+// blocker 2's third required deterministic test — "repeat the cutoff
+// guarantee for POST /reset" — applied to ClearLinkFaults, the exact
+// call controlapi.Server.doReset makes (via linkfault.Apply) as its own
+// step 7, immediately before calling FenceHeartbeat (doReset's step 8).
+// ClearLinkFaults calls the identical bumpHeartbeatGeneration fencing
+// step SetHeartbeatPause does (see linkstate.go), so this is the same
+// scenario as TestFenceHeartbeatWaitsForAnAlreadyAdmittedFrameBefore
+// PauseCompletes with the pause/clear roles matched to what a real reset
+// actually calls, proving reset gets the identical cutoff guarantee
+// rather than a merely-assumed-identical one.
+func TestFenceHeartbeatWaitsForAnAlreadyAdmittedFrameBeforeClearCompletes(t *testing.T) {
+	st := store.New()
+	srv, addr := startServer(t, st)
+	coord := linkfault.NewCoordinator()
+	srv.SetLinkCoordinator(coord)
+	c := dialRaw(t, addr)
+	c.startDT()
+	time.Sleep(20 * time.Millisecond) // let STARTDT_CON settle before relying on "started"
+
+	blockedInSend := make(chan struct{})
+	releaseSend := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseSend) })
+	defer release() // see the pause variant's identical comment on why this must be unconditional
+	testBeforeHeartbeatSend = func() {
+		close(blockedInSend)
+		<-releaseSend
+	}
+	defer func() { testBeforeHeartbeatSend = nil }()
+
+	st.Set(linkfault.HeartbeatKey, 77) // admitted while not paused -- queued, then parked at the hook
+	<-blockedInSend                    // hbLoop has dequeued it and is about to call sendIfStarted
+
+	srv.ClearLinkFaults() // mirrors doReset's own step 7 -- a reset with nothing active to clear is still a real, bump-worthy call
+
+	fenceDone := make(chan struct{})
+	go func() {
+		defer close(fenceDone)
+		srv.FenceHeartbeat() // mirrors doReset's own step 8
+	}()
+
+	select {
+	case <-fenceDone:
+		t.Fatal("FenceHeartbeat returned before the already-admitted heartbeat frame (value 77) was actually sent -- a reset must not be reported complete while an earlier frame is still in flight")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: FenceHeartbeat is still blocked on the barrier's ack.
+	}
+
+	release() // let hbLoop actually send the frame and reach the barrier behind it
+
+	select {
+	case <-fenceDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("FenceHeartbeat did not return within 2s after releasing the blocked send -- deadlocked, or lost the barrier ack")
+	}
+
+	c.nc.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	asdu, isIFrame, more := c.tryNextI()
+	if !more || !isIFrame || asdu[0] != typeMMENC1 {
+		t.Fatalf("expected a spontaneous heartbeat I-frame once the send was released, got isIFrame=%v more=%v", isIFrame, more)
+	}
+	ioa := int(asdu[6]) | int(asdu[7])<<8 | int(asdu[8])<<16
+	if ioa != heartbeatIOA {
+		t.Fatalf("IOA = %d, want the heartbeat point's IOA %d", ioa, heartbeatIOA)
+	}
+	if got := decodeFloat32(asdu[9:13]); got != 77 {
+		t.Errorf("delivered heartbeat value = %v, want 77 (the pre-reset admitted value) -- it must be sent, not silently discarded, just strictly before the fence returns", got)
 	}
 }

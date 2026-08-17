@@ -48,6 +48,17 @@ type Server struct {
 
 	gate      *appgate.Gate          // see SetGate
 	linkCoord *linkfault.Coordinator // see SetLinkCoordinator
+
+	// fenceMu/pendingFenceAcks back FenceHeartbeat — see heartbeat.go.
+	fenceMu          sync.Mutex
+	pendingFenceAcks []chan struct{}
+
+	// lastHeartbeatAdmitted/haveLastHeartbeatAdmitted back admitHeartbeat's
+	// own duplicate suppression — guarded by linkCoord (every access is
+	// from within admitHeartbeat, which already holds it for its whole
+	// body), not a separate mutex. See heartbeat.go.
+	lastHeartbeatAdmitted     float64
+	haveLastHeartbeatAdmitted bool
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -128,7 +139,7 @@ func (s *Server) acceptLoop() {
 		// connMu, the same lock SetDrop's own close-loop takes — see
 		// modbustcp's identical fix (simulator/internal/modbustcp/
 		// server.go, acceptLoop) for the TOCTOU window this closes.
-		c := &clientConn{srv: s, nc: nc}
+		c := &clientConn{srv: s, nc: nc, hbQueue: make(chan hbMsg, heartbeatQueueSize)}
 		s.connMu.Lock()
 		if s.link.dropped() {
 			s.connMu.Unlock()
@@ -137,8 +148,9 @@ func (s *Server) acceptLoop() {
 		}
 		s.conns[c] = struct{}{}
 		s.connMu.Unlock()
-		s.wg.Add(1)
+		s.wg.Add(2)
 		go s.handleConn(c)
+		go c.hbLoop()
 	}
 }
 
@@ -153,39 +165,21 @@ func (s *Server) spontaneousLoop(changes <-chan store.Change) {
 		if !ok {
 			continue
 		}
-		value := c.Value
 		if c.Key == linkfault.HeartbeatKey {
-			// Task 7 item 2's heartbeat_pause: this protocol's clients
-			// stop seeing the counter move, even though it keeps
-			// incrementing (and publishing Changes) underneath in the
-			// Store — general interrogation (handleGeneralInterrogation)
-			// is the one place a client sees it again, still frozen,
-			// until cleared.
-			//
-			// Re-resolves the *current* effective value under linkCoord,
-			// rather than trusting this Change's own c.Value — fourth-
-			// review-round fix: store.Store.Subscribe's channel is
-			// buffered and best-effort (its own doc comment), so this
-			// loop can easily still be draining Changes generated *while*
-			// paused after a concurrent clear has already landed; using
-			// the stale c.Value in that window would replay an old,
-			// possibly out-of-order intermediate heartbeat reading to the
-			// client right after a clear, instead of accurately
-			// reflecting the live value clear is supposed to restore.
-			// Checking "paused" fresh, right here, and substituting the
-			// live Store value (not c.Value) when not paused makes every
-			// broadcast for this point correct *at the moment it's sent*,
-			// regardless of how stale the Change that triggered it was.
-			s.linkCoord.Lock()
-			_, paused := s.link.heartbeatOverride()
-			live, _ := s.store.Get(linkfault.HeartbeatKey)
-			s.linkCoord.Unlock()
-			if paused {
-				continue
-			}
-			value = live
+			// Task 7 item 2's heartbeat_pause / fifth-review-round fix:
+			// heartbeat frames go through the admit-then-fence pipeline
+			// in heartbeat.go instead of straight to broadcast — see its
+			// own doc comment for why re-resolving "paused?" fresh, right
+			// before admission (this package's fourth-review-round fix),
+			// was still not enough on its own: a frame already resolved
+			// as "not paused, deliver value V" could still be sitting
+			// unsent in the gap before broadcast's own socket write,
+			// letting SetHeartbeatPause's caller report the pause active
+			// before V actually went out.
+			s.admitHeartbeat()
+			continue
 		}
-		asdu := monitoredASDU(meta, value, cotSpontaneous)
+		asdu := monitoredASDU(meta, c.Value, cotSpontaneous)
 		if asdu == nil {
 			continue // setpoints (WO) aren't monitored/reported spontaneously
 		}
@@ -222,6 +216,11 @@ type clientConn struct {
 	writeMu sync.Mutex
 	sendSeq uint16
 	recvSeq uint16
+
+	// hbQueue is this connection's own outbound heartbeat pipeline — see
+	// heartbeat.go. Created once, in acceptLoop, and closed exactly once,
+	// in handleConn's cleanup (both under connMu — see that comment).
+	hbQueue chan hbMsg
 	// started is read by sendIfStarted and written by startDataTransfer/
 	// stopDataTransfer — atomic. It used to be checked and written
 	// independently of writeMu, which -race caught as a plain data race;
@@ -325,8 +324,15 @@ func (c *clientConn) stopDataTransfer() error {
 func (s *Server) handleConn(c *clientConn) {
 	defer s.wg.Done()
 	defer func() {
+		// delete and close(c.hbQueue) happen under the *same* connMu
+		// critical section deliberately — see bumpHeartbeatGeneration's
+		// own doc comment (heartbeat.go): it also snapshots s.conns and
+		// sends into each hbQueue under connMu, and never after, so
+		// closing here is guaranteed to never race a send into an
+		// already-closed channel.
 		s.connMu.Lock()
 		delete(s.conns, c)
+		close(c.hbQueue)
 		s.connMu.Unlock()
 		c.nc.Close()
 	}()

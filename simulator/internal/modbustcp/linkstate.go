@@ -109,3 +109,14 @@ func (s *Server) ClearLinkFaults() {
 	s.link.hbValue = 0
 	s.link.mu.Unlock()
 }
+
+// FenceHeartbeat implements linkfault.Target as a no-op — Modbus has no
+// outbound push to fence in the first place: every FC03/FC04 response
+// resolves heartbeatOverride fresh, at the moment of that specific
+// request (see handleReadRegisters), so there is never an
+// already-admitted-but-not-yet-sent frame that a concurrent
+// SetHeartbeatPause/ClearLinkFaults could race against. See
+// linkfault.Target's own doc comment for why iec104.Server, the one
+// protocol with a background spontaneous-transmission push, needs a real
+// implementation instead.
+func (s *Server) FenceHeartbeat() {}
