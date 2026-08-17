@@ -1,0 +1,25 @@
+services:
+  m261sim:
+    build: .
+    ports:
+      - "502:502"
+      - "2404:2404"
+      - "8081:8081"
+    # The control API's own default bind (127.0.0.1:8081, loopback-only —
+    # see docs/README.md) would be unreachable from the host even with the
+    # port mapping above, since it's inside the container's own network
+    # namespace: Docker's port forwarding doesn't arrive as a literal
+    # loopback connection. -control-addr overrides just the bind address,
+    # the documented escape hatch for exactly this (AGENT-TASK §1.3: no
+    # hardcoded non-127.0.0.1 addresses in the *code* — this is a runtime
+    # flag, not a code change). Modbus/IEC-104 already bind every
+    # interface by default and need no override.
+    command:
+      - -config=simulator/config/m261sim.yaml
+      - -scenarios-dir=scenarios
+      - -control-addr=0.0.0.0:8081
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "2404"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

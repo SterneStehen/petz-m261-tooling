@@ -11,9 +11,15 @@ from pathlib import Path
 import pytest
 
 from catalog.build_catalog import ANCHORS, DANGEROUS_NAMES, build_catalog, build_points, check_anchors
+from tests.conftest import requires_registermap
 
 REGISTERMAP = Path(__file__).resolve().parent.parent / "m261-registermap"
 OVERRIDES = Path(__file__).resolve().parent.parent / "catalog" / "overrides.yaml"
+
+# Every test in this module needs the real files (see the module
+# docstring) -- see tests/conftest.py for why this must be a skip, not an
+# unconditional failure, when they aren't present.
+pytestmark = requires_registermap
 
 # AGENT-TASK §3.1
 EXPECTED_COUNTS = {

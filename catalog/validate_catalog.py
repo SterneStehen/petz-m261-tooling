@@ -29,6 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CATALOG = REPO_ROOT / "catalog" / "point_catalog.json"
 DEFAULT_REGISTERMAP = REPO_ROOT / "m261-registermap"
 DEFAULT_OUT = REPO_ROOT / "catalog" / "validation_report.md"
+DEFAULT_QUESTIONS_OUT = REPO_ROOT / "docs" / "open-questions.md"
 
 CRITICAL = "critical"
 WARNING = "warning"
@@ -608,7 +609,7 @@ def render_report(results: list[CheckResult], catalog_path: Path) -> str:
         "Warnings above)."
     )
     lines.append("")
-    questions = [r for r in warnings if r.manufacturer_question and (r.details or r.note)]
+    questions = manufacturer_questions(results)
     if not questions:
         lines.append("None — no warning raised anything actionable.")
     else:
@@ -619,23 +620,77 @@ def render_report(results: list[CheckResult], catalog_path: Path) -> str:
     return "\n".join(lines)
 
 
+def manufacturer_questions(results: list[CheckResult]) -> list[CheckResult]:
+    """The subset of results that are actually addressed to the
+    manufacturer and raised something actionable — shared by
+    render_report's own "Questions for the manufacturer" section and
+    render_manufacturer_questions (below), so the two documents can never
+    silently drift out of agreement on which findings qualify."""
+    return [r for r in results if r.level == WARNING and r.manufacturer_question and (r.details or r.note)]
+
+
+def render_manufacturer_questions(results: list[CheckResult]) -> str:
+    """Renders docs/open-questions.md (Task 8 item 5): a standalone
+    document listing the same findings render_report's own "Questions for
+    the manufacturer" section does, reframed for an external reader — no
+    PASS/FAIL/"warning" language, no reference to this catalog's own
+    internal checks or AGENT-TASK — so it can be sent to the manufacturer
+    as-is instead of extracted by hand from the full internal report.
+    """
+    lines = ["# Open questions for ENERGRID", ""]
+    lines.append(
+        "The points below could not be confirmed from the M261 register "
+        "map documentation alone. Each one currently ships as a "
+        "configurable default in the simulator (`unconfirmed: true`), not "
+        "a hardcoded value — please confirm the correct figure for each so "
+        "the default can be corrected once and for all."
+    )
+    lines.append("")
+
+    questions = manufacturer_questions(results)
+    if not questions:
+        lines.append("No open questions at this time.")
+        lines.append("")
+        return "\n".join(lines)
+
+    for i, r in enumerate(questions, 1):
+        lines.append(f"## {i}. {r.name}")
+        lines.append("")
+        lines.append(r.note or r.summary)
+        if r.details:
+            lines.append("")
+            for d in r.details:
+                lines.append(f"- {d}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
     ap.add_argument("--registermap", type=Path, default=DEFAULT_REGISTERMAP)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument(
+        "--questions-out", type=Path, default=DEFAULT_QUESTIONS_OUT,
+        help="Task 8 item 5: standalone manufacturer-facing open-questions document (docs/open-questions.md)",
+    )
     args = ap.parse_args(argv)
 
     results = run_checks(args.catalog, args.registermap)
     report = render_report(results, args.catalog)
+    questions_report = render_manufacturer_questions(results)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(report, encoding="utf-8")
+    args.questions_out.parent.mkdir(parents=True, exist_ok=True)
+    args.questions_out.write_text(questions_report, encoding="utf-8")
 
     failed_critical = [r for r in results if r.level == CRITICAL and not r.passed]
     for r in failed_critical:
         print(f"CRITICAL FAIL: {r.name}", file=sys.stderr)
     print(f"wrote {args.out}", file=sys.stderr)
+    print(f"wrote {args.questions_out}", file=sys.stderr)
     return 1 if failed_critical else 0
 
 

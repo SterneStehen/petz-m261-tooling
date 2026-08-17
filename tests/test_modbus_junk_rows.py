@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from catalog.parsing import POINT_SHEETS, parse_modbus
+from tests.conftest import requires_registermap
 
 REGISTERMAP = Path(__file__).resolve().parent.parent / "m261-registermap"
 
@@ -37,6 +38,7 @@ def test_parameter_names_row_filtered_from_synthetic_sheet(tmp_path):
     assert dropped == [("PCS", 30001, "Parameter Names:")]
 
 
+@requires_registermap
 def test_parameter_names_row_filtered_from_real_file():
     dropped: list[tuple[str, int, str]] = []
     rows = parse_modbus(REGISTERMAP / "M261_points_Modbus.xlsx", dropped=dropped)

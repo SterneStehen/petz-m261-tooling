@@ -14,12 +14,16 @@ from pathlib import Path
 import pytest
 
 from codegen.gen_go import main as gen_go_main
+from tests.conftest import requires_catalog
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CATALOG = REPO_ROOT / "catalog" / "point_catalog.json"
 GO_PKG = REPO_ROOT / "gen" / "go" / "m261points"
 
-pytestmark = pytest.mark.skipif(shutil.which("go") is None, reason="Go toolchain not installed")
+pytestmark = [
+    pytest.mark.skipif(shutil.which("go") is None, reason="Go toolchain not installed"),
+    requires_catalog,
+]
 
 
 @pytest.fixture(scope="module", autouse=True)

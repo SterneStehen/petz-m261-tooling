@@ -21,9 +21,11 @@ from catalog.validate_catalog import (
     check_strategy_periods,
     check_tag_count_matches_ro_count,
     main,
+    render_manufacturer_questions,
     render_report,
     run_checks,
 )
+from tests.conftest import requires_registermap, skip_if_no_registermap
 
 REGISTERMAP = Path(__file__).resolve().parent.parent / "m261-registermap"
 OVERRIDES = Path(__file__).resolve().parent.parent / "catalog" / "overrides.yaml"
@@ -48,6 +50,7 @@ def _rec(**overrides) -> dict:
 
 @pytest.fixture(scope="module")
 def catalog_records() -> list[dict]:
+    skip_if_no_registermap()
     return build_catalog(REGISTERMAP, OVERRIDES)
 
 
@@ -68,7 +71,7 @@ def test_all_critical_checks_pass_on_real_catalog(catalog_path):
 
 def test_main_exits_zero_on_real_catalog(catalog_path, tmp_path):
     out = tmp_path / "report.md"
-    code = main(["--catalog", str(catalog_path), "--registermap", str(REGISTERMAP), "--out", str(out)])
+    code = main(["--catalog", str(catalog_path), "--registermap", str(REGISTERMAP), "--out", str(out), "--questions-out", str(tmp_path / "open-questions.md")])
     assert code == 0
     assert out.exists()
 
@@ -87,14 +90,14 @@ def test_main_exits_nonzero_on_catalog_with_broken_anchor(catalog_path, tmp_path
     broken.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
 
     out = tmp_path / "report.md"
-    code = main(["--catalog", str(broken), "--registermap", str(REGISTERMAP), "--out", str(out)])
+    code = main(["--catalog", str(broken), "--registermap", str(REGISTERMAP), "--out", str(out), "--questions-out", str(tmp_path / "open-questions.md")])
     assert code == 1
     assert "❌ FAIL" in out.read_text(encoding="utf-8")
 
 
 def test_report_has_required_sections(catalog_path, tmp_path):
     out = tmp_path / "report.md"
-    main(["--catalog", str(catalog_path), "--registermap", str(REGISTERMAP), "--out", str(out)])
+    main(["--catalog", str(catalog_path), "--registermap", str(REGISTERMAP), "--out", str(out), "--questions-out", str(tmp_path / "open-questions.md")])
     text = out.read_text(encoding="utf-8")
     assert "## Critical checks" in text
     assert "## Warnings" in text
@@ -148,11 +151,39 @@ def test_manufacturer_questions_exclude_internal_calibration_remarks(tmp_path):
     assert "Internal remark" not in section
 
 
+def test_render_manufacturer_questions_matches_report_section():
+    """docs/open-questions.md (Task 8 item 5) must never silently drift
+    from render_report's own "Questions for the manufacturer" section —
+    both are built from the identical manufacturer_questions() filter."""
+    internal = CheckResult(
+        "Internal remark", "warning", True, "0 (see note)", ["detail"], "an internal note",
+        manufacturer_question=False,
+    )
+    vendor_facing = CheckResult(
+        "Vendor question", "warning", True, "1 thing", ["detail: X"], "please confirm X",
+    )
+    doc = render_manufacturer_questions([internal, vendor_facing])
+    assert "Internal remark" not in doc
+    assert "Vendor question" in doc
+    assert "please confirm X" in doc
+    assert "detail: X" in doc
+    # External-facing: no internal PASS/FAIL/warning jargon.
+    assert "PASS" not in doc
+    assert "FAIL" not in doc
+    assert "warning" not in doc.lower()
+
+
+def test_render_manufacturer_questions_empty_is_explicit():
+    doc = render_manufacturer_questions([])
+    assert "No open questions" in doc
+
+
 # --------------------------------------------------------------------------
 # One synthetic negative test per critical check
 # --------------------------------------------------------------------------
 
 
+@requires_registermap
 def test_control_figures_fails_on_wrong_count():
     records = [_rec(device="EMS", **{"class": "alarm"}, iec104_addr=i) for i in range(1, 31)]  # 30, not 31
     result = check_control_figures(records, REGISTERMAP)

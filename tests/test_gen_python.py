@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from codegen.gen_python import main as gen_python_main
+from tests.conftest import requires_catalog
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CATALOG = REPO_ROOT / "catalog" / "point_catalog.json"
@@ -23,9 +24,10 @@ PY_PKG = REPO_ROOT / "gen" / "python" / "m261_points"
 # always invoked as `sys.executable -m mypy` below), not shutil.which,
 # which only sees console scripts on $PATH — misses a venv's mypy unless
 # the venv happens to be "activated" in the calling shell.
-pytestmark = pytest.mark.skipif(
-    importlib.util.find_spec("mypy") is None, reason="mypy not installed"
-)
+pytestmark = [
+    pytest.mark.skipif(importlib.util.find_spec("mypy") is None, reason="mypy not installed"),
+    requires_catalog,
+]
 
 
 @pytest.fixture(scope="module", autouse=True)

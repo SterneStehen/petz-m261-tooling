@@ -21,8 +21,14 @@ from catalog.build_catalog import build_catalog
 from codegen.gen_go import main as gen_go_main
 from codegen.gen_python import main as gen_python_main
 from codegen.gen_seeds import main as gen_seeds_main
+from tests.conftest import requires_registermap
 
 REGISTERMAP = Path(__file__).resolve().parent.parent / "m261-registermap"
+
+# Every test in this module builds a catalog from the real register maps
+# (via _build_with_override, below) -- see tests/conftest.py for why this
+# must be a skip, not an unconditional failure, when they aren't present.
+pytestmark = requires_registermap
 
 
 def _build_with_override(tmp_path: Path, range_yaml: str) -> Path:

@@ -7,10 +7,13 @@ from pathlib import Path
 import pytest
 
 from codegen.gen_seeds import main as gen_seeds_main
+from tests.conftest import requires_catalog
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CATALOG = REPO_ROOT / "catalog" / "point_catalog.json"
 SEEDS = REPO_ROOT / "gen" / "seeds"
+
+pytestmark = requires_catalog
 
 
 @pytest.fixture(scope="module", autouse=True)

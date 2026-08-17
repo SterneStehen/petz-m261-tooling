@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    name: Go build, vet, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: go.sum
+      # gen/go/m261points (the generated catalog code the simulator
+      # imports) is committed, like any other Go source — this whole job
+      # never touches catalog/ or the private manufacturer register maps.
+      - name: gofmt
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "the following files are not gofmt-clean:"
+            echo "$out"
+            exit 1
+          fi
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./... -race
+
+  python:
+    name: Python tests (catalog/codegen)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r catalog/requirements.txt
+      # The manufacturer register maps (m261-registermap/) and the catalog
+      # built from them (catalog/point_catalog.json) are private, local-
+      # only material this repository does not include (see
+      # docs/README.md and .gitignore) — a plain checkout has neither.
+      # Most of this suite needs one or the other and skips itself
+      # cleanly when they're absent (tests/conftest.py) rather than
+      # failing; everything that doesn't (catalog.join/normalize/parsing
+      # against synthetic fixtures) always runs.
+      - run: python -m pytest tests/ -q -rs
+      - name: mypy (informational)
+        run: python -m mypy catalog codegen || true
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - run: docker build -t m261sim:ci .
+
+  # Task 3's own acceptance criterion, automated ("make generate
+  # regenerates everything from scratch, git diff is empty" — see the
+  # Makefile's own `validate` target). This job is intentionally gated
+  # off by default: the private manufacturer register maps this needs are
+  # not, and never will be, checked into this repository (see
+  # docs/README.md) — there is no source for this job to fetch them from
+  # here. A maintainer whose own CI environment *does* have access (a
+  # self-hosted runner with the files already present, or a private,
+  # access-controlled fetch step of their own) can enable it by setting
+  # the repository variable HAS_REGISTERMAP to "true" and adding whatever
+  # step actually provisions m261-registermap/ before `make validate`
+  # runs — nothing here pretends that source already exists.
+  generate-no-diff:
+    name: make generate (no diff)
+    runs-on: ubuntu-latest
+    if: ${{ vars.HAS_REGISTERMAP == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r catalog/requirements.txt
+      # A maintainer enabling this job (see above) is expected to insert
+      # their own step here to populate m261-registermap/ before this
+      # line runs.
+      - run: make validate

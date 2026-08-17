@@ -10,6 +10,9 @@ from pathlib import Path
 from codegen.gen_go import main as gen_go_main
 from codegen.gen_python import main as gen_python_main
 from codegen.gen_seeds import main as gen_seeds_main
+from tests.conftest import requires_catalog
+
+pytestmark = requires_catalog
 
 
 def _assert_dirs_identical(a: Path, b: Path) -> None:

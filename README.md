@@ -7,17 +7,34 @@ The manufacturer register maps and internal specifications are intentionally
 local-only and are not included in this repository. Obtain them through the
 project's approved internal channel before generating a catalog.
 
+Running the simulator (launch, ports, connecting a client) is documented
+separately in **[docs/README.md](docs/README.md)** — this file covers the
+repository and its build pipeline. The full list of every simulated point
+is in [docs/point-reference.md](docs/point-reference.md); manufacturer
+questions the register maps alone couldn't answer are in
+[docs/open-questions.md](docs/open-questions.md).
+
 ## Prerequisites
 
 - Python 3.11+ with `pip` and `venv` (for `catalog/` and `codegen/`)
 - Go 1.22+ (for `simulator/`)
-- Docker (for `docker compose up`, once packaging is implemented)
+- Docker (for `docker compose up` — see [docs/README.md](docs/README.md))
 
 ## Common commands
 
 ```text
-make generate   # build catalog and generated models
-make build      # build the simulator
-make test       # run tests
+make generate   # build catalog and generated models (needs the private register maps)
+make build      # build the simulator -> simulator/bin/m261sim
+make test       # go vet + go test -race + the Python test suite
+make validate   # regenerate from scratch and fail if anything differs from what's committed
 make run        # run the simulator locally
 ```
+
+`make generate` needs the manufacturer register maps, which this
+repository does not include — as does most of the Python test suite
+`make test` runs, since it exercises that same pipeline; those specific
+tests skip themselves cleanly when the maps are absent (see
+`tests/conftest.py`) rather than failing. `make build`/`make run`, and the
+Go half of `make test` (`go vet`/`go test -race`), never need the maps at
+all: the simulator only imports the already-generated `gen/go/m261points`
+package, which is committed like any other source file.

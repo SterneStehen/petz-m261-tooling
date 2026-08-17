@@ -5,10 +5,20 @@ __pycache__/
 
 # Private project materials: official register maps, generated catalog data,
 # internal specifications, and agent instructions remain local only.
+#
+# /docs/ itself is deliberately NOT ignored as a whole directory — git
+# cannot "un-ignore" individual files inside an ignored directory (a
+# documented limitation: it never descends into one to check exceptions),
+# so the two actually-private documents are named directly instead. Task 8's
+# own deliverables (docs/README.md, docs/point-reference.md,
+# docs/open-questions.md) are generated *output* or a plain operator guide,
+# not internal specs or raw register-map data — same "generated output is
+# tracked" convention gen/ already uses — and stay tracked normally.
 /m261-registermap/
 /catalog/point_catalog.json
 /catalog/validation_report.md
-/docs/
+/docs/AGENT-TASK.md
+/docs/AGENT-CODE-REVIEW.md
 
 # Credentials and local runtime configuration
 .env
