@@ -435,14 +435,6 @@ func TestResetIsAtomicAgainstConcurrentProtocolReads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mbHandler := gomodbus.NewTCPClientHandler(sim.mb.Addr().String())
-	mbHandler.SlaveId = 1
-	mbHandler.Timeout = 5 * time.Second
-	if err := mbHandler.Connect(); err != nil {
-		t.Fatalf("modbus Connect: %v", err)
-	}
-	t.Cleanup(func() { mbHandler.Close() })
-	mbClient := gomodbus.NewClient(mbHandler)
 	const wireAddr = 18 // maximum_charge_soc: F32, modbus_addr 40019 -> wire 40019-40001
 
 	const n = 30
@@ -451,6 +443,15 @@ func TestResetIsAtomicAgainstConcurrentProtocolReads(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
+			// One independent connection per goroutine — see dialModbus's
+			// own doc comment for why a shared client/connection here
+			// would never actually reach the server concurrently.
+			mbClient, closeClient, err := dialModbus(sim.mb.Addr().String(), 1)
+			if err != nil {
+				t.Errorf("modbus Connect: %v", err)
+				return
+			}
+			defer closeClient()
 			regs, err := mbClient.ReadHoldingRegisters(wireAddr, 2)
 			if err != nil {
 				t.Errorf("ReadHoldingRegisters: %v", err)
@@ -497,14 +498,11 @@ func TestFC16BatchWriteAtomicAgainstConcurrentReset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mbHandler := gomodbus.NewTCPClientHandler(sim.mb.Addr().String())
-	mbHandler.SlaveId = 1
-	mbHandler.Timeout = 5 * time.Second
-	if err := mbHandler.Connect(); err != nil {
+	mbClient, closeClient, err := dialModbus(sim.mb.Addr().String(), 1)
+	if err != nil {
 		t.Fatalf("modbus Connect: %v", err)
 	}
-	t.Cleanup(func() { mbHandler.Close() })
-	mbClient := gomodbus.NewClient(mbHandler)
+	t.Cleanup(closeClient)
 
 	// wire 152-153 = set_active_power_kw (40153), wire 154-155 =
 	// set_reactive_power_kvar (40155) — one contiguous 4-register FC16
@@ -526,13 +524,22 @@ func TestFC16BatchWriteAtomicAgainstConcurrentReset(t *testing.T) {
 	preActive := float64(math.Float32frombits(binary.BigEndian.Uint32(preActiveBits)))
 	preReactive := float64(math.Float32frombits(binary.BigEndian.Uint32(preReactiveBits)))
 
+	// One independent connection per writer goroutine — see dialModbus's
+	// own doc comment for why a shared client/connection here would never
+	// actually reach the server concurrently.
 	const n = 30
 	var wg sync.WaitGroup
 	wg.Add(n)
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
-			if _, err := mbClient.WriteMultipleRegisters(wireAddr, 4, buf); err != nil {
+			writerClient, closeWriter, err := dialModbus(sim.mb.Addr().String(), 1)
+			if err != nil {
+				t.Errorf("modbus Connect: %v", err)
+				return
+			}
+			defer closeWriter()
+			if _, err := writerClient.WriteMultipleRegisters(wireAddr, 4, buf); err != nil {
 				// A rejected write (e.g. mode reset mid-flight, or a
 				// transient race with the concurrent reset closing/
 				// reopening nothing — reset never disconnects clients)
@@ -609,21 +616,26 @@ func TestFC06HalfWriteNeverCommitsStaleReadAcrossReset(t *testing.T) {
 			t.Fatalf("iter %d: setup Write: %v", iter, err)
 		}
 
-		mbHandler := gomodbus.NewTCPClientHandler(sim.mb.Addr().String())
-		mbHandler.SlaveId = 1
-		mbHandler.Timeout = 5 * time.Second
-		if err := mbHandler.Connect(); err != nil {
-			t.Fatalf("iter %d: modbus Connect: %v", iter, err)
-		}
-		mbClient := gomodbus.NewClient(mbHandler)
-
+		// One independent connection per writer goroutine — see
+		// dialModbus's own doc comment for why a shared client/connection
+		// here would never actually reach the server concurrently (a
+		// genuine gap in an earlier version of this test: goburrow/
+		// modbus's own client serializes every request over one
+		// connection via an internal mutex, so N goroutines sharing one
+		// client never actually raced the server at all).
 		const n = 10
 		var wg sync.WaitGroup
 		wg.Add(n)
 		for i := 0; i < n; i++ {
 			go func() {
 				defer wg.Done()
-				mbClient.WriteSingleRegister(lowRegWireAddr, lowRegPattern) //nolint:errcheck // a rejected/erroring write is fine here; only a *committed stale* one is a failure
+				writerClient, closeWriter, err := dialModbus(sim.mb.Addr().String(), 1)
+				if err != nil {
+					t.Errorf("iter %d: modbus Connect: %v", iter, err)
+					return
+				}
+				defer closeWriter()
+				writerClient.WriteSingleRegister(lowRegWireAddr, lowRegPattern) //nolint:errcheck // a rejected/erroring write is fine here; only a *committed stale* one is a failure
 			}()
 		}
 		resp := postJSON(t, sim.apiURL("/reset"), nil)
@@ -632,7 +644,6 @@ func TestFC06HalfWriteNeverCommitsStaleReadAcrossReset(t *testing.T) {
 		}
 		resp.Body.Close()
 		wg.Wait()
-		mbHandler.Close()
 
 		got, _ := sim.store.Get(key)
 		gotF32 := float32(got)
@@ -641,6 +652,81 @@ func TestFC06HalfWriteNeverCommitsStaleReadAcrossReset(t *testing.T) {
 		}
 		if gotF32 != float32(resetDefault) && gotF32 != wantResetFirst {
 			t.Fatalf("iter %d: maximum_charge_soc = %v, want exactly %v (reset default, write-then-reset) or %v (reset-then-write composite)", iter, got, resetDefault, wantResetFirst)
+		}
+	}
+}
+
+// TestFC06AndIECWriteToSameSetpointNeverLoseAnUpdate is Blocker 2's
+// write-vs-write case (not write-vs-reset): commands.Processor.writeMu
+// makes a register-level read-modify-write (FC06) and a full-replace
+// write (an IEC-104 setpoint command) to the *same* point mutually
+// exclusive, not just each independently protected from a concurrent
+// Reset. Without it, gate.Op alone (a shared lock) let FC06's own read
+// land before a concurrent IEC write, while its own commit (built from
+// that now-stale base) landed after — silently discarding the IEC write
+// entirely, a classic lost update.
+//
+// Races one FC06 write (touching only the low register) against one
+// IEC-104 setpoint write to the same point, repeatedly. Exactly two
+// final values are reachable once writeMu makes the two operations
+// mutually exclusive as a whole (IEC's write is always either fully
+// before or fully after FC06's entire read-modify-write, never straddled
+// by it): the IEC value outright (IEC ran last), or FC06's low register
+// composed onto IEC's own value (FC06 ran last, having read IEC's
+// already-committed base). The only value that requires the bug to
+// reach — FC06's low register composed onto the point's *original*,
+// pre-IEC-write base — must never appear.
+func TestFC06AndIECWriteToSameSetpointNeverLoseAnUpdate(t *testing.T) {
+	const original = 77.0
+	const iecValue = 55.0
+	const wireAddr = 18 // maximum_charge_soc: F32, modbus_addr 40019 -> wire 40019-40001
+	const lowRegWireAddr = wireAddr + 1
+	const commonAddr, ioa = 1, 25098 // EMS device address, maximum_charge_soc's own IOA
+	var lowRegPattern uint16 = 0xABCD
+	lowRegHi, lowRegLo := byte(lowRegPattern>>8), byte(lowRegPattern)
+
+	key := m261points.PointKey{Device: "EMS", Slug: "maximum_charge_soc"}
+
+	originalBytes := m261points.EncodeF32(original, m261points.BigEndian)
+	forbidden := math.Float32frombits(binary.BigEndian.Uint32(append(append([]byte(nil), originalBytes[0:2]...), lowRegHi, lowRegLo)))
+
+	iecBytes := m261points.EncodeF32(iecValue, m261points.BigEndian)
+	fc06WinsComposite := math.Float32frombits(binary.BigEndian.Uint32(append(append([]byte(nil), iecBytes[0:2]...), lowRegHi, lowRegLo)))
+
+	for iter := 0; iter < 20; iter++ {
+		sim := newTask7Sim(t)
+		if err := sim.processor.Write(key, original); err != nil {
+			t.Fatalf("iter %d: setup Write: %v", iter, err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			mbClient, closeClient, err := dialModbus(sim.mb.Addr().String(), 1)
+			if err != nil {
+				t.Errorf("iter %d: modbus Connect: %v", iter, err)
+				return
+			}
+			defer closeClient()
+			mbClient.WriteSingleRegister(lowRegWireAddr, lowRegPattern) //nolint:errcheck // a rejected write is fine; only a lost update is a failure
+		}()
+		go func() {
+			defer wg.Done()
+			c := dialRawIEC(t, sim.iec.Addr().String())
+			c.startDT()
+			c.sendSetpointCommand(commonAddr, ioa, float32(iecValue))
+			c.expectActivationConfirmation() // block until the server has actually committed this write, not just accepted the bytes on the wire
+		}()
+		wg.Wait()
+
+		got, _ := sim.store.Get(key)
+		gotF32 := float32(got)
+		if gotF32 == forbidden {
+			t.Fatalf("iter %d: maximum_charge_soc = %v -- FC06's committed composite was built from the *original* pre-IEC-write base, meaning the concurrent IEC write was lost entirely (its own commit landed between FC06's read and commit)", iter, got)
+		}
+		if gotF32 != float32(iecValue) && gotF32 != fc06WinsComposite {
+			t.Fatalf("iter %d: maximum_charge_soc = %v, want exactly %v (IEC won) or %v (FC06 won, composed on top of IEC's own already-committed value)", iter, got, iecValue, fc06WinsComposite)
 		}
 	}
 }
@@ -685,6 +771,34 @@ func Test72HourNoGapsInHeartbeat(t *testing.T) {
 			t.Fatalf("heartbeat after tick %d = %v, want exactly %d — sequence gap or duplicate at this point", i, got, i)
 		}
 	}
+}
+
+// dialModbus opens a *fresh, independent* TCP connection to addr and
+// returns a client bound to it. Fourth-review-round fix: goburrow/modbus's
+// own tcpTransporter.Send holds an internal mutex for the whole request-
+// response round trip, so N goroutines sharing *one* client/connection
+// never actually reach the server concurrently — each request completes
+// before the next one is even sent, no matter how many goroutines are
+// "racing" to call it. A test that wants genuinely concurrent server-side
+// handling (to actually exercise an interleaving a fix is supposed to
+// prevent, not just fire a serialized sequence of requests against a live
+// reset) needs one real connection per concurrent caller, so the
+// server's own acceptLoop spawns one handleConn goroutine per connection
+// and they can genuinely run at the same time.
+//
+// Returns a plain error, not calling t.Fatalf itself — this is routinely
+// called from spawned goroutines in these tests, and t.Fatalf/FailNow is
+// documented as unsafe to call from any goroutine but the one running
+// the test function itself; only the caller, on the right goroutine,
+// knows whether Fatalf or Errorf is safe here.
+func dialModbus(addr string, unitID byte) (gomodbus.Client, func(), error) {
+	handler := gomodbus.NewTCPClientHandler(addr)
+	handler.SlaveId = unitID
+	handler.Timeout = 5 * time.Second
+	if err := handler.Connect(); err != nil {
+		return nil, nil, err
+	}
+	return gomodbus.NewClient(handler), func() { handler.Close() }, nil
 }
 
 func postJSON(t *testing.T, url string, body map[string]any) *http.Response {

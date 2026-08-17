@@ -153,6 +153,7 @@ func (s *Server) spontaneousLoop(changes <-chan store.Change) {
 		if !ok {
 			continue
 		}
+		value := c.Value
 		if c.Key == linkfault.HeartbeatKey {
 			// Task 7 item 2's heartbeat_pause: this protocol's clients
 			// stop seeing the counter move, even though it keeps
@@ -160,11 +161,31 @@ func (s *Server) spontaneousLoop(changes <-chan store.Change) {
 			// Store — general interrogation (handleGeneralInterrogation)
 			// is the one place a client sees it again, still frozen,
 			// until cleared.
-			if _, paused := s.link.heartbeatOverride(); paused {
+			//
+			// Re-resolves the *current* effective value under linkCoord,
+			// rather than trusting this Change's own c.Value — fourth-
+			// review-round fix: store.Store.Subscribe's channel is
+			// buffered and best-effort (its own doc comment), so this
+			// loop can easily still be draining Changes generated *while*
+			// paused after a concurrent clear has already landed; using
+			// the stale c.Value in that window would replay an old,
+			// possibly out-of-order intermediate heartbeat reading to the
+			// client right after a clear, instead of accurately
+			// reflecting the live value clear is supposed to restore.
+			// Checking "paused" fresh, right here, and substituting the
+			// live Store value (not c.Value) when not paused makes every
+			// broadcast for this point correct *at the moment it's sent*,
+			// regardless of how stale the Change that triggered it was.
+			s.linkCoord.Lock()
+			_, paused := s.link.heartbeatOverride()
+			live, _ := s.store.Get(linkfault.HeartbeatKey)
+			s.linkCoord.Unlock()
+			if paused {
 				continue
 			}
+			value = live
 		}
-		asdu := monitoredASDU(meta, c.Value, cotSpontaneous)
+		asdu := monitoredASDU(meta, value, cotSpontaneous)
 		if asdu == nil {
 			continue // setpoints (WO) aren't monitored/reported spontaneously
 		}

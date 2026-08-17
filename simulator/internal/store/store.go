@@ -101,6 +101,37 @@ func New() *Store {
 func (s *Store) Get(key m261points.PointKey) (float64, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.GetLocked(key)
+}
+
+// RLock/RUnlock let a caller hold this Store's read lock across more
+// than one operation — a multi-register Modbus response
+// (modbustcp.handleReadBits/handleReadRegisters), or one physics tick's
+// dispatch decision (commands.Processor.ResolvePower, which reads a
+// dozen-plus separate setpoints across several of its own helper
+// methods) — so the *whole* sequence is atomic against a concurrent
+// SetBatch/Restore, not just each individual point read on its own.
+// Fourth-review-round fix: SetBatch already makes a multi-point *write*
+// atomic (one Store-mutex hold for the whole batch), but a *reader* that
+// still called Get/GetByIEC/GetByModbus once per point (each taking and
+// releasing its own brief RLock) could still observe a batch half-
+// applied — this protected only the writer's own side of that race, not
+// the reader's.
+//
+// Never call Get/GetByIEC/GetByModbus/Set/etc. while holding RLock — each
+// of those takes its own RLock/Lock internally, and Go's sync.RWMutex is
+// not safe for a nested RLock on the same goroutine if a writer is queued
+// in between (a real deadlock risk, not hypothetical — the same class of
+// bug an earlier review flagged for appgate.Gate). Use the Locked
+// variants (GetLocked, GetByIECLocked, GetByModbusLocked) instead, which
+// assume the caller already holds RLock and never acquire it themselves.
+func (s *Store) RLock()   { s.mu.RLock() }
+func (s *Store) RUnlock() { s.mu.RUnlock() }
+
+// GetLocked is Get's variant for a caller that already holds RLock (via
+// Store.RLock) for a larger read transaction spanning more than one
+// point — does not itself acquire s.mu.
+func (s *Store) GetLocked(key m261points.PointKey) (float64, bool) {
 	v, ok := s.values[key]
 	return v, ok
 }
@@ -132,6 +163,12 @@ func (s *Store) Set(key m261points.PointKey, value float64) bool {
 func (s *Store) GetByIEC(addr IECAddr) (m261points.PointKey, float64, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.GetByIECLocked(addr)
+}
+
+// GetByIECLocked is GetByIEC's variant for a caller that already holds
+// RLock — see GetLocked's doc comment.
+func (s *Store) GetByIECLocked(addr IECAddr) (m261points.PointKey, float64, bool) {
 	key, ok := s.iecIndex[addr]
 	if !ok {
 		return m261points.PointKey{}, 0, false
@@ -154,6 +191,12 @@ func (s *Store) SetByIEC(addr IECAddr, value float64) (m261points.PointKey, bool
 func (s *Store) GetByModbus(addr ModbusAddr) (m261points.PointKey, float64, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.GetByModbusLocked(addr)
+}
+
+// GetByModbusLocked is GetByModbus's variant for a caller that already
+// holds RLock — see GetLocked's doc comment.
+func (s *Store) GetByModbusLocked(addr ModbusAddr) (m261points.PointKey, float64, bool) {
 	key, ok := s.modbusIndex[addr]
 	if !ok {
 		return m261points.PointKey{}, 0, false

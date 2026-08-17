@@ -120,6 +120,17 @@ type linkRequest struct {
 	DelayMS  int    `json:"delay_ms"`
 }
 
+// maxDelayMS is the largest delay_ms that, multiplied by time.Millisecond,
+// still fits in a time.Duration (an int64 count of nanoseconds) — mirrors
+// maxAdvanceSeconds's own rationale: a request past this silently wraps
+// around instead of erroring (Go doesn't panic on integer overflow),
+// which is how a fourth-review-round reproduction (delay_ms: MaxInt64)
+// got a 204 with the delay silently wrapping to a negative duration —
+// accepted, but the resulting "delay" is none at all, defeating the
+// request outright rather than being rejected. ~292,471 years in
+// milliseconds — far past any legitimate use of this endpoint.
+const maxDelayMS = int64(math.MaxInt64) / int64(time.Millisecond)
+
 func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
@@ -134,6 +145,10 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {
 	// scenario dialect for the identical action.
 	if req.Mode == string(linkfault.ModeDelay) && req.DelayMS <= 0 {
 		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Errorf("mode: delay requires a positive delay_ms, got %d", req.DelayMS))
+		return
+	}
+	if int64(req.DelayMS) > maxDelayMS {
+		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Errorf("delay_ms %d exceeds the maximum representable duration (%d ms)", req.DelayMS, maxDelayMS))
 		return
 	}
 	delay := time.Duration(req.DelayMS) * time.Millisecond

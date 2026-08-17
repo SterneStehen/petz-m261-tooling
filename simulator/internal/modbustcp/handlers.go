@@ -91,14 +91,23 @@ func (s *Server) handleReadBits(unitID byte, pdu []byte) []byte {
 	}
 	// One gate.Op for the whole response, not one per point read below —
 	// see SetGate's doc comment for the mixed pre-/post-reset read this
-	// prevents.
+	// prevents. store.RLock (innermost) makes the whole per-bit loop one
+	// read transaction against the Store too — fourth-review-round fix:
+	// gate.Op alone excludes a concurrent Reset, but a concurrent multi-
+	// point store.Store.SetBatch commit (itself only excluded from other
+	// *writers* by commands.Processor.writeMu, not from readers) could
+	// still land between two of this loop's own per-bit reads and produce
+	// a response mixing pre- and post-batch values — see store.Store.
+	// RLock's own doc comment.
 	done := s.opDone()
 	defer done()
+	s.store.RLock()
+	defer s.store.RUnlock()
 	byteCount := (qty + 7) / 8
 	bits := make([]byte, byteCount)
 	for i := 0; i < int(qty); i++ {
 		docAddr := int(start+uint16(i)) + classBase[2]
-		_, val, ok := s.store.GetByModbus(store.ModbusAddr{UnitID: int(unitID), Class: 2, Address: docAddr})
+		_, val, ok := s.store.GetByModbusLocked(store.ModbusAddr{UnitID: int(unitID), Class: 2, Address: docAddr})
 		if ok && val != 0 {
 			bits[i/8] |= 1 << uint(i%8)
 		}
@@ -119,18 +128,20 @@ func (s *Server) handleReadRegisters(unitID byte, pdu []byte, class int) []byte 
 	if qty == 0 || qty > 125 {
 		return exceptionPDU(pdu[0], excIllegalDataValue)
 	}
-	// linkCoord (outer) plus gate.Op (inner) for the whole response — see
-	// handleReadBits for gate.Op's own rationale, and
-	// iec104.Server.handleGeneralInterrogation's identical comment for
-	// linkCoord's: without it, this response's Store reads and its
-	// heartbeat-override resolution could be torn apart by a concurrent
-	// link mutation the same way an unguarded Store read and a separately
-	// -locked heartbeat check could be by one. Lock order (linkCoord
-	// outer, gate.Op inner) matches doReset's and GI's own.
+	// linkCoord (outer), then gate.Op, then store.RLock (innermost) for
+	// the whole response — see handleReadBits for gate.Op/store.RLock's
+	// own rationale, and iec104.Server.handleGeneralInterrogation's
+	// identical comment for linkCoord's: without it, this response's
+	// Store reads and its heartbeat-override resolution could be torn
+	// apart by a concurrent link mutation the same way an unguarded Store
+	// read and a separately-locked heartbeat check could be by one. Lock
+	// order matches doReset's and GI's own.
 	s.linkCoord.Lock()
 	defer s.linkCoord.Unlock()
 	done := s.opDone()
 	defer done()
+	s.store.RLock()
+	defer s.store.RUnlock()
 
 	buf := make([]byte, int(qty)*2)
 	cache := make(map[m261points.PointKey][]byte)
@@ -142,7 +153,7 @@ func (s *Server) handleReadRegisters(unitID byte, pdu []byte, class int) []byte 
 		enc, ok := cache[slot.key]
 		if !ok {
 			meta := m261points.Points[slot.key]
-			val, _ := s.store.Get(slot.key)
+			val, _ := s.store.GetLocked(slot.key)
 			if slot.key == linkfault.HeartbeatKey {
 				// Task 7 item 2's heartbeat_pause: this protocol's
 				// clients stop seeing the counter move, even though it
@@ -233,7 +244,21 @@ func (s *Server) handleWriteMultipleRegisters(unitID byte, pdu []byte) []byte {
 // gate.Op is the only one — see its own doc comment for why nesting a
 // second one here would risk deadlocking against a queued exclusive
 // Reset (the reviewer's explicit warning).
+//
+// Also holds commands.Processor.LockWrites/UnlockWrites for the same
+// whole transaction, *outside* (before) gate.Op — fourth-review-round
+// fix: gate.Op alone only excludes a concurrent Reset, not another
+// concurrent writer (another FC06/FC16 request, or an IEC-104 setpoint
+// write) also holding gate.Op at the same time — see writeMu's own doc
+// comment in package commands for the lost-update race this closes.
+// Nil-guarded (s.cfg.Commands can be nil in tests that predate Task 6
+// and write straight to the store, same as every other s.cfg.Commands
+// check in this file).
 func (s *Server) applyRegisterWrites(unit int, start uint16, regs [][]byte) byte {
+	if s.cfg.Commands != nil {
+		s.cfg.Commands.LockWrites()
+		defer s.cfg.Commands.UnlockWrites()
+	}
 	done := s.opDone()
 	defer done()
 

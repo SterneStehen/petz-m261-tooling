@@ -641,6 +641,11 @@ func TestExternalDriversStillConflictWithEachOtherUnderLivePacer(t *testing.T) {
 // "almost stopped" (heartbeat reached 24,478 within seconds of real
 // time). CheckedPace must reject this instead of silently producing an
 // implementation-defined Duration.
+//
+// Fourth review round: also rejects the opposite extreme — a speed so
+// large the quotient underflows to zero once truncated to whole
+// nanoseconds, which previously let PacedRun fall back to a runaway
+// as-fast-as-possible ticker instead of refusing to run.
 func TestCheckedPaceRejectsOverflow(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -650,6 +655,8 @@ func TestCheckedPaceRejectsOverflow(t *testing.T) {
 		{"extremely small speed", time.Second, 1e-300},
 		{"speed makes NaN", time.Second, math.NaN()},
 		{"speed is zero", time.Second, 0},
+		{"extremely large finite speed underflows to zero", time.Second, 1e30},
+		{"infinite speed underflows to zero", time.Second, math.Inf(1)},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -669,12 +676,11 @@ func TestCheckedPaceRejectsOverflow(t *testing.T) {
 		t.Errorf("CheckedPace(1s, 2) = %v, want 500ms", got)
 	}
 
-	// An infinite speed divides the result down to a representable 0,
-	// not an overflow — CheckedPace itself doesn't need to reject this;
-	// validSpeed (checked separately, upstream of every public caller)
-	// already rejects a non-finite speed before it ever reaches here.
-	if got, err := CheckedPace(time.Second, math.Inf(1)); err != nil || got != 0 {
-		t.Errorf("CheckedPace(1s, +Inf) = (%v, %v), want (0, nil)", got, err)
+	// d == 0 is exempt from the underflow-to-zero rejection: a
+	// zero-length remaining chunk legitimately paces to nothing at any
+	// speed, not an extreme-speed symptom.
+	if got, err := CheckedPace(0, 1e30); err != nil || got != 0 {
+		t.Errorf("CheckedPace(0, 1e30) = (%v, %v), want (0, nil)", got, err)
 	}
 }
 
@@ -705,5 +711,37 @@ func TestPacedRunDoesNotRunawayOnExtremeSpeed(t *testing.T) {
 
 	if hb := get(t, st, "EMS", "ems_periodic_heartbeat_indicator"); hb != 0 {
 		t.Errorf("heartbeat = %v after ~50ms with an overflowing speed, want 0 (PacedRun must refuse to run away, not tick at ~1ns cadence)", hb)
+	}
+}
+
+// TestPacedRunDoesNotRunawayOnHugeFiniteSpeed is the huge-speed mirror of
+// TestPacedRunDoesNotRunawayOnExtremeSpeed — fourth review round: a
+// speed so large the computed real interval underflows to zero
+// previously fell back to a fixed 1ns ticker, an uncontrolled as-fast-
+// as-possible cadence with no real pacing at all, not merely "wrong",
+// but capable of consuming a full CPU core. PacedRun must refuse to run
+// at all instead.
+func TestPacedRunDoesNotRunawayOnHugeFiniteSpeed(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	proc := newTestProcessor(t, st, clk)
+	r := NewRunner(New(DefaultParams(), 50), st, clk, proc)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.PacedRun(time.Second, 1e30, stop)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("PacedRun did not return after stop was closed")
+	}
+
+	if hb := get(t, st, "EMS", "ems_periodic_heartbeat_indicator"); hb != 0 {
+		t.Errorf("heartbeat = %v after ~50ms with an underflowing speed, want 0 (PacedRun must refuse to run away, not tick at an uncontrolled ~1ns cadence)", hb)
 	}
 }

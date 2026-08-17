@@ -59,7 +59,41 @@ type Processor struct {
 	diagnostics map[m261points.PointKey]Diagnostic
 
 	gate *appgate.Gate // see SetGate
+
+	// writeMu serializes every operation that determines a setpoint's
+	// next value and commits it — a full-replace write (Write) or a
+	// partial, register-level read-modify-write (modbustcp's
+	// applyRegisterWrites, via LockWrites/UnlockWrites) — against every
+	// other one. Fourth-review-round fix: gate.Op is a *shared* lock, so
+	// wrapping applyRegisterWrites' whole read-modify-write-validate-
+	// commit transaction in gate.Op (third review round) excluded it from
+	// a concurrent Reset (which needs gate.Exclusive) but never from
+	// another concurrent writer also holding gate.Op — a second FC06/FC16
+	// request touching the same point, or an IEC-104 setpoint write to it,
+	// could still interleave with an in-flight read-modify-write and
+	// produce a classic lost update: the read-modify-write's own read
+	// happens before the other writer's commit, so its own commit (based
+	// on that now-stale read) silently discards the other writer's change
+	// when it lands after. Write acquiring writeMu itself, even though a
+	// full-replace write doesn't need read-then-write protection for its
+	// *own* sake, is what closes the window: it makes every writer
+	// participate in the same mutual-exclusion domain a read-modify-write
+	// needs to be safe, not just protect read-modify-writes from each
+	// other.
+	writeMu sync.Mutex
 }
+
+// LockWrites/UnlockWrites let a caller (modbustcp's FC06/FC16 handler)
+// hold the same write-serialization lock Write uses internally, for its
+// own multi-step read-modify-write-validate-commit transaction — see
+// writeMu's own doc comment for the lost-update race this closes. Must
+// be held for the *entire* transaction, from the first read-modify-write
+// seed read through the final WriteBatch commit, exactly like gate.Op
+// already is (third review round) — writeMu is the outer lock, gate.Op
+// the inner one, a fixed order every caller in this codebase follows
+// (mirroring linkfault.Coordinator's own relationship to gate.Op).
+func (p *Processor) LockWrites()   { p.writeMu.Lock() }
+func (p *Processor) UnlockWrites() { p.writeMu.Unlock() }
 
 // SetGate wires the process-wide reset-atomicity gate (package appgate)
 // — Write becomes a shared (Op) operation against it once set, so a
@@ -256,6 +290,8 @@ func (p *Processor) Write(key m261points.PointKey, value float64) error {
 		log.Printf("commands: rejected write %s/%s = %v: %v", key.Device, key.Slug, value, err)
 		return err
 	}
+	p.writeMu.Lock() // see writeMu's own doc comment — outer lock, ahead of gate.Op
+	defer p.writeMu.Unlock()
 	done := p.opDone()
 	defer done()
 	p.applySideEffects(key, value)
@@ -281,9 +317,9 @@ type KeyValue = store.KeyValue
 // write spanning more than one catalog point) — calling it with an
 // unvalidated pair skips Validate entirely, unlike Write.
 //
-// Deliberately ungated (does *not* call gate.Op itself, unlike every
-// other mutating method here) — third-review-round fix: the caller
-// (modbustcp.applyRegisterWrites) needs the *entire* transaction —
+// Deliberately ungated (does *not* call gate.Op or writeMu itself,
+// unlike every other mutating method here) — third-review-round fix: the
+// caller (modbustcp.applyRegisterWrites) needs the *entire* transaction —
 // reading each touched point's current value to build the read-modify-
 // write seed for an unaligned FC06 half-write, decoding, Validate, and
 // this final commit — to run under one gate.Op, not just the commit
@@ -295,6 +331,13 @@ type KeyValue = store.KeyValue
 // mutex for the whole batch, so even a concurrent reader that also holds
 // gate.Op (a shared lock, so it doesn't itself exclude another gate.Op
 // holder) can never observe only part of a multi-point batch applied.
+//
+// Fourth-review-round addition: the caller must *also* hold writeMu
+// (LockWrites/UnlockWrites) for that same entire transaction, ahead of
+// gate.Op — see writeMu's own doc comment for the lost-update race
+// (another concurrent writer to the same point, not just Reset) this
+// closes. WriteBatch itself still doesn't acquire either lock; it
+// assumes the caller already holds both, in that order.
 func (p *Processor) WriteBatch(writes []KeyValue) {
 	for _, kv := range writes {
 		p.applySideEffects(kv.Key, kv.Value)
@@ -340,7 +383,25 @@ func (p *Processor) applySideEffects(key m261points.PointKey, value float64) {
 // physically possible right now; ResolvePower is responsible for
 // everything upstream of that (mode arbitration, EMS-level limits,
 // watchdog, Power On/Off).
+//
+// Holds p.store.RLock() for its *entire* body — fourth-review-round fix:
+// this reads a dozen-plus separate setpoints (set_operating_mode, the
+// Remote-mode power pair, both SoC/power limits, and — in Auto Strategy
+// — up to ten Strategy Periods' worth of schedule fields) across several
+// of its own helper methods (resolvePriorityDriver, scheduleLookup,
+// applyPowerLimits), each previously via its own independently-locked
+// store.Store.Get call. A concurrent multi-point Modbus batch commit
+// (store.Store.SetBatch) landing partway through used to be able to mix
+// pre- and post-batch setpoint values into one dispatch decision — e.g.
+// reading the *old* operating mode together with the *new* power
+// setpoint from the same just-committed batch, a combination the client
+// never actually requested. One RLock for the whole call closes that:
+// either this dispatch decision sees the batch fully applied, or not at
+// all, never a mix.
 func (p *Processor) ResolvePower(now time.Time, bmsMaxChargeKW, bmsMaxDischargeKW, socPercent float64, chargeProhibited, dischargeProhibited bool) (activeKW, reactiveKW float64) {
+	p.store.RLock()
+	defer p.store.RUnlock()
+
 	mode := p.getInt("set_operating_mode")
 
 	p.mu.Lock()
@@ -605,8 +666,16 @@ func (p *Processor) Reset() {
 	p.diagMu.Unlock()
 }
 
+// get reads one EMS setpoint — assumes the caller already holds
+// p.store.RLock() for the whole multi-point read transaction it's part
+// of (every current caller is within ResolvePower's own call graph,
+// which wraps its entire body in one RLock/RUnlock pair — see
+// ResolvePower's doc comment). Uses GetLocked, not Get: Get takes its
+// own RLock internally, which would be an unsafe nested RLock on top of
+// the one ResolvePower already holds (see store.Store.RLock's own doc
+// comment for the deadlock risk that guards against).
 func (p *Processor) get(slug string) float64 {
-	v, _ := p.store.Get(emsKey(slug))
+	v, _ := p.store.GetLocked(emsKey(slug))
 	return v
 }
 

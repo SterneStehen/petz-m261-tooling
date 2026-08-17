@@ -23,6 +23,12 @@ import (
 // partially"), not which specific rule fired.
 var ErrMalformed = errors.New("scenario: malformed")
 
+// maxDelayMS is the largest link.delay_ms that, multiplied by
+// time.Millisecond, still fits in a time.Duration — see controlapi's
+// identical constant (simulator/internal/controlapi/handlers.go) for the
+// overflow-wraps-to-a-negative-duration bug this guards against.
+const maxDelayMS = int64(math.MaxInt64) / int64(time.Millisecond)
+
 // raw* mirror the YAML shape exactly (AGENT-TASK.md, Task 7 item 4's
 // example) — kept separate from the semantic Scenario/Step/*Action types
 // so parsing (strings, optional pointers) and the validated, executable
@@ -275,6 +281,16 @@ func parseStep(i int, rs rawStep) (Step, m261points.PointKey, bool, error) {
 			if rs.Link.DelayMS <= 0 {
 				return Step{}, m261points.PointKey{}, false, fmt.Errorf(
 					"%w: step %d: link.mode: delay requires a positive delay_ms, got %d", ErrMalformed, i, rs.Link.DelayMS,
+				)
+			}
+			// See controlapi's identical maxDelayMS check: delay_ms *
+			// time.Millisecond must fit in a time.Duration, or it
+			// silently wraps (Go doesn't panic on integer overflow)
+			// instead of erroring — accepted, but the resulting "delay"
+			// defeats the request rather than honoring it.
+			if int64(rs.Link.DelayMS) > maxDelayMS {
+				return Step{}, m261points.PointKey{}, false, fmt.Errorf(
+					"%w: step %d: link.delay_ms %d exceeds the maximum representable duration (%d ms)", ErrMalformed, i, rs.Link.DelayMS, maxDelayMS,
 				)
 			}
 		default:

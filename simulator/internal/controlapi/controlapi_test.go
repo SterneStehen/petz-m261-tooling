@@ -3,6 +3,7 @@ package controlapi_test
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -422,6 +423,27 @@ func TestSetLinkDelayRequiresPositiveDelayMS(t *testing.T) {
 	}
 	if h.iec.delay != 0 {
 		t.Errorf("iec.delay = %v, want unchanged 0 — no invalid delay request should have taken effect", h.iec.delay)
+	}
+}
+
+// TestSetLinkRejectsOverflowingDelayMS is the fourth review round's
+// duration-overflow finding applied to link.delay_ms: delay_ms *
+// time.Millisecond must fit in a time.Duration (an int64 count of
+// nanoseconds), or it silently wraps (Go doesn't panic on integer
+// overflow) instead of erroring — reproduced black-box as delay_ms:
+// MaxInt64 getting a 204 with the resulting "delay" wrapped to a
+// negative duration, silently disabling the delay the request asked
+// for instead of being rejected.
+func TestSetLinkRejectsOverflowingDelayMS(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do(t, "POST", "/link", map[string]any{
+		"protocol": "iec104", "mode": "delay", "delay_ms": math.MaxInt64,
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("delay_ms=MaxInt64: status = %d, want 400, body = %s", resp.StatusCode, body)
+	}
+	if h.iec.snapshot().delay != 0 {
+		t.Errorf("iec.delay = %v, want unchanged 0 — an overflowing delay_ms must not take effect", h.iec.snapshot().delay)
 	}
 }
 

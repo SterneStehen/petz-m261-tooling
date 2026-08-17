@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -1276,4 +1277,67 @@ func TestResetDoesNotTouchStore(t *testing.T) {
 	if v, _ := st.Get(emsKey("maximum_charge_soc")); v != 77 {
 		t.Errorf("maximum_charge_soc after Reset = %v, want unchanged 77 — Reset must not touch the Store", v)
 	}
+}
+
+// TestResolvePowerNeverObservesATornMultiPointBatch is the fourth review
+// round's torn-multi-point-read case: ResolvePower reads several
+// separate setpoints — including set_operating_mode and
+// set_active_power_kw — each previously through its own independently
+// -locked store.Store.Get call. A concurrent multi-point batch commit
+// (store.Store.SetBatch — what a Modbus FC16 request spanning both
+// points ultimately calls) landing partway through used to be able to
+// mix pre- and post-batch values into one dispatch decision.
+//
+// Batches set_operating_mode/set_active_power_kw together, back and
+// forth, between (Remote, 50) and (Manual, 120), racing many
+// ResolvePower calls against it. Only two dispatch results are reachable
+// if ResolvePower's own read is atomic against the whole batch: 50 (it
+// saw the Remote/50 pair) or 0 (it saw the Manual/120 pair — Manual
+// always dispatches 0, regardless of what set_active_power_kw holds).
+// 120 is only reachable by reading the *new* power together with the
+// *old* Remote mode — a combination no single instant of either batch's
+// state ever actually had.
+func TestResolvePowerNeverObservesATornMultiPointBatch(t *testing.T) {
+	p, st, clk := newProcessor(t)
+	modeKey := emsKey("set_operating_mode")
+	powerKey := emsKey("set_active_power_kw")
+
+	remoteOld := []store.KeyValue{{Key: modeKey, Value: 2}, {Key: powerKey, Value: 50}}
+	manualNew := []store.KeyValue{{Key: modeKey, Value: 0}, {Key: powerKey, Value: 120}}
+	if !st.SetBatch(remoteOld) {
+		t.Fatal("setup SetBatch failed")
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		toggle := false
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if toggle {
+				st.SetBatch(remoteOld)
+			} else {
+				st.SetBatch(manualNew)
+			}
+			toggle = !toggle
+		}
+	}()
+
+	const n = 5000
+	for i := 0; i < n; i++ {
+		active, _ := p.ResolvePower(clk.Now(), 1e9, 1e9, 50, false, false)
+		if active != 50 && active != 0 {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("iter %d: ResolvePower active = %v, want exactly 50 (pre-batch pair) or 0 (post-batch pair) — observed a torn read of the batch", i, active)
+		}
+	}
+	close(stop)
+	wg.Wait()
 }

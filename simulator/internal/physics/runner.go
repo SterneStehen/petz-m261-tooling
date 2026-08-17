@@ -288,13 +288,15 @@ func (r *Runner) ReleaseDrive() {
 // a panic or a runaway ticker — main.go validates both upfront and fails
 // fast before starting anything, but PacedRun doesn't assume every
 // caller does that. An extreme-but-technically-valid speed (e.g. a tiny
-// positive value close to zero) that would make stepInterval/speed
-// overflow a time.Duration is also a no-op — PacedRun itself has no
-// caller to report the failure through (main.go's own -speed validation
-// is expected to reject this before ever calling PacedRun; see
-// CheckedPace), and running at a runaway ~1ns cadence instead (a bare,
+// positive value close to zero, or — fourth review round — an
+// enormous one) that would make stepInterval/speed over/underflow a
+// time.Duration is also a no-op — PacedRun itself has no caller to
+// report the failure through (main.go's own -speed validation is
+// expected to reject this before ever calling PacedRun; see
+// CheckedPace), and running at a runaway cadence instead (a bare,
 // unchecked float64->Duration conversion is implementation-defined once
-// out of int64 range, not a panic — a real second-review-round finding)
+// out of int64 range, not a panic; a duration that underflows to zero
+// falls back to an uncontrolled as-fast-as-possible ticker either way)
 // would silently misrepresent the requested speed rather than visibly
 // doing nothing.
 func (r *Runner) PacedRun(stepInterval time.Duration, speed float64, stop <-chan struct{}) {
@@ -303,10 +305,7 @@ func (r *Runner) PacedRun(stepInterval time.Duration, speed float64, stop <-chan
 	}
 	realInterval, err := CheckedPace(stepInterval, speed)
 	if err != nil {
-		return
-	}
-	if realInterval <= 0 {
-		realInterval = time.Nanosecond // extreme speed: tick as fast as the ticker/scheduler allow, never zero/negative
+		return // speed is too extreme (either direction) for a meaningful real-time pace at this stepInterval -- see CheckedPace
 	}
 	ticker := time.NewTicker(realInterval)
 	defer ticker.Stop()
@@ -341,12 +340,27 @@ func validSpeed(speed float64) bool {
 // silently turn a 1s stepInterval/speed into a ~1ns real interval
 // instead of the "almost stopped" pace the caller actually asked for
 // (reproduced: heartbeat reached 24,478 within seconds of real time).
+//
+// Also rejects the opposite extreme: a speed so *large* (still finite,
+// still individually "valid" by validSpeed's own check) that d/speed
+// underflows to a duration of zero once truncated to whole nanoseconds.
+// Fourth-review-round finding: the previous version silently accepted
+// this and let PacedRun fall back to a fixed 1ns real interval — a
+// runaway ticker firing as fast as the OS scheduler allows, exactly the
+// "destructive" outcome the tiny-speed check above already guards
+// against, just from the other direction. d == 0 is exempt (a
+// zero-length remaining chunk legitimately paces to nothing, not an
+// extreme speed).
 func CheckedPace(d time.Duration, speed float64) (time.Duration, error) {
 	ns := float64(d) / speed
 	if math.IsNaN(ns) || math.IsInf(ns, 0) || ns > float64(math.MaxInt64) || ns < float64(math.MinInt64) {
 		return 0, fmt.Errorf("physics: %s / %v does not fit in a representable duration", d, speed)
 	}
-	return time.Duration(ns), nil
+	pace := time.Duration(ns)
+	if d > 0 && pace <= 0 {
+		return 0, fmt.Errorf("physics: %s / %v underflows to a non-positive duration -- speed is too large relative to this interval for a meaningful real-time pace", d, speed)
+	}
+	return pace, nil
 }
 
 // Rebase sets the dt baseline for the next Tick to now, without touching

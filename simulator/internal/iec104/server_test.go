@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
@@ -104,6 +105,31 @@ func (c *rawClient) nextI() []byte {
 		}
 		// S or U frame with nothing pending for us in this test harness
 	}
+}
+
+// tryNextI is nextI's non-fatal counterpart — used by tests that expect
+// (and must tolerate) a read timeout as a normal "no more frames right
+// now" outcome, not a test failure: more == false means the read failed
+// (timeout, EOF, malformed header — the caller's read deadline is what
+// actually bounds this, not a distinction this helper makes), isIFrame
+// == false with more == true means an S/U-frame was read and skipped,
+// keep calling.
+func (c *rawClient) tryNextI() (asdu []byte, isIFrame bool, more bool) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(c.nc, header); err != nil {
+		return nil, false, false
+	}
+	if header[0] != 0x68 {
+		return nil, false, false
+	}
+	rest := make([]byte, header[1])
+	if _, err := io.ReadFull(c.nc, rest); err != nil {
+		return nil, false, false
+	}
+	if rest[0]&0x01 == 0 { // I-format
+		return rest[4:], true, true
+	}
+	return nil, false, true // S/U frame — not an error, just not an I-frame
 }
 
 // waitForType scans frames until it finds one of the given ASDU type,
@@ -570,5 +596,70 @@ func TestIEC104LinkHeartbeatPauseSuppressesSpontaneousTransmission(t *testing.T)
 	c.nc.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if _, err := c.nc.Read(make([]byte, 1)); err == nil {
 		t.Error("received a frame after a Store change to a paused heartbeat point, want none (suppressed)")
+	}
+}
+
+// TestSpontaneousLoopNeverReplaysStaleHeartbeatAfterClear is the fourth
+// review round's spontaneousLoop finding: it re-checked
+// s.link.heartbeatOverride() fresh at the moment it actually processed
+// each queued Change (not the moment the Change was generated), but
+// broadcast that Change's own — possibly long-stale, since
+// store.Store.Subscribe's channel is buffered and best-effort — c.Value
+// whenever paused happened to be false *by then*. A Change generated
+// *while paused* (which should stay permanently invisible — the whole
+// point of heartbeat_pause) could still be replayed to the client as a
+// distinct spontaneous update once spontaneousLoop finally drained it,
+// if a concurrent clear landed first.
+//
+// Deterministically forces this exact interleaving: two Store writes
+// happen while paused (queuing two Changes with stale payloads 10 and
+// 20), then this test itself holds linkCoord — which spontaneousLoop's
+// own per-Change check now also acquires — while ClearLinkFaults runs,
+// guaranteeing both already-queued Changes are only actually processed
+// after the clear. Every spontaneous heartbeat value the client receives
+// afterward must equal the final live value (20) — never the first
+// queued Change's stale payload (10).
+func TestSpontaneousLoopNeverReplaysStaleHeartbeatAfterClear(t *testing.T) {
+	st := store.New()
+	heartbeatKey := m261points.PointKey{Device: "EMS", Slug: "ems_periodic_heartbeat_indicator"}
+	srv, addr := startServer(t, st)
+	coord := linkfault.NewCoordinator()
+	srv.SetLinkCoordinator(coord)
+	c := dialRaw(t, addr)
+	c.startDT()
+	time.Sleep(20 * time.Millisecond) // let STARTDT_CON settle before relying on "started"
+
+	srv.SetHeartbeatPause(0)
+	st.Set(heartbeatKey, 10) // queued Change #1, generated while paused
+	st.Set(heartbeatKey, 20) // queued Change #2, generated while paused -- neither processed by spontaneousLoop yet
+
+	// Block spontaneousLoop's own per-Change check (it now also acquires
+	// coord) for the whole clear, forcing both of the Changes queued
+	// above to only be processed once paused is already false.
+	coord.Lock()
+	srv.ClearLinkFaults()
+	coord.Unlock()
+
+	var sawStale bool
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		c.nc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		asdu, isIFrame, more := c.tryNextI()
+		if !more {
+			break
+		}
+		if !isIFrame || asdu[0] != typeMMENC1 || asdu[2] != cotSpontaneous {
+			continue
+		}
+		ioa := int(asdu[6]) | int(asdu[7])<<8 | int(asdu[8])<<16
+		if ioa != heartbeatIOA {
+			continue
+		}
+		if decodeFloat32(asdu[9:13]) == 10 {
+			sawStale = true
+		}
+	}
+	if sawStale {
+		t.Error("received a spontaneous heartbeat update for the stale, paused-era value 10 after a concurrent clear -- a replay of a reading that should have stayed permanently invisible")
 	}
 }

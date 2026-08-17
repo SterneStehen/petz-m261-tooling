@@ -226,6 +226,26 @@ steps:
 	}
 }
 
+// TestParseRejectsOverflowingDelayMS is the fourth review round's
+// duration-overflow finding applied to the scenario dialect's own
+// link.delay_ms — mirrors controlapi's identical
+// TestSetLinkRejectsOverflowingDelayMS for the same underlying bug:
+// delay_ms * time.Millisecond must fit in a time.Duration, or it
+// silently wraps (Go doesn't panic on integer overflow) instead of
+// erroring.
+func TestParseRejectsOverflowingDelayMS(t *testing.T) {
+	_, err := scenario.Parse([]byte(`
+name: x
+clock: {start: "2026-08-12T00:00:00+03:00", speed: 1}
+steps:
+  - at: 0s
+    link: {protocol: both, mode: delay, delay_ms: 9223372036854775807}
+`))
+	if !errors.Is(err, scenario.ErrMalformed) {
+		t.Errorf("Parse with an overflowing link.delay_ms = %v, want ErrMalformed", err)
+	}
+}
+
 func TestParseAcceptsLinkClear(t *testing.T) {
 	s, err := scenario.Parse([]byte(`
 name: x
