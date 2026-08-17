@@ -3,15 +3,17 @@ package iec104
 import (
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
 // heartbeatQueueSize is generous relative to how often a heartbeat frame
 // can actually be admitted (at most once per physics tick, and pauses/
 // clears are rare, deliberate admin actions, not a hot path) — this is
-// not meant to survive a sustained flood, only to give
-// bumpHeartbeatGeneration's own connMu-held enqueue loop (below) enough
-// slack that it practically never blocks on a healthy connection's own
-// queue filling up.
+// not meant to survive a sustained flood: enqueueOrDisconnect (below)
+// disconnects a connection outright once its own queue is this full,
+// rather than silently losing anything, so heartbeatQueueSize's only job
+// is giving a healthy connection enough slack that a brief scheduling
+// delay in its own hbLoop never trips that.
 const heartbeatQueueSize = 256
 
 // hbMsg is one item in a connection's own heartbeat outbound queue —
@@ -26,13 +28,12 @@ type hbMsg struct {
 	ack       chan struct{}
 }
 
-// admitHeartbeat is spontaneousLoop's heartbeat-specific admission step,
-// replacing the previous design's "resolve paused?, then broadcast"
-// sequence (fourth review round) — the gap between resolving and the
-// actual socket write in broadcast was exactly the residual race the
-// fifth review round's blocker 2 named: "a frame can also be classified
-// as allowed, then pause can finish, and that old frame can be sent
-// afterward."
+// admitHeartbeat is spontaneousLoop's heartbeat-specific admission step
+// for one already-published store.Change, c — replacing the previous
+// design's "resolve paused?, then broadcast" sequence (fourth review
+// round) and, sixth review round, its own successor ("resolve paused?
+// and re-read the *current* live value, then broadcast" — see below for
+// why that was still wrong).
 //
 // Holds linkCoord for the whole admission decision *and* the enqueue
 // into every connection's own hbQueue (not just the decision) —
@@ -43,86 +44,107 @@ type hbMsg struct {
 // (bumpHeartbeatGeneration, called from within SetHeartbeatPause/
 // ClearLinkFaults itself, under the same linkCoord hold), or this whole
 // admission hasn't started yet and will correctly see the new, paused
-// state instead. This is safe to hold linkCoord across (unlike waiting
-// for a fence) because every step here is memory-only — a channel send
-// into a generously-sized buffer, never a socket write.
+// state (and boundary revision) instead. This is safe to hold linkCoord
+// across (unlike waiting for a fence) because every step here is
+// memory-only — a channel send into a generously-sized buffer, or a
+// disconnect (enqueueOrDisconnect), never a blocking socket write.
 //
-// A paused heartbeat Change is discarded permanently right here, before
-// ever reaching any connection's queue — Task 7 item 2's own model:
-// events generated during a paused generation don't exist as far as any
-// client is concerned, clear or no clear.
-//
-// Also suppresses admitting a value identical to the last one actually
-// admitted (lastHeartbeatAdmitted) — closing the specific "paused-era
-// events are still emitted as duplicates after clear" gap the review
-// named: several store.Change events queued back-to-back while paused
-// (each with a different, now-superseded stale payload) all resolve to
-// the *same* current live value once finally processed after a clear —
-// correct in what they'd report (round four's fix), but each one was
-// still a separate, redundant admission of a value the client had
-// already been sent. The real heartbeat point only ever increments, so a
-// duplicate here can only be an artifact of paused-era backlog draining,
-// never a legitimate repeated live reading being dropped.
-func (s *Server) admitHeartbeat() {
+// Sixth-review-round rewrite: this used to re-read the Store's *current*
+// live heartbeat value at admission time instead of trusting c.Value —
+// deliberately, to avoid replaying a stale intermediate reading. But
+// store.Store.Subscribe's channel is buffered and best-effort, so c can
+// easily still be sitting unprocessed when a pause activates *and later
+// clears* — and re-reading "current" at that point launders c into a
+// brand new, current-value event, exactly the "paused-era events are
+// still emitted... after clear" bug the review named: c was generated
+// during a now-superseded generation, and no amount of freshening its
+// *value* changes that fact. The fix is c.Rev, not the value: c.Rev <=
+// s.heartbeatGenBoundaryRev means a *later* pause-or-clear transition
+// (bumpHeartbeatGeneration, called from both) already moved the boundary
+// past this specific event — permanently stale, discarded here,
+// regardless of what "paused" reads right now. Only once that check
+// passes does this go back to using c.Value directly (never re-read),
+// exactly like every other point's Change already does in
+// spontaneousLoop — "do not convert an old queued event into a fresh
+// current-value event."
+func (s *Server) admitHeartbeat(c store.Change) {
 	s.linkCoord.Lock()
 	defer s.linkCoord.Unlock()
 
-	_, paused := s.link.heartbeatOverride()
-	if paused {
-		return
+	if c.Rev <= s.heartbeatGenBoundaryRev {
+		return // superseded by a later pause/clear/reset transition -- permanently stale, never delivered
 	}
-	live, _ := s.store.Get(linkfault.HeartbeatKey)
-	if s.haveLastHeartbeatAdmitted && s.lastHeartbeatAdmitted == live {
+	if _, paused := s.link.heartbeatOverride(); paused {
 		return
 	}
 	meta := m261points.Points[linkfault.HeartbeatKey]
-	asdu := monitoredASDU(meta, live, cotSpontaneous)
+	asdu := monitoredASDU(meta, c.Value, cotSpontaneous)
 	if asdu == nil {
 		return // unreachable in practice (the heartbeat point is telemetry, always monitored) -- defensive, matching every other monitoredASDU-nil check in this package
 	}
-	s.lastHeartbeatAdmitted, s.haveLastHeartbeatAdmitted = live, true
 
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
-	for c := range s.conns {
-		select {
-		case c.hbQueue <- hbMsg{asdu: asdu}:
-		default:
-			// The queue is full -- heartbeatQueueSize's own doc comment:
-			// this connection isn't keeping up (a very slow/stuck peer).
-			// Dropping this one admission rather than blocking connMu (and
-			// therefore every other connection's own accept/close/link
-			// bookkeeping) behind it is the same trade-off broadcast's own
-			// design already makes for every other spontaneous point.
-		}
+	for conn := range s.conns {
+		s.enqueueOrDisconnect(conn, hbMsg{asdu: asdu})
+	}
+}
+
+// enqueueOrDisconnect tries a non-blocking send of msg into conn's
+// hbQueue and reports whether it succeeded. Sixth-review-round fix: on
+// failure (the queue is full — this connection's own hbLoop isn't
+// keeping up), disconnects conn outright instead of silently discarding
+// msg. Silently dropping a *barrier* here used to make FenceHeartbeat
+// return without ever having waited for this connection at all — the
+// fence would report success while an old, unfenced frame could still be
+// sitting queued behind the (never delivered) barrier, exactly the
+// "silent barrier loss" the review forbids. A dropped plain *value*
+// admission would only cost this one connection a single missed update —
+// already the accepted trade-off for every other spontaneous point, via
+// broadcast's own best-effort send — but this closes it the same way
+// anyway, for one uniform rule rather than two different failure modes
+// for what's fundamentally the same problem: a connection whose own
+// hbQueue is this far behind is not a connection FenceHeartbeat can
+// meaningfully wait on, so it's removed instead of silently ignored.
+// Must be called while connMu is already held (both callers hold it for
+// their whole enqueue loop).
+func (s *Server) enqueueOrDisconnect(conn *clientConn, msg hbMsg) bool {
+	select {
+	case conn.hbQueue <- msg:
+		return true
+	default:
+		conn.nc.Close() //nolint:errcheck // handleConn's own read loop notices and runs its usual cleanup (delete from s.conns, close hbQueue)
+		return false
 	}
 }
 
 // bumpHeartbeatGeneration is SetHeartbeatPause/ClearLinkFaults' own
-// fencing step (see linkstate.go) — enqueues a fresh barrier into every
-// currently open connection's hbQueue and records its ack channel for a
+// fencing step (see linkstate.go): records the current Store revision as
+// the new generation boundary (admitHeartbeat's own c.Rev <=
+// heartbeatGenBoundaryRev check) and enqueues a fresh barrier into every
+// currently open connection's hbQueue, recording its ack channel for a
 // later FenceHeartbeat call to wait on. Must be called while linkCoord is
 // already held (both callers only ever run from within Apply/
 // ApplyCoordinated's own coord.Lock hold) — this is what gives the
-// barrier its ordering guarantee: any admitHeartbeat call that already
-// finished enqueueing before this one started is fully represented by
-// items sitting ahead of this barrier in every connection's queue (FIFO),
-// and any admitHeartbeat call that hasn't started yet will see the new
-// paused/cleared state once it does. Doesn't itself wait for anything —
-// see FenceHeartbeat for why that must happen outside this hold.
+// boundary and the barrier the same ordering guarantee: any admitHeartbeat
+// call that already started (and is therefore either already fully
+// enqueued, or blocked waiting for this same linkCoord) is either fully
+// represented ahead of this barrier in every connection's queue, or will
+// see the new boundary/paused state once it gets its turn; nothing can
+// straddle the two.
 func (s *Server) bumpHeartbeatGeneration() {
+	s.heartbeatGenBoundaryRev = s.store.CurrentRevision()
+
 	s.connMu.Lock()
 	acks := make([]chan struct{}, 0, len(s.conns))
-	for c := range s.conns {
+	for conn := range s.conns {
 		ack := make(chan struct{})
-		select {
-		case c.hbQueue <- hbMsg{isBarrier: true, ack: ack}:
+		if s.enqueueOrDisconnect(conn, hbMsg{isBarrier: true, ack: ack}) {
 			acks = append(acks, ack)
-		default:
-			// Queue full (see admitHeartbeat) -- this connection's own
-			// backlog is already being dropped, not delivered in order
-			// FenceHeartbeat could meaningfully wait on; nothing to fence.
 		}
+		// enqueueOrDisconnect returning false already disconnected conn --
+		// nothing to fence for it; it can never receive a stale frame
+		// again, so it's simply excluded rather than needing an ack.
 	}
 	s.connMu.Unlock()
 
@@ -135,8 +157,10 @@ func (s *Server) bumpHeartbeatGeneration() {
 // for the contract every caller (controlapi, scenario.Runner) must
 // follow: call this only *after* releasing linkCoord, never while still
 // holding it, since a slow connection's own transport write can make
-// this block for as long as that write takes, and linkCoord must never
-// be held across that (see bumpHeartbeatGeneration's own doc comment).
+// this block for as long as that write takes (bounded — see
+// clientConn.withWriteDeadline — but still real time), and linkCoord must
+// never be held across that (see bumpHeartbeatGeneration's own doc
+// comment).
 //
 // Waits on every ack accumulated since the last call, not just the ones
 // from the very latest SetHeartbeatPause/ClearLinkFaults — if two such
@@ -146,9 +170,11 @@ func (s *Server) bumpHeartbeatGeneration() {
 // it and run its own bump first), waiting on the newer barrier alone
 // would still be correct on its own terms, but draining *all*
 // accumulated acks here is simpler to reason about and strictly safe:
-// every one of them is guaranteed to close eventually (hbLoop always
-// processes a barrier it successfully dequeued), and waiting on a few
-// extra, already-satisfied ones costs nothing once they're closed.
+// every one of them is guaranteed to close eventually — either hbLoop
+// processes it normally, or withWriteDeadline's own timeout disconnects
+// the connection outright, whose hbLoop then drains straight through any
+// remaining queued items (including barriers) once its own hbQueue is
+// closed — never left permanently unclosed.
 func (s *Server) FenceHeartbeat() {
 	s.fenceMu.Lock()
 	acks := s.pendingFenceAcks
@@ -164,10 +190,14 @@ func (s *Server) FenceHeartbeat() {
 // connection outbound actor/queue with generation-tagged frames and a
 // barrier/ack command" the fifth review round asked for. Runs until
 // hbQueue is closed (handleConn's own cleanup, once this connection is
-// gone). Strictly sequential: a barrier can only be dequeued (and its
-// ack closed) after every value ahead of it in the queue has already
-// been handed to sendIfStarted, which is exactly the guarantee
-// FenceHeartbeat's callers rely on.
+// gone, or FenceHeartbeat/enqueueOrDisconnect's own trigger of it — see
+// their own doc comments). Strictly sequential: a barrier can only be
+// dequeued (and its ack closed) after every value ahead of it in the
+// queue has already been handed to sendIfStarted, which is exactly the
+// guarantee FenceHeartbeat's callers rely on. sendIfStarted's own write
+// is bounded (clientConn.withWriteDeadline) — a peer that stops reading
+// can delay this loop by at most that bound before being disconnected,
+// never indefinitely.
 func (c *clientConn) hbLoop() {
 	defer c.srv.wg.Done()
 	for msg := range c.hbQueue {
@@ -178,7 +208,7 @@ func (c *clientConn) hbLoop() {
 		if testBeforeHeartbeatSend != nil {
 			testBeforeHeartbeatSend()
 		}
-		c.sendIfStarted(msg.asdu) //nolint:errcheck // a slow/dead peer just misses this update, same as broadcast's own convention
+		c.sendIfStarted(msg.asdu) //nolint:errcheck // a slow/dead peer just misses this update and is disconnected by withWriteDeadline; same convention as broadcast
 	}
 }
 

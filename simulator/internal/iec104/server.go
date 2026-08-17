@@ -53,12 +53,12 @@ type Server struct {
 	fenceMu          sync.Mutex
 	pendingFenceAcks []chan struct{}
 
-	// lastHeartbeatAdmitted/haveLastHeartbeatAdmitted back admitHeartbeat's
-	// own duplicate suppression — guarded by linkCoord (every access is
-	// from within admitHeartbeat, which already holds it for its whole
-	// body), not a separate mutex. See heartbeat.go.
-	lastHeartbeatAdmitted     float64
-	haveLastHeartbeatAdmitted bool
+	// heartbeatGenBoundaryRev is admitHeartbeat's own generation cutoff —
+	// see its and bumpHeartbeatGeneration's own doc comments (heartbeat.go).
+	// Guarded by linkCoord (every access is from within one of those two
+	// functions, both of which already hold it for their whole body), not
+	// a separate mutex.
+	heartbeatGenBoundaryRev uint64
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -166,17 +166,16 @@ func (s *Server) spontaneousLoop(changes <-chan store.Change) {
 			continue
 		}
 		if c.Key == linkfault.HeartbeatKey {
-			// Task 7 item 2's heartbeat_pause / fifth-review-round fix:
-			// heartbeat frames go through the admit-then-fence pipeline
-			// in heartbeat.go instead of straight to broadcast — see its
-			// own doc comment for why re-resolving "paused?" fresh, right
-			// before admission (this package's fourth-review-round fix),
-			// was still not enough on its own: a frame already resolved
-			// as "not paused, deliver value V" could still be sitting
-			// unsent in the gap before broadcast's own socket write,
-			// letting SetHeartbeatPause's caller report the pause active
-			// before V actually went out.
-			s.admitHeartbeat()
+			// Task 7 item 2's heartbeat_pause / fifth- and sixth-review-
+			// round fix: heartbeat frames go through the admit-then-fence
+			// pipeline in heartbeat.go instead of straight to broadcast —
+			// see admitHeartbeat's own doc comment for why even re-
+			// resolving "paused?" and the *current* live value fresh at
+			// admission time (this package's fourth- and fifth-review-
+			// round fixes) was still not enough: c itself, not a fresh
+			// read, is what admitHeartbeat now checks and (if not stale)
+			// delivers.
+			s.admitHeartbeat(c)
 			continue
 		}
 		asdu := monitoredASDU(meta, c.Value, cotSpontaneous)
@@ -255,11 +254,53 @@ func (c *clientConn) writeIFrame(asdu []byte) error {
 // already hold writeMu (sendIfStarted, startDataTransfer's kin) and must
 // not re-lock it.
 func (c *clientConn) writeIFrameLocked(asdu []byte) error {
-	if err := writeIFrame(c.nc, c.sendSeq, c.recvSeq, asdu); err != nil {
+	if err := c.withWriteDeadline(func() error { return writeIFrame(c.nc, c.sendSeq, c.recvSeq, asdu) }); err != nil {
 		return err
 	}
 	c.sendSeq++
 	return nil
+}
+
+// writeDeadline bounds every socket write this connection ever makes —
+// sixth-review-round fix: without this, a client that stops reading (but
+// leaves the TCP connection open) can make a write here block
+// indefinitely, and since every write for one connection is serialized
+// through the same writeMu hbLoop also uses, that block doesn't just stall
+// this one frame — FenceHeartbeat's own wait for hbLoop to reach its
+// barrier (see heartbeat.go) would then never return either, hanging
+// POST /link, POST /link/clear, and POST /reset on one unrelated,
+// non-reading client. 5s is generous for a live TCP peer under any normal
+// condition (this codebase's own SetDelay link-fault mode tops out in the
+// same ballpark of intentional latency) while still bounding the worst
+// case to something a caller can reasonably wait out rather than
+// something indistinguishable from a hang.
+// A var, not a const, purely so a package-internal test can shrink it —
+// see server_test.go's TestSlowWriteGetsDisconnectedInsteadOfHanging
+// Indefinitely — production code never changes it from this default.
+var writeDeadline = 5 * time.Second
+
+// withWriteDeadline sets a bounded write deadline on c.nc, runs fn (one
+// of this package's writeIFrame/writeSFrame/writeUFrame call wrappers),
+// and disconnects this connection if fn fails specifically because that
+// deadline expired — never for any other write error (a broken pipe or
+// reset connection is already effectively gone; handleConn's own read
+// loop notices and cleans up on its own, same as before this fix). Must
+// be called while writeMu is already held (every caller here holds it).
+func (c *clientConn) withWriteDeadline(fn func() error) error {
+	c.nc.SetWriteDeadline(time.Now().Add(writeDeadline)) //nolint:errcheck // best-effort; a failure here just means fn's own Write gets no deadline, same as before this fix existed
+	err := fn()
+	if isTimeoutErr(err) {
+		c.nc.Close() //nolint:errcheck // disconnect a peer that isn't draining its receive buffer, rather than leave hbLoop/handleConn permanently stuck behind it
+	}
+	return err
+}
+
+// isTimeoutErr reports whether err is (or wraps) a net.Error whose own
+// Timeout() is true — the specific, narrow signal a deadline actually
+// expired, as opposed to any other write failure.
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // sendIfStarted writes asdu as a spontaneous I-frame only if the
@@ -287,13 +328,13 @@ func (c *clientConn) sendIfStarted(asdu []byte) error {
 func (c *clientConn) writeSFrame() error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return writeSFrame(c.nc, c.recvSeq)
+	return c.withWriteDeadline(func() error { return writeSFrame(c.nc, c.recvSeq) })
 }
 
 func (c *clientConn) writeUFrame(u uType) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return writeUFrame(c.nc, u)
+	return c.withWriteDeadline(func() error { return writeUFrame(c.nc, u) })
 }
 
 // startDataTransfer sends STARTDT_CON and marks the connection started as
@@ -302,7 +343,7 @@ func (c *clientConn) writeUFrame(u uType) error {
 func (c *clientConn) startDataTransfer() error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if err := writeUFrame(c.nc, uStartDTCon); err != nil {
+	if err := c.withWriteDeadline(func() error { return writeUFrame(c.nc, uStartDTCon) }); err != nil {
 		return err
 	}
 	c.started.Store(true)
@@ -318,7 +359,7 @@ func (c *clientConn) stopDataTransfer() error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	c.started.Store(false)
-	return writeUFrame(c.nc, uStopDTCon)
+	return c.withWriteDeadline(func() error { return writeUFrame(c.nc, uStopDTCon) })
 }
 
 func (s *Server) handleConn(c *clientConn) {

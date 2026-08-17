@@ -601,31 +601,38 @@ func TestIEC104LinkHeartbeatPauseSuppressesSpontaneousTransmission(t *testing.T)
 }
 
 // TestSpontaneousLoopNeverReplaysStaleHeartbeatAfterClear is the fourth
-// review round's spontaneousLoop finding: it re-checked
-// s.link.heartbeatOverride() fresh at the moment it actually processed
-// each queued Change (not the moment the Change was generated), but
-// broadcast that Change's own — possibly long-stale, since
-// store.Store.Subscribe's channel is buffered and best-effort — c.Value
-// whenever paused happened to be false *by then*. A Change generated
-// *while paused* (which should stay permanently invisible — the whole
-// point of heartbeat_pause) could still be replayed to the client as a
-// distinct spontaneous update once spontaneousLoop finally drained it,
-// if a concurrent clear landed first.
+// review round's spontaneousLoop finding, since strengthened twice more:
+//
+//   - Fourth review round: spontaneousLoop re-checked
+//     s.link.heartbeatOverride() fresh at the moment it actually processed
+//     each queued Change (not the moment the Change was generated), but
+//     broadcast that Change's own — possibly long-stale, since
+//     store.Store.Subscribe's channel is buffered and best-effort —
+//     c.Value whenever paused happened to be false *by then*.
+//   - Fifth review round: admitHeartbeat started re-reading the *current*
+//     live Store value instead of trusting c.Value, and suppressing a
+//     duplicate of the last value actually admitted — closing the wrong-
+//     *value* replay, but still delivering at least one frame for the
+//     paused-era backlog once it finally drained after the clear.
+//   - Sixth review round (this fix): a heartbeat event generated during a
+//     paused generation must be discarded permanently, full stop — zero
+//     frames, not "at most one correct one" — even once processed after a
+//     clear. admitHeartbeat now compares each Change's own Store revision
+//     (c.Rev) against the revision boundary bumpHeartbeatGeneration
+//     records at every pause/clear transition, and uses c.Value directly
+//     (never a fresh re-read) once a Change passes that check — see
+//     heartbeat.go.
 //
 // Deterministically forces this exact interleaving: two Store writes
 // happen while paused (queuing two Changes with stale payloads 10 and
 // 20), then this test itself holds linkCoord — which spontaneousLoop's
 // own per-Change check now also acquires — while ClearLinkFaults runs,
 // guaranteeing both already-queued Changes are only actually processed
-// after the clear. Every spontaneous heartbeat value the client receives
-// afterward must equal the final live value (20) — never the first
-// queued Change's stale payload (10) — and, fifth-review-round addition
-// (admitHeartbeat's duplicate suppression, heartbeat.go): the two queued
-// Changes, once both processed after the clear and both resolving to the
-// identical live value 20, must produce at most *one* spontaneous frame,
-// not two — "paused-era events are still emitted as duplicates after
-// clear" was the review's own wording for exactly this residual gap in
-// round four's fix (which only corrected the *value*, not the count).
+// after the clear. Zero spontaneous heartbeat frames may arrive for
+// either of them. Only a genuinely new Change after the clear (the "next
+// real heartbeat tick") must be delivered — checked explicitly, so this
+// test can't be trivially satisfied by a fix that discards *everything*
+// forever.
 func TestSpontaneousLoopNeverReplaysStaleHeartbeatAfterClear(t *testing.T) {
 	st := store.New()
 	heartbeatKey := m261points.PointKey{Device: "EMS", Slug: "ems_periodic_heartbeat_indicator"}
@@ -647,32 +654,39 @@ func TestSpontaneousLoopNeverReplaysStaleHeartbeatAfterClear(t *testing.T) {
 	srv.ClearLinkFaults()
 	coord.Unlock()
 
-	var sawStale bool
-	var heartbeatFrames int
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		c.nc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-		asdu, isIFrame, more := c.tryNextI()
-		if !more {
-			break
+	readHeartbeatFrames := func(window time.Duration) (values []float32) {
+		t.Helper()
+		deadline := time.Now().Add(window)
+		for time.Now().Before(deadline) {
+			c.nc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			asdu, isIFrame, more := c.tryNextI()
+			if !more {
+				break
+			}
+			if !isIFrame || asdu[0] != typeMMENC1 || asdu[2] != cotSpontaneous {
+				continue
+			}
+			ioa := int(asdu[6]) | int(asdu[7])<<8 | int(asdu[8])<<16
+			if ioa != heartbeatIOA {
+				continue
+			}
+			values = append(values, decodeFloat32(asdu[9:13]))
 		}
-		if !isIFrame || asdu[0] != typeMMENC1 || asdu[2] != cotSpontaneous {
-			continue
-		}
-		ioa := int(asdu[6]) | int(asdu[7])<<8 | int(asdu[8])<<16
-		if ioa != heartbeatIOA {
-			continue
-		}
-		heartbeatFrames++
-		if decodeFloat32(asdu[9:13]) == 10 {
-			sawStale = true
-		}
+		return values
 	}
-	if sawStale {
-		t.Error("received a spontaneous heartbeat update for the stale, paused-era value 10 after a concurrent clear -- a replay of a reading that should have stayed permanently invisible")
+
+	if got := readHeartbeatFrames(500 * time.Millisecond); len(got) != 0 {
+		t.Errorf("received %d spontaneous heartbeat frame(s) after the clear (%v), want zero -- both queued Changes were generated during the paused generation and must be discarded permanently, not replayed (even at the correct value) once finally processed after the clear", len(got), got)
 	}
-	if heartbeatFrames > 1 {
-		t.Errorf("received %d spontaneous heartbeat frames after the clear, want at most 1 -- two paused-era Changes resolving to the same live value must not each produce their own duplicate frame", heartbeatFrames)
+
+	// The "next real heartbeat tick": a genuinely new Change, generated
+	// *after* the clear, must still be delivered -- proves the fix
+	// discards specifically the paused-era backlog, not every future
+	// heartbeat frame.
+	st.Set(heartbeatKey, 30)
+	got := readHeartbeatFrames(2 * time.Second)
+	if len(got) != 1 || got[0] != 30 {
+		t.Errorf("spontaneous heartbeat frames after a genuinely new post-clear Change = %v, want exactly [30]", got)
 	}
 }
 
@@ -824,5 +838,171 @@ func TestFenceHeartbeatWaitsForAnAlreadyAdmittedFrameBeforeClearCompletes(t *tes
 	}
 	if got := decodeFloat32(asdu[9:13]); got != 77 {
 		t.Errorf("delivered heartbeat value = %v, want 77 (the pre-reset admitted value) -- it must be sent, not silently discarded, just strictly before the fence returns", got)
+	}
+}
+
+// TestFenceHeartbeatDisconnectsRatherThanSilentlyLosingABarrier is
+// blocker 2's second required deterministic test (sixth review round):
+// "fill the per-connection heartbeat queue, activate pause/clear/reset,
+// and prove no pre-fence frame is sent after the API operation returns."
+//
+// Before this fix, bumpHeartbeatGeneration's own barrier enqueue used the
+// same best-effort "drop silently if full" convention as an ordinary
+// value admission (select/default) — meaning FenceHeartbeat could return
+// having *never actually waited* for a connection whose queue happened to
+// be full at exactly the wrong moment: the barrier vanished, no ack was
+// ever recorded for it, and FenceHeartbeat had nothing to wait on for
+// that connection at all. Silent barrier loss, forbidden by design.
+//
+// This fills one connection's hbQueue to capacity — first admitting one
+// value (dequeued by hbLoop, which then blocks in the testBeforeHeartbeat
+// -Send hook so nothing drains further), then admitting exactly
+// heartbeatQueueSize more (filling the buffer completely) — then
+// activates pause. The barrier enqueue must fail (queue full): asserts
+// the connection is disconnected outright (never silently ignored) and
+// that FenceHeartbeat still returns promptly, proving the fence was
+// resolved rather than defeated.
+func TestFenceHeartbeatDisconnectsRatherThanSilentlyLosingABarrier(t *testing.T) {
+	st := store.New()
+	heartbeatKey := m261points.PointKey{Device: "EMS", Slug: "ems_periodic_heartbeat_indicator"}
+	srv, addr := startServer(t, st)
+	coord := linkfault.NewCoordinator()
+	srv.SetLinkCoordinator(coord)
+	c := dialRaw(t, addr)
+	c.startDT()
+	time.Sleep(20 * time.Millisecond) // let STARTDT_CON settle before relying on "started"
+
+	blockedInSend := make(chan struct{})
+	releaseSend := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseSend) })
+	defer release() // unconditional, even on a failing assertion -- see the pause-fence test's identical comment on why
+	testBeforeHeartbeatSend = func() {
+		close(blockedInSend)
+		<-releaseSend
+	}
+	defer func() { testBeforeHeartbeatSend = nil }()
+
+	// Calls admitHeartbeat directly (bypassing store.Store.Subscribe's own
+	// pipeline) rather than 257 rapid st.Set calls: store.Store.publish is
+	// itself best-effort against a *64*-deep subscriber channel (well
+	// under heartbeatQueueSize), so a tight loop of that many Sets, faster
+	// than spontaneousLoop's own goroutine could ever drain them, would
+	// mostly get silently dropped *before* ever reaching admitHeartbeat --
+	// never actually filling hbQueue, and defeating this test's own
+	// premise. Calling the exact function spontaneousLoop itself calls
+	// keeps this a faithful test of admitHeartbeat/enqueueOrDisconnect
+	// while making the fill fully deterministic.
+	srv.admitHeartbeat(store.Change{Key: heartbeatKey, Value: 0, Rev: 1}) // dequeued by hbLoop, which then blocks in the hook -- hbQueue itself is now empty (0 pending)
+	<-blockedInSend
+
+	for i := 1; i <= heartbeatQueueSize; i++ {
+		srv.admitHeartbeat(store.Change{Key: heartbeatKey, Value: float64(i), Rev: uint64(i + 1)}) // fills hbQueue to exactly its capacity (heartbeatQueueSize pending)
+	}
+
+	srv.SetHeartbeatPause(999) // bumpHeartbeatGeneration's own barrier enqueue must now find the queue full
+
+	fenceDone := make(chan struct{})
+	go func() {
+		defer close(fenceDone)
+		srv.FenceHeartbeat()
+	}()
+
+	select {
+	case <-fenceDone:
+		// Expected: nothing to wait on for the now-disconnected connection.
+	case <-time.After(2 * time.Second):
+		t.Fatal("FenceHeartbeat did not return within 2s -- a silently lost barrier must not make the fence hang, and a correctly-disconnected connection has nothing left to wait on")
+	}
+
+	// A plain read *timeout* is not evidence of a disconnect -- it just
+	// means nothing arrived before the deadline, which is equally true of
+	// a connection that's still open but silent. Only a definite error
+	// other than a timeout (EOF, connection reset, "use of closed network
+	// connection") confirms the server actually closed its side.
+	c.nc.SetReadDeadline(time.Now().Add(1 * time.Second))
+	_, err := c.nc.Read(make([]byte, 1))
+	if err == nil {
+		t.Error("connection was not disconnected after its hbQueue filled up during a pause activation -- a lost barrier must result in a definite disconnect, not a connection silently left behind")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Errorf("read timed out instead of erroring (%v) -- the connection was not actually disconnected after its hbQueue filled up during a pause activation, a lost barrier must result in a definite disconnect", err)
+	}
+}
+
+// TestSlowWriteGetsDisconnectedInsteadOfHangingIndefinitely is blocker
+// 2's third required deterministic test (sixth review round): "block an
+// in-flight write and prove the operation completes by bounded
+// disconnect/timeout, not indefinite waiting."
+//
+// Builds a clientConn directly around one side of a net.Pipe() — a
+// synchronous, in-memory net.Conn implementation, so a Write on it blocks
+// for exactly as long as nothing reads the other side, deterministically
+// (unlike trying to fill a real TCP socket's kernel buffers, which is
+// both slow and unreliable to force) — and registers it in the server's
+// own connection set directly, bypassing the real TCP listener/
+// acceptLoop/handleConn entirely (this connection's read side is never
+// serviced, since nothing here ever calls readFrame on it — cleanup is
+// therefore this test's own responsibility, done manually to mirror
+// exactly what handleConn's cleanup defer would otherwise do). Shrinks
+// writeDeadline first so this test doesn't have to wait out the real 5s
+// production value.
+//
+// Never reads from the client side, so sendIfStarted's write blocks
+// until withWriteDeadline's own bound trips it — asserts the call
+// actually blocked for approximately writeDeadline (not less — proving
+// this test's own premise, that the write really was blocking, holds),
+// returns with a timeout error rather than hanging indefinitely, and
+// that the connection is subsequently, actually closed.
+func TestSlowWriteGetsDisconnectedInsteadOfHangingIndefinitely(t *testing.T) {
+	old := writeDeadline
+	writeDeadline = 300 * time.Millisecond
+	t.Cleanup(func() { writeDeadline = old })
+
+	st := store.New()
+	srv, _ := startServer(t, st)
+
+	serverSide, clientSide := net.Pipe()
+	t.Cleanup(func() { clientSide.Close() })
+
+	conn := &clientConn{srv: srv, nc: serverSide, hbQueue: make(chan hbMsg, heartbeatQueueSize)}
+	conn.started.Store(true)
+	srv.connMu.Lock()
+	srv.conns[conn] = struct{}{}
+	srv.connMu.Unlock()
+	srv.wg.Add(1)
+	go conn.hbLoop()
+	t.Cleanup(func() {
+		// Mirrors handleConn's own cleanup defer exactly (server.go) --
+		// this connection never went through acceptLoop/handleConn, so
+		// nothing else will ever do this for it.
+		srv.connMu.Lock()
+		delete(srv.conns, conn)
+		close(conn.hbQueue)
+		srv.connMu.Unlock()
+	})
+
+	started := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- conn.sendIfStarted([]byte{0x01, 0x02, 0x03}) // arbitrary ASDU bytes -- content is irrelevant, only that it's a real write attempt
+	}()
+
+	select {
+	case err := <-done:
+		elapsed := time.Since(started)
+		if elapsed < writeDeadline/2 {
+			t.Fatalf("sendIfStarted returned after only %s, well before writeDeadline (%s) could plausibly have elapsed -- the write did not actually block on the unread pipe as this test assumes", elapsed, writeDeadline)
+		}
+		if err == nil {
+			t.Fatal("sendIfStarted returned a nil error for a write that should have hit its deadline -- the peer (clientSide) was never read from")
+		}
+	case <-time.After(writeDeadline + 3*time.Second):
+		t.Fatalf("sendIfStarted did not return within writeDeadline+3s (%s) -- the write is hanging indefinitely instead of being bounded", writeDeadline+3*time.Second)
+	}
+
+	// Confirm the connection was actually closed as a result of the
+	// timeout, not just this one call failing on its own — a second write
+	// attempt on an already-closed net.Pipe side errors immediately.
+	if _, err := serverSide.Write([]byte{0x00}); err == nil {
+		t.Error("server-side connection was not closed after a write hit its deadline -- a timed-out write must result in disconnecting the slow peer, not just failing this one call")
 	}
 }

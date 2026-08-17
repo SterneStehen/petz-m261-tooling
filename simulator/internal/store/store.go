@@ -17,6 +17,29 @@ import (
 type Change struct {
 	Key   m261points.PointKey
 	Value float64
+	// Rev is the Store's own monotonic revision as of the mutation that
+	// produced this Change — sixth-review-round addition. Every Set/
+	// SetBatch/Restore call increments one global counter exactly once
+	// and stamps that single value onto every Change it publishes (a
+	// setpoint's own value plus its readback twin, or every point in one
+	// batch/restore) — a strictly later call always produces a strictly
+	// larger Rev, comparable across every key, not just within one.
+	//
+	// This is what lets a subscriber establish "was this specific event
+	// generated before or after some later cutoff", something checking
+	// current state at *processing* time cannot do on its own: a Change
+	// can sit in a buffered subscriber channel for a while before it's
+	// actually processed, and by then "current state" may already
+	// reflect a transition that happened *after* this Change was
+	// generated but *before* it was processed — re-deriving a fresh
+	// "current" value at that point silently launders a stale,
+	// superseded event into what looks like a brand new one. See
+	// iec104.Server.admitHeartbeat for the concrete case this closes: a
+	// heartbeat event still queued when heartbeat_pause activates or
+	// clears must be identifiable as belonging to that now-superseded
+	// generation even once a subscriber finally processes it afterward,
+	// not reinterpreted as a fresh, current-value event.
+	Rev uint64
 }
 
 // IECAddr is a point's IEC-104 address: ASDU common address (== device
@@ -46,6 +69,11 @@ const subscriberBufferSize = 64
 type Store struct {
 	mu     sync.RWMutex
 	values map[m261points.PointKey]float64
+	// rev is the current Store revision — see Change.Rev's own doc
+	// comment. Guarded by mu, incremented exactly once per Set/SetBatch/
+	// Restore call (not once per Change — every Change one of those calls
+	// publishes shares that call's single new value).
+	rev uint64
 
 	iecIndex    map[IECAddr]m261points.PointKey
 	modbusIndex map[ModbusAddr]m261points.PointKey
@@ -128,6 +156,19 @@ func (s *Store) Get(key m261points.PointKey) (float64, bool) {
 func (s *Store) RLock()   { s.mu.RLock() }
 func (s *Store) RUnlock() { s.mu.RUnlock() }
 
+// CurrentRevision returns the Store's current revision — see Change.Rev's
+// own doc comment. Any Change published by a Set/SetBatch/Restore call
+// that *starts* after this method returns is guaranteed to carry a Rev
+// strictly greater than the value returned here (mu serializes the two);
+// this is what lets a caller establish "any Change with Rev <= this
+// snapshot was, or should be treated as if it was, already accounted for
+// as of this instant" — see iec104.Server.bumpHeartbeatGeneration.
+func (s *Store) CurrentRevision() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rev
+}
+
 // GetLocked is Get's variant for a caller that already holds RLock (via
 // Store.RLock) for a larger read transaction spanning more than one
 // point — does not itself acquire s.mu.
@@ -145,11 +186,13 @@ func (s *Store) Set(key m261points.PointKey, value float64) bool {
 		s.mu.Unlock()
 		return false
 	}
+	s.rev++
+	rev := s.rev
 	s.values[key] = value
-	changed := []Change{{Key: key, Value: value}}
+	changed := []Change{{Key: key, Value: value, Rev: rev}}
 	if rbKey, ok := s.readbackOf[key]; ok {
 		s.values[rbKey] = value
-		changed = append(changed, Change{Key: rbKey, Value: value})
+		changed = append(changed, Change{Key: rbKey, Value: value, Rev: rev})
 	}
 	s.mu.Unlock()
 
@@ -260,11 +303,13 @@ func (s *Store) SnapshotDevice(deviceAddr int) map[m261points.PointKey]float64 {
 // Snapshot(), which by construction has one entry per point already.
 func (s *Store) Restore(snapshot map[m261points.PointKey]float64) {
 	s.mu.Lock()
+	s.rev++
+	rev := s.rev
 	changed := make([]Change, 0, len(snapshot))
 	for k, v := range snapshot {
 		if cur, ok := s.values[k]; !ok || cur != v {
 			s.values[k] = v
-			changed = append(changed, Change{Key: k, Value: v})
+			changed = append(changed, Change{Key: k, Value: v, Rev: rev})
 		}
 	}
 	s.mu.Unlock()
@@ -304,13 +349,15 @@ func (s *Store) SetBatch(writes []KeyValue) bool {
 			return false
 		}
 	}
+	s.rev++
+	rev := s.rev
 	changed := make([]Change, 0, len(writes)*2)
 	for _, kv := range writes {
 		s.values[kv.Key] = kv.Value
-		changed = append(changed, Change{Key: kv.Key, Value: kv.Value})
+		changed = append(changed, Change{Key: kv.Key, Value: kv.Value, Rev: rev})
 		if rbKey, ok := s.readbackOf[kv.Key]; ok {
 			s.values[rbKey] = kv.Value
-			changed = append(changed, Change{Key: rbKey, Value: kv.Value})
+			changed = append(changed, Change{Key: rbKey, Value: kv.Value, Rev: rev})
 		}
 	}
 	s.mu.Unlock()
