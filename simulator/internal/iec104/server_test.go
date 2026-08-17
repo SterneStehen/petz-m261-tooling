@@ -1006,3 +1006,108 @@ func TestSlowWriteGetsDisconnectedInsteadOfHangingIndefinitely(t *testing.T) {
 		t.Error("server-side connection was not closed after a write hit its deadline -- a timed-out write must result in disconnecting the slow peer, not just failing this one call")
 	}
 }
+
+// TestClearAtomicWithHeartbeatRevisionBoundary is the sixth review
+// round's own follow-up finding: ClearLinkFaults used to flip hbFrozen to
+// false, release the lock protecting it, and only *afterward* call
+// store.Store.CurrentRevision() as a separate step to capture the
+// generation boundary. A physics tick's own heartbeat Set could complete
+// entirely in that gap — a heartbeat genuinely written *after* the clear
+// already took effect, whose own Rev would then be <= the boundary
+// captured a moment later, so admitHeartbeat would wrongly discard it as
+// stale. The first normal tick after a clear could be silently lost.
+//
+// Deterministically forces exactly this window open (rather than hoping
+// a stress loop finds it) via testDuringHeartbeatTransition, a hook
+// applyHeartbeatTransition calls while still holding the Store's own
+// write lock — after ClearLinkFaults' own state flip, before the write
+// lock (and therefore the ability to compute the *next* revision) is
+// released. Asserts a concurrent store.Store.Set genuinely blocks for as
+// long as the transition is held open there (not just "happens to
+// resolve in the right order") and, once released, that heartbeat is
+// delivered exactly once — proving the fix's own precise rule: every
+// Change with Rev <= boundary happened before the transition, every
+// Change with Rev > boundary happened after it, with no gap either can
+// fall into.
+func TestClearAtomicWithHeartbeatRevisionBoundary(t *testing.T) {
+	st := store.New()
+	heartbeatKey := m261points.PointKey{Device: "EMS", Slug: "ems_periodic_heartbeat_indicator"}
+	srv, addr := startServer(t, st)
+	coord := linkfault.NewCoordinator()
+	srv.SetLinkCoordinator(coord)
+	c := dialRaw(t, addr)
+	c.startDT()
+	time.Sleep(20 * time.Millisecond) // let STARTDT_CON settle before relying on "started"
+
+	srv.SetHeartbeatPause(0) // pause first, so ClearLinkFaults below has a real transition (paused -> unpaused) to apply
+
+	blockedInTransition := make(chan struct{})
+	releaseTransition := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseTransition) })
+	defer release() // unconditional, even on a failing assertion -- see the earlier fence tests' identical comment on why
+	testDuringHeartbeatTransition = func() {
+		close(blockedInTransition)
+		<-releaseTransition
+	}
+	defer func() { testDuringHeartbeatTransition = nil }()
+
+	clearDone := make(chan struct{})
+	go func() {
+		defer close(clearDone)
+		// Holds coord itself, matching how every real caller reaches
+		// ClearLinkFaults (via linkfault.Apply/ApplyCoordinated, which
+		// holds the same coordinator for the whole call) -- without this,
+		// a concurrent admitHeartbeat (triggered by the Set below) could
+		// acquire linkCoord and race bumpHeartbeatGeneration's own write
+		// to heartbeatGenBoundaryRev, which assumes (like production)
+		// that nothing else is running concurrently under linkCoord.
+		coord.Lock()
+		defer coord.Unlock()
+		srv.ClearLinkFaults()
+	}()
+	<-blockedInTransition // ClearLinkFaults has flipped hbFrozen and is now parked mid-transition, still holding the Store's write lock
+
+	// A concurrent physics-tick-style heartbeat write, attempted while the
+	// transition is still open, must not be able to commit yet -- it needs
+	// the same Store write lock applyHeartbeatTransition is holding.
+	setDone := make(chan struct{})
+	go func() {
+		defer close(setDone)
+		st.Set(heartbeatKey, 42)
+	}()
+
+	select {
+	case <-setDone:
+		t.Fatal("Store.Set completed while ClearLinkFaults' own transition was still open -- the Store write must wait for the atomic flip-plus-boundary-capture to finish")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: Set is blocked on the Store's own write lock.
+	}
+
+	release() // let the transition finish (capturing the boundary), which also unblocks the waiting Set
+	<-clearDone
+	<-setDone
+
+	// The heartbeat (42) could only have committed strictly *after* the
+	// clear's boundary was captured (it was blocked until then) -- it is a
+	// genuine post-clear event and must be delivered exactly once.
+	var got []float32
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c.nc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		asdu, isIFrame, more := c.tryNextI()
+		if !more {
+			break
+		}
+		if !isIFrame || asdu[0] != typeMMENC1 || asdu[2] != cotSpontaneous {
+			continue
+		}
+		ioa := int(asdu[6]) | int(asdu[7])<<8 | int(asdu[8])<<16
+		if ioa != heartbeatIOA {
+			continue
+		}
+		got = append(got, decodeFloat32(asdu[9:13]))
+	}
+	if len(got) != 1 || got[0] != 42 {
+		t.Errorf("post-clear heartbeat frames = %v, want exactly [42] -- a heartbeat that committed during the clear's own atomic transition must be delivered exactly once, never lost", got)
+	}
+}

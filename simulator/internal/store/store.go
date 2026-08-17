@@ -169,6 +169,35 @@ func (s *Store) CurrentRevision() uint64 {
 	return s.rev
 }
 
+// WithCurrentRevision holds the Store's own *write* lock for the
+// duration of fn and returns the revision fn observed — sixth-review-
+// round follow-up: CurrentRevision alone is only atomic with respect to
+// Set/SetBatch/Restore *by itself*; a caller that needs some other state
+// transition of its own (not a Store mutation) to be linearized against
+// the revision counter — "everything before this instant is Rev <= N,
+// everything after is Rev > N" — cannot get that by calling
+// CurrentRevision() as a *separate* step after its own transition,
+// because a Set can complete entirely in the gap between the two,
+// landing at the wrong side of the boundary the caller captures a moment
+// later. Running fn while still holding the write lock closes that gap:
+// no Set/SetBatch/Restore can even begin (they need this same lock)
+// until fn returns, so every one of them is provably either fully
+// complete before fn started (Rev <= the value returned here) or entirely
+// after (Rev > it) — never straddling fn's own transition.
+//
+// fn must never call back into the Store (Get/Set/etc. all need the same
+// non-reentrant mu). See iec104.Server.applyHeartbeatTransition for the
+// motivating case: a heartbeat pause/clear transition needs exactly this
+// atomicity against a concurrent physics tick's own heartbeat Set, or a
+// tick landing in the old two-step gap could be permanently misclassified
+// as having happened on the wrong side of the transition.
+func (s *Store) WithCurrentRevision(fn func(currentRev uint64)) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn(s.rev)
+	return s.rev
+}
+
 // GetLocked is Get's variant for a caller that already holds RLock (via
 // Store.RLock) for a larger read transaction spanning more than one
 // point — does not itself acquire s.mu.

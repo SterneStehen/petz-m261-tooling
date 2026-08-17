@@ -118,13 +118,53 @@ func (s *Server) enqueueOrDisconnect(conn *clientConn, msg hbMsg) bool {
 	}
 }
 
-// bumpHeartbeatGeneration is SetHeartbeatPause/ClearLinkFaults' own
-// fencing step (see linkstate.go): records the current Store revision as
-// the new generation boundary (admitHeartbeat's own c.Rev <=
-// heartbeatGenBoundaryRev check) and enqueues a fresh barrier into every
-// currently open connection's hbQueue, recording its ack channel for a
-// later FenceHeartbeat call to wait on. Must be called while linkCoord is
-// already held (both callers only ever run from within Apply/
+// applyHeartbeatTransition is SetHeartbeatPause/ClearLinkFaults' shared
+// implementation (linkstate.go): runs fn (the actual link-state field
+// flip, e.g. hbFrozen/hbValue) and captures the generation boundary as
+// *one* atomic transaction against the Store's own revision counter
+// (store.Store.WithCurrentRevision), then bumps the fencing generation
+// with that boundary.
+//
+// Follow-up to the sixth review round's own fix: bumpHeartbeatGeneration
+// used to call store.Store.CurrentRevision() as a *separate* step, after
+// fn had already run and released whatever lock protected it. A physics
+// tick's own heartbeat Set could complete entirely in that gap — the
+// resulting Change's Rev would then be <= the boundary captured a moment
+// later (a Set that clearly happened *after* the transition become
+// externally visible, e.g. after ClearLinkFaults's own hbFrozen=false),
+// so admitHeartbeat would wrongly discard a genuine post-transition
+// heartbeat as stale. Running fn *inside* WithCurrentRevision's own
+// write-lock hold closes the gap: no Set/SetBatch/Restore can complete
+// (or even start) while fn is running, so the boundary this captures is
+// provably never split by a concurrent Set landing on the wrong side of
+// it.
+func (s *Server) applyHeartbeatTransition(fn func()) {
+	boundary := s.store.WithCurrentRevision(func(uint64) {
+		fn()
+		if testDuringHeartbeatTransition != nil {
+			testDuringHeartbeatTransition()
+		}
+	})
+	s.bumpHeartbeatGeneration(boundary)
+}
+
+// testDuringHeartbeatTransition, when non-nil, runs from within
+// applyHeartbeatTransition while the Store's write lock is still held —
+// after fn's own state flip, before the lock is released — the exact
+// seam a test needs to hold open to prove a concurrent store.Store.Set
+// genuinely blocks until the transition finishes, rather than being able
+// to land in a gap between the flip and the boundary capture. Always nil
+// in production; never set outside a test.
+var testDuringHeartbeatTransition func()
+
+// bumpHeartbeatGeneration is applyHeartbeatTransition's own fencing step:
+// records boundaryRev (already captured atomically against the Store's
+// revision counter — see applyHeartbeatTransition) as the new generation
+// boundary (admitHeartbeat's own c.Rev <= heartbeatGenBoundaryRev check)
+// and enqueues a fresh barrier into every currently open connection's
+// hbQueue, recording its ack channel for a later FenceHeartbeat call to
+// wait on. Must be called while linkCoord is already held (both
+// SetHeartbeatPause and ClearLinkFaults only ever run from within Apply/
 // ApplyCoordinated's own coord.Lock hold) — this is what gives the
 // boundary and the barrier the same ordering guarantee: any admitHeartbeat
 // call that already started (and is therefore either already fully
@@ -132,8 +172,8 @@ func (s *Server) enqueueOrDisconnect(conn *clientConn, msg hbMsg) bool {
 // represented ahead of this barrier in every connection's queue, or will
 // see the new boundary/paused state once it gets its turn; nothing can
 // straddle the two.
-func (s *Server) bumpHeartbeatGeneration() {
-	s.heartbeatGenBoundaryRev = s.store.CurrentRevision()
+func (s *Server) bumpHeartbeatGeneration(boundaryRev uint64) {
+	s.heartbeatGenBoundaryRev = boundaryRev
 
 	s.connMu.Lock()
 	acks := make([]chan struct{}, 0, len(s.conns))
