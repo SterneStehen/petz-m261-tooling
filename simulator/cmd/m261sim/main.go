@@ -133,6 +133,13 @@ func main() {
 	if _, err := physics.CheckedPace(*stepInterval, *speed); err != nil {
 		log.Fatalf("-physics-step %s / -speed %v: %v", *stepInterval, *speed, err)
 	}
+	readyTickInterval, _ := physics.CheckedPace(*stepInterval, *speed)
+	// Permit two normal paced intervals plus a small scheduler margin. The
+	// checked pace above guarantees this interval is finite and positive.
+	readyTickTimeout := time.Duration(math.MaxInt64)
+	if readyTickInterval <= (time.Duration(math.MaxInt64)-time.Second)/2 {
+		readyTickTimeout = readyTickInterval*2 + time.Second
+	}
 
 	// The simulator has exactly one model clock (AGENT-TASK §1.5),
 	// always a *clock.Fake — never clock.Real directly wired into
@@ -246,7 +253,7 @@ func main() {
 		NewEngine:       newEngine,
 		StartupInstant:  startupInstant,
 		PublicConfig:    publicConfigFrom(cfg),
-		Ready:           func() bool { return iec.Listening() && mb.Listening() },
+		Ready:           func() bool { return iec.Listening() && mb.Listening() && runner.TickHealthy(readyTickTimeout) },
 	})
 	if err := capi.Start(); err != nil {
 		log.Fatalf("control api: %v", err)

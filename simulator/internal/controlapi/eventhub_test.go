@@ -32,3 +32,15 @@ func TestEventHubExpiredHistoryRequiresResyncAndRecentHistoryReplays(t *testing.
 		t.Fatalf("recent replay: resync=%v replay=%+v", recent, replay)
 	}
 }
+
+func TestEventHubFreshClientDoesNotResyncAfterHistoryEviction(t *testing.T) {
+	h := newEventHub(2)
+	for i := 0; i < 4; i++ {
+		h.publish("fault", time.Time{}, nil, i)
+	}
+	_, replay, resync, unsubscribe := h.subscribe(0)
+	defer unsubscribe()
+	if resync || len(replay) != 2 || replay[0].ID != 3 || replay[1].ID != 4 {
+		t.Fatalf("fresh client: resync=%v replay=%+v", resync, replay)
+	}
+}

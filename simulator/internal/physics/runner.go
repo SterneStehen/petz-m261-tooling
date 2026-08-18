@@ -46,6 +46,10 @@ type Runner struct {
 	commands *commands.Processor
 	last     time.Time
 	writes   []store.KeyValue // scratch buffer, protected by mu
+	// lastWallTickUnixNano is an operational liveness signal only. It is
+	// intentionally separate from the injected model clock, which may be
+	// frozen while the process itself remains healthy.
+	lastWallTickUnixNano int64
 
 	gate *appgate.Gate // see SetGate
 
@@ -163,6 +167,7 @@ func (r *Runner) Tick() {
 // step assumes r.mu is already held (Tick's caller, or Reset's own
 // writeState below via NewRunner's construction-time call pattern).
 func (r *Runner) step(dt time.Duration) {
+	atomic.StoreInt64(&r.lastWallTickUnixNano, time.Now().UnixNano())
 	state := r.engine.State() // this tick's starting BMS headroom/SoC, before Step
 	activePower, reactivePower, meterDirectionInverted := r.commands.ResolveDispatch(
 		r.clock.Now(), state.MaxChargeableKW, state.MaxDischargeableKW, state.SoCPercent,
@@ -182,6 +187,17 @@ func (r *Runner) step(dt time.Duration) {
 
 	r.engine.Step(dt, activePower, reactivePower)
 	r.writeState()
+}
+
+// TickHealthy reports whether the physics engine has completed a model tick
+// recently enough for an operational readiness probe. It does not affect the
+// deterministic model clock or any physics behaviour.
+func (r *Runner) TickHealthy(maxAge time.Duration) bool {
+	last := atomic.LoadInt64(&r.lastWallTickUnixNano)
+	if last == 0 || maxAge <= 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, last)) <= maxAge
 }
 
 // Reset replaces the running Engine with a fresh one (Task 7 item 7:

@@ -745,3 +745,21 @@ func TestPacedRunDoesNotRunawayOnHugeFiniteSpeed(t *testing.T) {
 		t.Errorf("heartbeat = %v after ~50ms with an underflowing speed, want 0 (PacedRun must refuse to run away, not tick at an uncontrolled ~1ns cadence)", hb)
 	}
 }
+
+func TestTickHealthyRequiresRecentCompletedTick(t *testing.T) {
+	st := store.New()
+	clk := clock.NewFake(time.Now())
+	r := NewRunner(New(DefaultParams(), 50), st, clk, newTestProcessor(t, st, clk))
+	if r.TickHealthy(time.Second) {
+		t.Fatal("new runner reported a physics tick before it had stepped")
+	}
+	if err := r.TickOnce(time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if !r.TickHealthy(time.Second) {
+		t.Fatal("runner did not report its just-completed tick as healthy")
+	}
+	if r.TickHealthy(-time.Second) {
+		t.Fatal("negative liveness interval was accepted")
+	}
+}
