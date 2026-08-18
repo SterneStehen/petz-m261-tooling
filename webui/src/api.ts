@@ -3,7 +3,7 @@ export type Point = PointValue & { name_raw: string; class: "alarm" | "telemetry
 export type Status = { model_time: string; ready: boolean; configuration: Record<string, { value: unknown; unconfirmed: boolean }> };
 export type Snapshot = { revision: number; model_time: string; points: PointValue[] };
 export type SSEPayload = { id: number; type: string; timestamp: string; revision: number | null; payload: { points?: PointValue[]; changes?: PointValue[]; from_revision?: number; [key: string]: unknown } };
-export type Diagnostic = { code: string; PointKey: { Device: string; Slug: string }; AcceptedValue: number; SelectedMode: string };
+export type Diagnostic = { code: string; point_key: { Device: string; Slug: string }; accepted_value: number; selected_mode?: string };
 export type CommandResponse = { device: string; slug: string; accepted_value: number; readback: number; diagnostic?: Diagnostic };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {

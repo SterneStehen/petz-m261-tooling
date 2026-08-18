@@ -326,3 +326,43 @@ func TestSubscribeBatchesDeliversWholeMutationAndSnapshotBoundary(t *testing.T) 
 		}
 	}
 }
+
+// TestBatchSubscriberDetectsOneForcedDrop fills the bounded queue before
+// publishing exactly one more mutation. A later batch then has a revision
+// gap; no queued batch can contain a partial mutation because publication is
+// one channel send per ChangeBatch.
+func TestBatchSubscriberDetectsOneForcedDrop(t *testing.T) {
+	s := New()
+	ch, unsubscribe := s.SubscribeBatches()
+	defer unsubscribe()
+	keyA := m261points.PointKey{Device: "EMS", Slug: "desired_active_power_kw"}
+	keyB := m261points.PointKey{Device: "BMS", Slug: "soc"}
+
+	for i := 0; i < subscriberBufferSize; i++ {
+		if !s.SetBatch([]KeyValue{{Key: keyA, Value: float64(i)}, {Key: keyB, Value: float64(i)}}) {
+			t.Fatal("SetBatch failed while filling subscriber queue")
+		}
+	}
+	if !s.SetBatch([]KeyValue{{Key: keyA, Value: 1000}, {Key: keyB, Value: 1000}}) {
+		t.Fatal("SetBatch failed for forced drop")
+	}
+
+	var last uint64
+	for i := 0; i < subscriberBufferSize; i++ {
+		batch := <-ch
+		if len(batch.Changes) != 2 {
+			t.Fatalf("batch %d exposed %d of 2 changes", batch.Revision, len(batch.Changes))
+		}
+		if i > 0 && batch.Revision != last+1 {
+			t.Fatalf("unexpected gap before forced drop: got %d after %d", batch.Revision, last)
+		}
+		last = batch.Revision
+	}
+	if !s.Set(keyA, 2000) {
+		t.Fatal("Set failed after draining queue")
+	}
+	afterDrop := <-ch
+	if afterDrop.Revision != last+2 {
+		t.Fatalf("revision after forced drop = %d after %d, want exactly one missing batch", afterDrop.Revision, last)
+	}
+}
