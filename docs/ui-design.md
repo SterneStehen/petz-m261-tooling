@@ -31,8 +31,9 @@ time, a plain-text connection status, and this three-item navigation.
 ### Typography
 
 Use the local system UI stack: `Inter, ui-sans-serif, system-ui, -apple-system,
-"Segoe UI", sans-serif`. No remote font request is permitted. Telemetry uses
-tabular numerals (`font-variant-numeric: tabular-nums`).
+"Segoe UI", sans-serif`. Inter `.woff2` files are bundled as local application
+assets; no Google Fonts, CDN, or remote font request is permitted. Telemetry
+uses tabular numerals (`font-variant-numeric: tabular-nums`).
 
 | Token | Value | Use |
 |---|---:|---|
@@ -58,6 +59,11 @@ tabular numerals (`font-variant-numeric: tabular-nums`).
 | `red` | `#B42318` | Alarm, rejected, dangerous action |
 | `gray` | `#667085` | Offline, unavailable, disabled |
 
+`amber` text and its icon are used only inside a white `surface` status chip,
+where their 4.64:1 contrast passes WCAG AA. They are never rendered as bare
+text directly on the `canvas`; an `Unconfirmed` badge always has its own white
+surface, quiet `line` border, text label, and `!` icon.
+
 Colour never communicates a state by itself. Every chip and banner includes
 plain language plus an icon or symbol: for example, `● Connected`,
 `! Unconfirmed`, and `× Alarm`.
@@ -71,6 +77,10 @@ plain language plus an icon or symbol: for example, `● Connected`,
 | `radius.control` | 10 px |
 | `shadow.surface` | `0 1px 2px rgb(16 24 40 / 6%), 0 8px 24px rgb(16 24 40 / 5%)` |
 | `focus` | 3 px `#2367D1` outer ring, 2 px offset |
+| `error` | `red` text/icon on `#FFF5F4` surface, `red` left accent |
+| `loading` | `surface.muted` placeholder with 150 ms opacity transition |
+| `disabled` | `surface.muted`, `ink.muted`, 55% opacity, `not-allowed` cursor |
+| `unconfirmed` | White status chip, `amber` text/icon, `line` border, `! Unconfirmed` label |
 | `desktop` | 1280 px reference width |
 | `tablet` | 768 px breakpoint |
 | `mobile` | 390 px reference width |
@@ -258,4 +268,3 @@ validation, pending indicator, and a full-width submit control.
 - The compiled static bundle is embedded in the Go binary and served from the
   same loopback control-API port. API routes always take precedence over
   static routing.
-
