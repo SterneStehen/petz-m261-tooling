@@ -22,7 +22,7 @@ generate:
 webui:
 	cd webui && npm ci && npm run build
 
-build: webui
+build:
 	$(GO) build -o $(BINARY) ./simulator/cmd/m261sim
 
 # go vet + go test -race, then the Python suite. Most of the Python suite
@@ -30,7 +30,7 @@ build: webui
 # absent (see tests/conftest.py); the Go half never does — gen/go/
 # m261points is committed, so the simulator builds and its own tests run
 # without ever touching catalog/ or the register maps.
-test: webui
+test:
 	$(GO) vet ./...
 	$(GO) test ./... -race
 	$(PYTHON) -m pytest tests/ -q
