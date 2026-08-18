@@ -4,7 +4,7 @@ GO ?= go
 BIN_DIR := simulator/bin
 BINARY := $(BIN_DIR)/m261sim
 
-.PHONY: generate build test run validate lint clean
+.PHONY: generate webui build test run validate lint clean
 
 # Task 3 acceptance: "make generate regenerates everything from scratch,
 # git diff is empty" (see `validate`, below, for the automated check).
@@ -19,7 +19,10 @@ generate:
 	$(PYTHON) -m codegen.gen_docs
 
 # Task 8 item 2.
-build:
+webui:
+	cd webui && npm ci && npm run build
+
+build: webui
 	$(GO) build -o $(BINARY) ./simulator/cmd/m261sim
 
 # go vet + go test -race, then the Python suite. Most of the Python suite
@@ -27,7 +30,7 @@ build:
 # absent (see tests/conftest.py); the Go half never does — gen/go/
 # m261points is committed, so the simulator builds and its own tests run
 # without ever touching catalog/ or the register maps.
-test:
+test: webui
 	$(GO) vet ./...
 	$(GO) test ./... -race
 	$(PYTHON) -m pytest tests/ -q
@@ -45,15 +48,15 @@ run: build
 # only artifacts, not committed output) — there is nothing for git to
 # compare there, by design; see README.md for why most CI environments
 # can't run this target at all without the register maps.
-validate: generate
-	@git diff --exit-code -- gen/ || \
-		(echo "make generate produced a diff against what's committed -- run 'make generate' and commit the result" && exit 1)
-	@if [ -n "$$(git status --porcelain -- gen/)" ]; then \
-		echo "make generate produced new untracked/deleted files under gen/"; \
-		git status --porcelain -- gen/; \
+validate: generate webui
+	@git diff --exit-code -- gen/ webui/dist/ || \
+		(echo "make generate or webui produced a diff against committed output" && exit 1)
+	@if [ -n "$$(git status --porcelain -- gen/ webui/dist/)" ]; then \
+		echo "make generate or webui produced untracked/deleted output"; \
+		git status --porcelain -- gen/ webui/dist/; \
 		exit 1; \
 	fi
-	@echo "make generate: no diff"
+	@echo "generated catalog and web UI: no diff"
 
 # go vet/gofmt are always enforced; mypy is informational only for now —
 # catalog/ has a small number of pre-existing findings (missing type

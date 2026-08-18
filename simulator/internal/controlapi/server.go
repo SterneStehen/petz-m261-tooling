@@ -6,11 +6,14 @@
 package controlapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -23,6 +26,7 @@ import (
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/physics"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/scenario"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
+	"github.com/SterneStehen/petz-m261-tooling/webui"
 )
 
 // Config bundles every dependency the control API's handlers need.
@@ -114,7 +118,8 @@ func New(cfg Config) *Server {
 	mux.HandleFunc("/api/v1/demo/prepare", s.handleV1DemoPrepare)
 	mux.HandleFunc("/api/v1/health/live", s.handleV1Live)
 	mux.HandleFunc("/api/v1/health/ready", s.handleV1Ready)
-	mux.HandleFunc("/", s.handleNotFound) // every unregistered path — a JSON 404, not net/http's plain-text default
+	mux.HandleFunc("/api/", s.handleNotFound) // API typos must never fall through to the SPA shell.
+	mux.HandleFunc("/", s.handleWebUI)
 
 	s.hs = &http.Server{Handler: mux}
 	return s
@@ -143,6 +148,42 @@ func (s *Server) listeningReady() bool { return s.listening.Load() }
 
 func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "not_found", fmt.Errorf("no such endpoint: %s %s", r.Method, r.URL.Path))
+}
+
+// handleWebUI serves Task 10's embedded production bundle. Known static
+// assets are returned as files; all other browser routes receive index.html
+// so navigation remains client-side. API routes are registered before this
+// catch-all and /api/ has an explicit JSON 404 above.
+func (s *Server) handleWebUI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", fmt.Errorf("%s not allowed on %s", r.Method, r.URL.Path))
+		return
+	}
+	bundle, err := fs.Sub(webui.Assets, "dist")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "webui_unavailable", err)
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	if path == "" {
+		path = "index.html"
+	}
+	if _, err := fs.Stat(bundle, path); err != nil {
+		path = "index.html"
+	}
+	if path == "index.html" {
+		data, err := fs.ReadFile(bundle, path)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "webui_unavailable", err)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		http.ServeContent(w, r, path, time.Time{}, bytes.NewReader(data))
+		return
+	}
+	served := r.Clone(r.Context())
+	served.URL.Path = "/" + path
+	http.FileServer(http.FS(bundle)).ServeHTTP(w, served)
 }
 
 // --- JSON helpers -----------------------------------------------------

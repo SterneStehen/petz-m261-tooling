@@ -245,6 +245,7 @@ func (s *Server) handleV1Events(w http.ResponseWriter, r *http.Request) {
 	ticker := time.NewTicker(telemetryWindow)
 	defer ticker.Stop()
 	pending := make(map[m261points.PointKey]float64)
+	var pendingStartRevision uint64
 	var pendingRevision uint64
 	flushTelemetry := func() {
 		if len(pending) == 0 {
@@ -258,7 +259,7 @@ func (s *Server) handleV1Events(w http.ResponseWriter, r *http.Request) {
 		sort.Slice(changes, func(i, j int) bool {
 			return changes[i].Device == changes[j].Device && changes[i].Slug < changes[j].Slug || changes[i].Device < changes[j].Device
 		})
-		s.writeSSE(w, sseEvent{ID: id, Type: "telemetry", Timestamp: s.cfg.Clock.Now(), Revision: &pendingRevision, Payload: map[string]any{"changes": changes}})
+		s.writeSSE(w, sseEvent{ID: id, Type: "telemetry", Timestamp: s.cfg.Clock.Now(), Revision: &pendingRevision, Payload: map[string]any{"from_revision": pendingStartRevision, "changes": changes}})
 		flusher.Flush()
 		clear(pending)
 	}
@@ -284,6 +285,9 @@ func (s *Server) handleV1Events(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			last = batch.Revision
+			if len(pending) == 0 {
+				pendingStartRevision = batch.Revision
+			}
 			for _, c := range batch.Changes {
 				pending[c.Key] = c.Value
 			}

@@ -373,12 +373,24 @@ func readSSEEvent(t *testing.T, reader *bufio.Reader) (string, []byte) {
 
 func TestUnknownRouteIsJSON404(t *testing.T) {
 	h := newHarness(t)
-	resp, body := h.do(t, "GET", "/nope", nil)
+	resp, body := h.do(t, "GET", "/api/v1/nope", nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404, body = %s", resp.StatusCode, body)
 	}
 	if e := decodeError(t, body); e.Error.Code != "not_found" {
 		t.Errorf("error.code = %q, want not_found (body: %s)", e.Error.Code, body)
+	}
+}
+
+func TestEmbeddedWebUIAndAPIRouting(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do(t, http.MethodGet, "/", nil)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "M261 Simulator Console") {
+		t.Fatalf("web UI status=%d body=%s", resp.StatusCode, body)
+	}
+	resp, body = h.do(t, http.MethodGet, "/api/v1/status", nil)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+		t.Fatalf("API route was intercepted: status=%d content-type=%q body=%s", resp.StatusCode, resp.Header.Get("Content-Type"), body)
 	}
 }
 

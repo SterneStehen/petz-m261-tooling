@@ -72,7 +72,7 @@ components:
         type: {type: string, enum: [snapshot, telemetry, fault, scenario_step, reset, diagnostic, resync_required]}
         timestamp: {type: string, format: date-time}
         revision: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
-        payload: {type: object}
+        payload: {type: object, description: 'Telemetry payload includes from_revision and coalesced point changes.'}
     Error:
       type: object
       required: [error]

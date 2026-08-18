@@ -1,20 +1,11 @@
-# Keep the build context small and avoid ever sending private materials
-# to the Docker daemon in the first place — the Dockerfile only COPYs
-# go.mod/go.sum, gen/, simulator/, simulator/config/m261sim.yaml, and
-# scenarios/, but everything else in the repo root is still part of the
-# build context unless excluded here.
-.git/
-.venv/
-.mypy_cache/
-.pytest_cache/
-__pycache__/
-*.pyc
-
-m261-registermap/
-catalog/
-docs/
-
-tests/
-codegen/
-
-simulator/bin/
+.git
+.venv
+m261-registermap
+catalog/point_catalog.json
+catalog/validation_report.md
+webui/node_modules
+webui/src
+webui/package-lock.json
+webui/package.json
+webui/tsconfig.json
+webui/vite.config.ts

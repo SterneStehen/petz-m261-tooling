@@ -18,6 +18,8 @@ RUN go mod download
 
 COPY gen/ gen/
 COPY simulator/ simulator/
+COPY webui/embed.go webui/embed.go
+COPY webui/dist/ webui/dist/
 RUN CGO_ENABLED=0 go build -trimpath -o /out/m261sim ./simulator/cmd/m261sim
 
 # --- runtime stage -------------------------------------------------------
