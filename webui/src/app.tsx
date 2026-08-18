@@ -5,6 +5,12 @@ import { useSimulator } from "./use-simulator";
 
 type Page = "overview" | "control" | "lab";
 type Toast = { tone: "success" | "error"; text: string } | null;
+type Language = "en" | "uk";
+
+const uiText: Record<Language, Record<string, string>> = {
+  en: { overview: "Overview / Demo", control: "Control", lab: "Test Lab", connected: "Connected", offline: "Offline", connecting: "Connecting", loadingTime: "Loading time…", language: "Українська" },
+  uk: { overview: "Огляд / Демонстрація", control: "Керування", lab: "Тестова лабораторія", connected: "Підключено", offline: "Поза мережею", connecting: "Підключення", loadingTime: "Завантаження часу…", language: "English" }
+};
 
 const point = (values: Record<string, number>, device: string, slug: string) => values[`${device}/${slug}`] ?? 0;
 const number = (value: number, digits = 1) => new Intl.NumberFormat("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits }).format(value);
@@ -28,7 +34,14 @@ function MiniChart({ title, value, unit, tone }: { title: string; value: number;
 export function App() {
   const simulator = useSimulator();
   const [page, setPage] = useState<Page>("overview");
+  const [language, setLanguage] = useState<Language>(() => (localStorage.getItem("m261-language") === "uk" ? "uk" : "en"));
   const [toast, setToast] = useState<Toast>(null);
+  const text = uiText[language];
+  const switchLanguage = () => setLanguage((current) => {
+    const next = current === "en" ? "uk" : "en";
+    localStorage.setItem("m261-language", next);
+    return next;
+  });
   const notify = (next: Toast) => { setToast(next); if (next) window.setTimeout(() => setToast(null), 5000); };
   useEffect(() => {
     if (!simulator.lastEvent) return;
@@ -41,8 +54,8 @@ export function App() {
     notify({ tone: simulator.lastEvent.type === "fault" ? "error" : "success", text: messages[simulator.lastEvent.type] });
   }, [simulator.lastEvent?.id]);
   const props = { ...simulator, notify };
-  return <div className="app-shell">
-    <header className="topbar"><div className="brand">M261 <b>SIMULATOR</b></div><nav aria-label="Console"><button className={page === "overview" ? "is-active" : ""} onClick={() => setPage("overview")}>Overview / Demo</button><button className={page === "control" ? "is-active" : ""} onClick={() => setPage("control")}>Control</button><button className={page === "lab" ? "is-active" : ""} onClick={() => setPage("lab")}>Test Lab</button></nav><div className="topbar-status"><span>{simulator.modelTime ? new Date(simulator.modelTime).toLocaleString() : "Loading time…"}</span><Chip tone={simulator.stream === "connected" ? "good" : simulator.stream === "offline" ? "offline" : "warning"}>{simulator.stream === "connected" ? "Connected" : simulator.stream === "offline" ? "Offline" : "Connecting"}</Chip></div></header>
+  return <div className="app-shell" lang={language}>
+    <header className="topbar"><div className="brand">M261 <b>SIMULATOR</b></div><nav aria-label="Console"><button className={page === "overview" ? "is-active" : ""} onClick={() => setPage("overview")}>{text.overview}</button><button className={page === "control" ? "is-active" : ""} onClick={() => setPage("control")}>{text.control}</button><button className={page === "lab" ? "is-active" : ""} onClick={() => setPage("lab")}>{text.lab}</button></nav><div className="topbar-status"><span>{simulator.modelTime ? new Date(simulator.modelTime).toLocaleString() : text.loadingTime}</span><Chip tone={simulator.stream === "connected" ? "good" : simulator.stream === "offline" ? "offline" : "warning"}>{simulator.stream === "connected" ? text.connected : simulator.stream === "offline" ? text.offline : text.connecting}</Chip><button className="language-switch" onClick={switchLanguage} aria-label="Switch interface language">{text.language}</button></div></header>
     <main>{page === "overview" && <Overview {...props} />}{page === "control" && <Control {...props} />}{page === "lab" && <TestLab {...props} />}</main>
     {toast && <div className={`toast toast--${toast.tone}`} role="status">{toast.text}</div>}
   </div>;
