@@ -6,8 +6,8 @@ export default defineConfig({
   expect: { timeout: 10_000 },
   use: { baseURL: "http://127.0.0.1:18081", trace: "retain-on-failure" },
   projects: [
-    { name: "desktop", use: { browserName: "chromium", ...devices["Desktop Chrome"], viewport: { width: 1280, height: 900 } } },
-    { name: "mobile", use: { browserName: "chromium", ...devices["iPhone 13"] } }
+    { name: "desktop", browserName: "chromium", use: { ...devices["Desktop Chrome"], viewport: { width: 1280, height: 900 } } },
+    { name: "mobile", browserName: "chromium", use: { ...devices["iPhone 13"] } }
   ],
   webServer: {
     command: "go run ./simulator/cmd/m261sim -modbus-addr=127.0.0.1:1502 -iec104-addr=127.0.0.1:12404 -control-addr=127.0.0.1:18081",
