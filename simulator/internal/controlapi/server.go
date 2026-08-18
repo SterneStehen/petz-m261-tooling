@@ -92,6 +92,17 @@ type Server struct {
 
 func New(cfg Config) *Server {
 	s := &Server{cfg: cfg, validDevices: make(map[string]bool), events: newEventHub(256)}
+	if cfg.ScenarioRunner != nil {
+		cfg.ScenarioRunner.SetStepObserver(func(event scenario.StepEvent) {
+			revision := cfg.Store.CurrentRevision()
+			s.events.publish("scenario_step", cfg.Clock.Now(), &revision, map[string]any{
+				"scenario": event.Scenario,
+				"index":    event.Index,
+				"at":       event.At.String(),
+				"action":   event.Action,
+			})
+		})
+	}
 	for key := range m261points.Points {
 		s.validDevices[key.Device] = true
 	}

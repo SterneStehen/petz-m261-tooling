@@ -20,10 +20,10 @@ const DiagCodeAcceptedButUnsupported = "accepted_but_unsupported"
 // for Demand Control/Load Tracking (the mode that won priority but has no
 // modeled effect); it's the empty string for Trip/Clear Protection.
 type Diagnostic struct {
-	Code          string
-	PointKey      m261points.PointKey
-	AcceptedValue float64
-	SelectedMode  string
+	Code          string              `json:"code"`
+	PointKey      m261points.PointKey `json:"point_key"`
+	AcceptedValue float64             `json:"accepted_value"`
+	SelectedMode  string              `json:"selected_mode,omitempty"`
 }
 
 // recordDiagnostic stores d, keyed by PointKey — a point's latest

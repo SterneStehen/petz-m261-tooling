@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
 type v1PointValue struct {
@@ -99,9 +100,18 @@ func (s *Server) handleV1Commands(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "command_rejected", err)
 		return
 	}
-	// Store.Set mirrors a setpoint to its IEC-104 readback twin atomically;
-	// the accepted engineering value is therefore the authoritative readback.
-	readback := *req.Value
+	meta, ok := m261points.Points[key]
+	if !ok || meta.ReadbackIEC104Addr == nil {
+		writeError(w, http.StatusInternalServerError, "readback_unavailable", fmt.Errorf("no readback point for %s/%s", req.Device, req.Slug))
+		return
+	}
+	// Return the persisted mirror, not an echo of the request. The Store's
+	// readback point is the authoritative command result.
+	_, readback, ok := s.cfg.Store.GetByIEC(store.IECAddr{CommonAddr: meta.DeviceAddr, ObjAddr: *meta.ReadbackIEC104Addr})
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "readback_unavailable", fmt.Errorf("readback point for %s/%s is absent from Store", req.Device, req.Slug))
+		return
+	}
 	response := map[string]any{"device": req.Device, "slug": req.Slug, "accepted_value": *req.Value, "readback": readback}
 	if d, ok := s.cfg.Processor.DiagnosticFor(key); ok {
 		response["diagnostic"] = d

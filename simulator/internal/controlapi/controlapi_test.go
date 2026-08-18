@@ -235,6 +235,17 @@ func TestV1CatalogStateAndCommands(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("command status = %d: %s", resp.StatusCode, body)
 	}
+	var command struct {
+		Readback float64 `json:"readback"`
+	}
+	if err := json.Unmarshal(body, &command); err != nil {
+		t.Fatalf("decode command response: %v", err)
+	}
+	meta := m261points.Points[m261points.PointKey{Device: "EMS", Slug: "set_operating_mode"}]
+	_, storedReadback, ok := h.store.GetByIEC(store.IECAddr{CommonAddr: meta.DeviceAddr, ObjAddr: *meta.ReadbackIEC104Addr})
+	if !ok || command.Readback != storedReadback {
+		t.Fatalf("command readback = %v; Store mirror = %v, present=%t", command.Readback, storedReadback, ok)
+	}
 	resp, body = h.do(t, http.MethodPost, "/api/v1/commands", map[string]any{"device": "BMS", "slug": "soc", "value": 2})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("non-setpoint status = %d: %s", resp.StatusCode, body)
@@ -242,6 +253,55 @@ func TestV1CatalogStateAndCommands(t *testing.T) {
 	resp, body = h.do(t, http.MethodPost, "/api/v1/demo/prepare", nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("demo prepare status = %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestV1EventsPublishesScenarioSteps(t *testing.T) {
+	h := newHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.baseURL+"/api/v1/events?initial_state=true", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	if typ, _ := readSSEEvent(t, reader); typ != "snapshot" {
+		t.Fatalf("first SSE event=%q, want snapshot", typ)
+	}
+	_, _ = h.do(t, http.MethodPost, "/scenario/load", map[string]any{"yaml": `
+name: SSE progress
+clock: {start: "2026-08-12T00:00:00Z", speed: 100}
+steps:
+  - at: 0s
+    expect: {device: BMS, point: soc, min: 0}
+`})
+	start, startBody := h.do(t, http.MethodPost, "/scenario/start", nil)
+	if start.StatusCode != http.StatusNoContent {
+		t.Fatalf("scenario start=%d: %s", start.StatusCode, startBody)
+	}
+	got := make(chan struct {
+		typ  string
+		data []byte
+	}, 1)
+	go func() {
+		typ, data := readSSEEvent(t, reader)
+		got <- struct {
+			typ  string
+			data []byte
+		}{typ, data}
+	}()
+	select {
+	case event := <-got:
+		if event.typ != "scenario_step" || !strings.Contains(string(event.data), `"action":"expect"`) {
+			t.Fatalf("scenario SSE event=%q data=%s", event.typ, event.data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for scenario_step SSE event")
 	}
 }
 

@@ -131,7 +131,8 @@ type Runner struct {
 	iecTarget     linkfault.Target
 	modbusTarget  linkfault.Target
 
-	linkCoord *linkfault.Coordinator // see SetLinkCoordinator
+	linkCoord    *linkfault.Coordinator // see SetLinkCoordinator
+	stepObserver func(StepEvent)
 }
 
 // SetLinkCoordinator wires the shared link-fault coordinator (package
@@ -143,6 +144,15 @@ type Runner struct {
 // nil (never calling SetLinkCoordinator) disables coordination, same as
 // every other gated type in this codebase.
 func (r *Runner) SetLinkCoordinator(c *linkfault.Coordinator) { r.linkCoord = c }
+
+// SetStepObserver installs the optional, non-authoritative progress hook used
+// by presentation layers. The runner itself remains independent of those
+// layers and keeps deterministic execution if no observer is installed.
+func (r *Runner) SetStepObserver(observer func(StepEvent)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stepObserver = observer
+}
 
 func NewRunner(
 	st *store.Store,
@@ -504,8 +514,28 @@ func (r *Runner) run(done, stop chan struct{}) {
 		}
 
 		r.mu.Lock()
+		event := StepEvent{Scenario: r.scenario.Name, Index: r.cursor, At: step.At, Action: stepAction(step)}
 		r.cursor++
+		observer := r.stepObserver
 		r.mu.Unlock()
+		if observer != nil {
+			observer(event)
+		}
+	}
+}
+
+func stepAction(step Step) string {
+	switch {
+	case step.Write != nil:
+		return "write"
+	case step.Fault != nil:
+		return "fault"
+	case step.Expect != nil:
+		return "expect"
+	case step.Link != nil:
+		return "link"
+	default:
+		return "unknown"
 	}
 }
 

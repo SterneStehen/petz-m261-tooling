@@ -39,6 +39,17 @@ type Step struct {
 	Link   *LinkAction
 }
 
+// StepEvent is emitted after a scenario step has completed successfully.
+// Index is zero-based, matching Cursor before the runner advances it.
+// Observers are informational only: they must not mutate runner state or
+// block scenario execution.
+type StepEvent struct {
+	Scenario string
+	Index    int
+	At       time.Duration
+	Action   string
+}
+
 // WriteAction and FaultAction share a shape (a target point plus one
 // engineering-unit value) but are kept as distinct types rather than one
 // shared struct: they go through entirely different validation/execution
