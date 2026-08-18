@@ -68,6 +68,24 @@ func (f *fakeLinkTarget) ClearLinkFaults() {
 	f.cleared = true
 }
 func (f *fakeLinkTarget) FenceHeartbeat() {}
+func (f *fakeLinkTarget) ActiveLinkFaults() []linkfault.Mode {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var modes []linkfault.Mode
+	if f.drop {
+		modes = append(modes, linkfault.ModeDrop)
+	}
+	if f.hang {
+		modes = append(modes, linkfault.ModeHang)
+	}
+	if f.delay > 0 {
+		modes = append(modes, linkfault.ModeDelay)
+	}
+	if f.hbSet {
+		modes = append(modes, linkfault.ModeHeartbeatPause)
+	}
+	return modes
+}
 
 // linkTargetState is fakeLinkTarget's field values without its mutex --
 // fakeLinkTarget itself must never be copied by value (go vet's copylocks
@@ -335,12 +353,12 @@ func TestV1StatusReportsAndClearsLinkFault(t *testing.T) {
 	}
 	_, body = h.do(t, http.MethodGet, "/api/v1/status", nil)
 	var active struct {
-		LinkFaults map[string]string `json:"link_faults"`
+		LinkFaults map[string][]string `json:"link_faults"`
 	}
 	if err := json.Unmarshal(body, &active); err != nil {
 		t.Fatal(err)
 	}
-	if active.LinkFaults["modbus"] != "drop" {
+	if len(active.LinkFaults["modbus"]) != 1 || active.LinkFaults["modbus"][0] != "drop" {
 		t.Fatalf("link_faults=%v", active.LinkFaults)
 	}
 	resp, body = h.do(t, http.MethodPost, "/link/clear", map[string]any{"protocol": "modbus"})
@@ -354,6 +372,59 @@ func TestV1StatusReportsAndClearsLinkFault(t *testing.T) {
 	}
 	if len(active.LinkFaults) != 0 {
 		t.Fatalf("link_faults after clear=%v", active.LinkFaults)
+	}
+}
+
+func TestV1StatusClearsLinkFaultAfterReset(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do(t, http.MethodPost, "/link", map[string]any{"protocol": "modbus", "mode": "drop"})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("link=%d: %s", resp.StatusCode, body)
+	}
+	resp, body = h.do(t, http.MethodPost, "/reset", nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("reset=%d: %s", resp.StatusCode, body)
+	}
+	_, body = h.do(t, http.MethodGet, "/api/v1/status", nil)
+	var status struct {
+		LinkFaults map[string][]string `json:"link_faults"`
+	}
+	if err := json.Unmarshal(body, &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status.LinkFaults) != 0 {
+		t.Fatalf("link_faults after reset=%v", status.LinkFaults)
+	}
+}
+
+func TestV1StatusReportsScenarioLinkFault(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do(t, http.MethodPost, "/scenario/load", map[string]any{"yaml": "name: status link\nclock: {start: \"2026-08-12T00:00:00Z\", speed: 1000}\nsteps:\n  - at: 0s\n    link: {protocol: modbus, mode: drop}\n"})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("load=%d: %s", resp.StatusCode, body)
+	}
+	resp, body = h.do(t, http.MethodPost, "/scenario/start", nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("start=%d: %s", resp.StatusCode, body)
+	}
+	deadline := time.After(time.Second)
+	for h.scenarioRunner.Cursor() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("scenario did not execute link step")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	_, body = h.do(t, http.MethodGet, "/api/v1/status", nil)
+	var status struct {
+		LinkFaults map[string][]string `json:"link_faults"`
+	}
+	if err := json.Unmarshal(body, &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status.LinkFaults["modbus"]) != 1 || status.LinkFaults["modbus"][0] != "drop" {
+		t.Fatalf("link_faults=%v", status.LinkFaults)
 	}
 }
 

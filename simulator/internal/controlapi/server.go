@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -88,13 +87,11 @@ type Server struct {
 	ln           net.Listener
 	hs           *http.Server
 	events       *eventHub
-	linkMu       sync.RWMutex
-	linkModes    map[string]string
 	listening    atomic.Bool
 }
 
 func New(cfg Config) *Server {
-	s := &Server{cfg: cfg, validDevices: make(map[string]bool), events: newEventHub(256), linkModes: make(map[string]string)}
+	s := &Server{cfg: cfg, validDevices: make(map[string]bool), events: newEventHub(256)}
 	if cfg.ScenarioRunner != nil {
 		cfg.ScenarioRunner.SetStepObserver(func(event scenario.StepEvent) {
 			revision := cfg.Store.CurrentRevision()

@@ -23,6 +23,7 @@ func (f *fakeTarget) SetDelay(d time.Duration)    { f.delay = d }
 func (f *fakeTarget) SetHeartbeatPause(v float64) { f.hbValue, f.hbSet = v, true }
 func (f *fakeTarget) ClearLinkFaults()            { *f = fakeTarget{cleared: true} }
 func (f *fakeTarget) FenceHeartbeat()             {}
+func (f *fakeTarget) ActiveLinkFaults() []linkfault.Mode { return nil }
 
 func TestApplyTargetsIEC104Only(t *testing.T) {
 	iec, mb := &fakeTarget{}, &fakeTarget{}

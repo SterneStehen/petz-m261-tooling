@@ -68,6 +68,9 @@ type Target interface {
 	// spontaneous-transmission loop is the one path that actually needs
 	// this.
 	FenceHeartbeat()
+	// ActiveLinkFaults returns the currently applied modes. It is a
+	// read-only observation of the target's authoritative state.
+	ActiveLinkFaults() []Mode
 }
 
 // Protocol is a link fault's target: one of the two protocol servers, or

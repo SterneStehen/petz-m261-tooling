@@ -3,7 +3,6 @@ package controlapi
 import (
 	"encoding/json"
 	"fmt"
-	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
 	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/store"
 )
 
@@ -169,9 +169,15 @@ func (s *Server) handleV1Status(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	s.linkMu.RLock()
-	links := maps.Clone(s.linkModes)
-	s.linkMu.RUnlock()
+	links := map[string][]linkfault.Mode{
+		"iec104": s.cfg.IECServer.ActiveLinkFaults(),
+		"modbus": s.cfg.ModbusServer.ActiveLinkFaults(),
+	}
+	for protocol, modes := range links {
+		if len(modes) == 0 {
+			delete(links, protocol)
+		}
+	}
 	snapshot := s.cfg.Store.Snapshot()
 	alarms := 0
 	for key, value := range snapshot {

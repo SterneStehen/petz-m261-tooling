@@ -10,7 +10,7 @@ export type Status = {
   model_time: string;
   ready: boolean;
   configuration: Record<string, { value: unknown; unconfirmed: boolean }>;
-  link_faults: Record<string, string>;
+  link_faults: Record<string, string[]>;
   active_alarm_count: number;
   scenario: { running: boolean; name: string };
 };

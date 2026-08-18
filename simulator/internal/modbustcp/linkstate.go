@@ -3,6 +3,8 @@ package modbustcp
 import (
 	"sync"
 	"time"
+
+	"github.com/SterneStehen/petz-m261-tooling/simulator/internal/linkfault"
 )
 
 // linkState holds this Server's currently active link fault (Task 7 item
@@ -108,6 +110,25 @@ func (s *Server) ClearLinkFaults() {
 	s.link.hbFrozen = false
 	s.link.hbValue = 0
 	s.link.mu.Unlock()
+}
+
+func (s *Server) ActiveLinkFaults() []linkfault.Mode {
+	s.link.mu.Lock()
+	defer s.link.mu.Unlock()
+	var modes []linkfault.Mode
+	if s.link.drop {
+		modes = append(modes, linkfault.ModeDrop)
+	}
+	if s.link.hang {
+		modes = append(modes, linkfault.ModeHang)
+	}
+	if s.link.delay > 0 {
+		modes = append(modes, linkfault.ModeDelay)
+	}
+	if s.link.hbFrozen {
+		modes = append(modes, linkfault.ModeHeartbeatPause)
+	}
+	return modes
 }
 
 // FenceHeartbeat implements linkfault.Target as a no-op — Modbus has no

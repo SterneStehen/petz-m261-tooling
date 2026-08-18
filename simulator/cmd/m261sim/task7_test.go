@@ -1008,9 +1008,10 @@ func TestBaseScenariosPassInCI(t *testing.T) {
 // against the real thing).
 type noopLinkTarget struct{}
 
-func (*noopLinkTarget) SetDrop()                  {}
-func (*noopLinkTarget) SetHang()                  {}
-func (*noopLinkTarget) SetDelay(time.Duration)    {}
-func (*noopLinkTarget) SetHeartbeatPause(float64) {}
-func (*noopLinkTarget) ClearLinkFaults()          {}
-func (*noopLinkTarget) FenceHeartbeat()           {}
+func (*noopLinkTarget) SetDrop()                           {}
+func (*noopLinkTarget) SetHang()                           {}
+func (*noopLinkTarget) SetDelay(time.Duration)             {}
+func (*noopLinkTarget) SetHeartbeatPause(float64)          {}
+func (*noopLinkTarget) ClearLinkFaults()                   {}
+func (*noopLinkTarget) FenceHeartbeat()                    {}
+func (*noopLinkTarget) ActiveLinkFaults() []linkfault.Mode { return nil }

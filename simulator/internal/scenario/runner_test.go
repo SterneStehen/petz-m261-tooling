@@ -26,12 +26,13 @@ type fakeLinkTarget struct {
 	delay               time.Duration
 }
 
-func (f *fakeLinkTarget) SetDrop()                  { f.drop = true }
-func (f *fakeLinkTarget) SetHang()                  { f.hang = true }
-func (f *fakeLinkTarget) SetDelay(d time.Duration)  { f.delay = d }
-func (f *fakeLinkTarget) SetHeartbeatPause(float64) {}
-func (f *fakeLinkTarget) ClearLinkFaults()          { *f = fakeLinkTarget{cleared: true} }
-func (f *fakeLinkTarget) FenceHeartbeat()           {}
+func (f *fakeLinkTarget) SetDrop()                           { f.drop = true }
+func (f *fakeLinkTarget) SetHang()                           { f.hang = true }
+func (f *fakeLinkTarget) SetDelay(d time.Duration)           { f.delay = d }
+func (f *fakeLinkTarget) SetHeartbeatPause(float64)          {}
+func (f *fakeLinkTarget) ClearLinkFaults()                   { *f = fakeLinkTarget{cleared: true} }
+func (f *fakeLinkTarget) FenceHeartbeat()                    {}
+func (f *fakeLinkTarget) ActiveLinkFaults() []linkfault.Mode { return nil }
 
 type harness struct {
 	store     *store.Store

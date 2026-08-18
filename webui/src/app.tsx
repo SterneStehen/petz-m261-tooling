@@ -642,7 +642,7 @@ function Overview({
       )}
       {Object.entries(status?.link_faults ?? {}).map(([protocol, mode]) => (
         <div className="event-banner" role="status" key={protocol}>
-          <b>{t("linkFaultActive", { protocol, mode })}</b>
+          <b>{t("linkFaultActive", { protocol, mode: mode.join(", ") })}</b>
         </div>
       ))}
       <div className="dashboard-grid">
