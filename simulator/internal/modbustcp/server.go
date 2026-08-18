@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
@@ -64,6 +65,7 @@ type Server struct {
 
 	gate      *appgate.Gate          // see SetGate
 	linkCoord *linkfault.Coordinator // see SetLinkCoordinator
+	listening atomic.Bool
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -110,6 +112,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("modbustcp: listen: %w", err)
 	}
 	s.ln = ln
+	s.listening.Store(true)
 	s.wg.Add(1)
 	go s.acceptLoop()
 	return nil
@@ -118,9 +121,13 @@ func (s *Server) Start() error {
 // Addr returns the listener's actual address (useful with Addr: "127.0.0.1:0" in tests).
 func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 
+// Listening reports whether this server still owns its TCP listener.
+func (s *Server) Listening() bool { return s.listening.Load() }
+
 // Close stops accepting new connections, closes every open connection,
 // and waits for their handler goroutines to exit.
 func (s *Server) Close() error {
+	s.listening.Store(false)
 	close(s.quit)
 	err := s.ln.Close()
 	s.connMu.Lock()

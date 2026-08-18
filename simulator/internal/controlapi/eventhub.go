@@ -46,7 +46,10 @@ func (h *eventHub) subscribe(last uint64) (<-chan sseEvent, []sseEvent, bool, fu
 	h.nextSubscriber++
 	ch := make(chan sseEvent, 64)
 	h.subscribers[id] = ch
-	resync := last > 0 && (len(h.history) == 0 || last < h.history[0].ID-1)
+	// A client claiming an ID after this process's newest event is just as
+	// out of sync as one whose requested history has expired (for example
+	// after a simulator restart, when the in-memory journal starts at 1).
+	resync := last > h.next || (len(h.history) > 0 && last < h.history[0].ID-1)
 	replay := []sseEvent{}
 	if !resync {
 		for _, e := range h.history {

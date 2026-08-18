@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/SterneStehen/petz-m261-tooling/gen/go/m261points"
@@ -82,6 +83,7 @@ type Server struct {
 	ln           net.Listener
 	hs           *http.Server
 	events       *eventHub
+	listening    atomic.Bool
 }
 
 func New(cfg Config) *Server {
@@ -125,6 +127,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("controlapi: listen: %w", err)
 	}
 	s.ln = ln
+	s.listening.Store(true)
 	go s.hs.Serve(ln) //nolint:errcheck // Close's ln.Close() is what ends Serve; the resulting ErrServerClosed is expected, not a failure to report
 	return nil
 }
@@ -132,8 +135,11 @@ func (s *Server) Start() error {
 func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 
 func (s *Server) Close() error {
+	s.listening.Store(false)
 	return s.hs.Close()
 }
+
+func (s *Server) listeningReady() bool { return s.listening.Load() }
 
 func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "not_found", fmt.Errorf("no such endpoint: %s %s", r.Method, r.URL.Path))

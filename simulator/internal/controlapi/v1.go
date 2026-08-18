@@ -99,10 +99,9 @@ func (s *Server) handleV1Commands(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "command_rejected", err)
 		return
 	}
+	// Store.Set mirrors a setpoint to its IEC-104 readback twin atomically;
+	// the accepted engineering value is therefore the authoritative readback.
 	readback := *req.Value
-	if meta, ok := m261points.Points[key]; ok && meta.ReadbackIEC104Addr != nil { // Store mirroring is authoritative; the response value is still the accepted engineering value.
-		readback = *req.Value
-	}
 	response := map[string]any{"device": req.Device, "slug": req.Slug, "accepted_value": *req.Value, "readback": readback}
 	if d, ok := s.cfg.Processor.DiagnosticFor(key); ok {
 		response["diagnostic"] = d
@@ -159,11 +158,7 @@ func (s *Server) handleV1Status(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	ready := true
-	if s.cfg.Ready != nil {
-		ready = s.cfg.Ready()
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"model_time": s.cfg.Clock.Now(), "configuration": s.cfg.PublicConfig, "ready": ready})
+	writeJSON(w, http.StatusOK, map[string]any{"model_time": s.cfg.Clock.Now(), "configuration": s.cfg.PublicConfig, "ready": s.ready()})
 }
 func (s *Server) handleV1Live(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
@@ -175,7 +170,7 @@ func (s *Server) handleV1Ready(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	if s.cfg.Ready != nil && !s.cfg.Ready() {
+	if !s.ready() {
 		writeError(w, http.StatusServiceUnavailable, "not_ready", fmt.Errorf("one or more simulator servers are unavailable"))
 		return
 	}
@@ -188,7 +183,7 @@ func (s *Server) handleV1DemoPrepare(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
-	if s.cfg.Ready != nil && !s.cfg.Ready() {
+	if !s.ready() {
 		writeError(w, http.StatusServiceUnavailable, "not_ready", fmt.Errorf("simulator is not ready"))
 		return
 	}
@@ -199,6 +194,10 @@ func (s *Server) handleV1DemoPrepare(w http.ResponseWriter, r *http.Request) {
 	rev := s.cfg.Store.CurrentRevision()
 	s.events.publish("reset", s.cfg.Clock.Now(), &rev, map[string]any{"source": "demo_prepare"})
 	writeJSON(w, http.StatusOK, map[string]any{"demo_session_id": fmt.Sprintf("demo-%d", rev), "model_time": s.cfg.Clock.Now(), "revision": rev})
+}
+
+func (s *Server) ready() bool {
+	return s.listeningReady() && (s.cfg.Ready == nil || s.cfg.Ready())
 }
 
 // handleV1Events uses Store's atomic subscribe-and-snapshot primitive: no
@@ -239,10 +238,36 @@ func (s *Server) handleV1Events(w http.ResponseWriter, r *http.Request) {
 	}
 	flusher.Flush()
 	last := rev
+	// Coalesce high-frequency Store batches for the browser. The Store
+	// subscription remains loss-detecting at the batch level: every batch is
+	// checked before its final value is folded into this short UI window.
+	const telemetryWindow = 150 * time.Millisecond
+	ticker := time.NewTicker(telemetryWindow)
+	defer ticker.Stop()
+	pending := make(map[m261points.PointKey]float64)
+	var pendingRevision uint64
+	flushTelemetry := func() {
+		if len(pending) == 0 {
+			return
+		}
+		id = s.events.nextID()
+		changes := make([]v1PointValue, 0, len(pending))
+		for key, value := range pending {
+			changes = append(changes, v1PointValue{Device: key.Device, Slug: key.Slug, Value: value})
+		}
+		sort.Slice(changes, func(i, j int) bool {
+			return changes[i].Device == changes[j].Device && changes[i].Slug < changes[j].Slug || changes[i].Device < changes[j].Device
+		})
+		s.writeSSE(w, sseEvent{ID: id, Type: "telemetry", Timestamp: s.cfg.Clock.Now(), Revision: &pendingRevision, Payload: map[string]any{"changes": changes}})
+		flusher.Flush()
+		clear(pending)
+	}
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-ticker.C:
+			flushTelemetry()
 		case event, ok := <-rare:
 			if !ok {
 				return
@@ -254,18 +279,15 @@ func (s *Server) handleV1Events(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if batch.Revision != last+1 {
-				s.writeSSE(w, sseEvent{ID: id + 1, Type: "resync_required", Timestamp: s.cfg.Clock.Now(), Payload: map[string]any{"expected_revision": last + 1, "received_revision": batch.Revision}})
+				s.writeSSE(w, sseEvent{ID: s.events.nextID(), Type: "resync_required", Timestamp: s.cfg.Clock.Now(), Payload: map[string]any{"expected_revision": last + 1, "received_revision": batch.Revision}})
 				flusher.Flush()
 				return
 			}
-			id = s.events.nextID()
 			last = batch.Revision
-			changes := make([]v1PointValue, 0, len(batch.Changes))
 			for _, c := range batch.Changes {
-				changes = append(changes, v1PointValue{c.Key.Device, c.Key.Slug, c.Value})
+				pending[c.Key] = c.Value
 			}
-			s.writeSSE(w, sseEvent{ID: id, Type: "telemetry", Timestamp: s.cfg.Clock.Now(), Revision: &batch.Revision, Payload: map[string]any{"changes": changes}})
-			flusher.Flush()
+			pendingRevision = batch.Revision
 		}
 	}
 }

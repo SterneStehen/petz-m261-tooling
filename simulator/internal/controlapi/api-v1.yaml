@@ -4,49 +4,76 @@ info:
   version: 1.0.0
 paths:
   /api/v1/catalog:
-    get: {summary: Generated point metadata}
+    get: {summary: Generated point metadata, responses: {'200': {$ref: '#/components/responses/JSON'}}}
   /api/v1/status:
-    get: {summary: Simulator/server and display configuration status}
+    get: {summary: Simulator status and public configuration, responses: {'200': {$ref: '#/components/responses/JSON'}}}
   /api/v1/state:
-    get: {summary: Atomic point snapshot with Store revision}
+    get:
+      summary: Atomic point snapshot with Store revision
+      responses: {'200': {description: Snapshot, content: {application/json: {schema: {$ref: '#/components/schemas/State'}}}}}
   /api/v1/commands:
     post:
       summary: Write one setpoint through commands.Processor
       requestBody:
         required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [device, slug, value]
-              properties:
-                device: {type: string}
-                slug: {type: string}
-                value: {type: number}
+        content: {application/json: {schema: {$ref: '#/components/schemas/CommandRequest'}}}
+      responses:
+        '200': {description: Accepted command and readback, content: {application/json: {schema: {$ref: '#/components/schemas/CommandResponse'}}}}
+        '400': {$ref: '#/components/responses/Error'}
   /api/v1/scenarios:
-    get: {summary: List bundled scenario files}
+    get: {summary: List bundled scenario files, responses: {'200': {$ref: '#/components/responses/JSON'}}}
   /api/v1/scenario/status:
-    get: {summary: Loaded scenario, cursor, running state and last error}
+    get: {summary: Loaded scenario, cursor, running state and last error, responses: {'200': {$ref: '#/components/responses/JSON'}}}
   /api/v1/diagnostics:
-    get: {summary: Structured command diagnostics}
+    get: {summary: Structured command diagnostics, responses: {'200': {$ref: '#/components/responses/JSON'}}}
   /api/v1/events:
     get:
-      summary: Server-sent event stream; initial_state=true atomically bootstraps snapshot and stream
+      summary: Atomically bootstrapped server-sent event stream
+      description: Use initial_state=true for every initial connection and resynchronisation. Telemetry is coalesced; rare events are replayed from Last-Event-ID or explicitly covered by resync_required.
       parameters:
-        - name: initial_state
-          in: query
-          required: true
-          schema: {type: boolean, const: true}
-        - name: Last-Event-ID
-          in: header
-          schema: {type: string}
+        - {name: initial_state, in: query, required: true, schema: {type: string, const: 'true'}}
+        - {name: Last-Event-ID, in: header, schema: {type: string, pattern: '^[0-9]+$'}}
       responses:
-        '200':
-          description: text/event-stream events: snapshot, telemetry, resync_required
-          content: {text/event-stream: {schema: {type: string}}}
+        '200': {description: SSE stream, content: {text/event-stream: {schema: {$ref: '#/components/schemas/SSEEvent'}}}}
+        '400': {$ref: '#/components/responses/Error'}
   /api/v1/demo/prepare:
-    post: {summary: Deterministically reset and validate a guided-demo session}
+    post: {summary: Deterministically reset and validate a guided-demo session, responses: {'200': {$ref: '#/components/responses/JSON'}, '503': {$ref: '#/components/responses/Error'}}}
   /api/v1/health/live:
-    get: {summary: Process liveness}
+    get: {summary: Process liveness, responses: {'200': {$ref: '#/components/responses/JSON'}}}
   /api/v1/health/ready:
-    get: {summary: Listener readiness; 503 when unavailable}
+    get: {summary: All protocol and control listeners are available, responses: {'200': {$ref: '#/components/responses/JSON'}, '503': {$ref: '#/components/responses/Error'}}}
+components:
+  responses:
+    JSON: {description: JSON response, content: {application/json: {schema: {type: object}}}}
+    Error: {description: API error, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+  schemas:
+    PointValue:
+      type: object
+      required: [device, slug, value]
+      properties: {device: {type: string}, slug: {type: string}, value: {type: number}}
+    State:
+      type: object
+      required: [revision, model_time, points]
+      properties: {revision: {type: integer, minimum: 0}, model_time: {type: string, format: date-time}, points: {type: array, items: {$ref: '#/components/schemas/PointValue'}}}
+    CommandRequest:
+      type: object
+      required: [device, slug, value]
+      additionalProperties: false
+      properties: {device: {type: string}, slug: {type: string}, value: {type: number}}
+    CommandResponse:
+      type: object
+      required: [device, slug, accepted_value, readback]
+      properties: {device: {type: string}, slug: {type: string}, accepted_value: {type: number}, readback: {type: number}, diagnostic: {type: object}}
+    SSEEvent:
+      type: object
+      required: [id, type, timestamp, revision, payload]
+      properties:
+        id: {type: integer, minimum: 0}
+        type: {type: string, enum: [snapshot, telemetry, fault, scenario_step, reset, diagnostic, resync_required]}
+        timestamp: {type: string, format: date-time}
+        revision: {oneOf: [{type: integer, minimum: 0}, {type: 'null'}]}
+        payload: {type: object}
+    Error:
+      type: object
+      required: [error]
+      properties: {error: {type: object, required: [code, message], properties: {code: {type: string}, message: {type: string}}}}

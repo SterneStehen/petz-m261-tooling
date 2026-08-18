@@ -1,12 +1,16 @@
 package controlapi_test
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -94,6 +98,7 @@ type harness struct {
 	server         *controlapi.Server
 	baseURL        string
 	startupInstant time.Time
+	ready          *bool
 }
 
 // newHarness builds a controlapi.Server exactly as main.go wires one —
@@ -121,6 +126,7 @@ func newHarness(t *testing.T) *harness {
 	sr.SetLinkCoordinator(linkCoord)
 
 	startupSnapshot := st.Snapshot()
+	ready := true
 
 	srv := controlapi.New(controlapi.Config{
 		Addr:            "127.0.0.1:0",
@@ -139,6 +145,7 @@ func newHarness(t *testing.T) *harness {
 		StartupSnapshot: startupSnapshot,
 		NewEngine:       newEngine,
 		StartupInstant:  startupInstant,
+		Ready:           func() bool { return ready },
 	})
 	if err := srv.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -147,6 +154,7 @@ func newHarness(t *testing.T) *harness {
 	return &harness{
 		store: st, injector: inj, processor: proc, physicsRunner: pr, clk: fc, scenarioRunner: sr,
 		iec: iec, mb: mb, server: srv, baseURL: "http://" + srv.Addr().String(), startupInstant: startupInstant,
+		ready: &ready,
 	}
 }
 
@@ -234,6 +242,130 @@ func TestV1CatalogStateAndCommands(t *testing.T) {
 	resp, body = h.do(t, http.MethodPost, "/api/v1/demo/prepare", nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("demo prepare status = %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestV1StatusHealthAndReadEndpoints(t *testing.T) {
+	h := newHarness(t)
+	for _, path := range []string{"/api/v1/status", "/api/v1/scenarios", "/api/v1/scenario/status", "/api/v1/diagnostics", "/api/v1/health/live", "/api/v1/health/ready"} {
+		resp, body := h.do(t, http.MethodGet, path, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: status=%d body=%s", path, resp.StatusCode, body)
+		}
+	}
+	*h.ready = false
+	resp, body := h.do(t, http.MethodGet, "/api/v1/health/ready", nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("not-ready status=%d body=%s", resp.StatusCode, body)
+	}
+	if got := decodeError(t, body).Error.Code; got != "not_ready" {
+		t.Fatalf("not-ready code=%q", got)
+	}
+	resp, body = h.do(t, http.MethodPost, "/api/v1/demo/prepare", nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("demo not-ready status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestV1DemoPrepareIsDeterministic(t *testing.T) {
+	h := newHarness(t)
+	key := m261points.PointKey{Device: "EMS", Slug: "set_operating_mode"}
+	if err := h.processor.Write(key, 2); err != nil {
+		t.Fatal(err)
+	}
+	resp, body := h.do(t, http.MethodPost, "/api/v1/demo/prepare", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first prepare=%d: %s", resp.StatusCode, body)
+	}
+	first := h.store.Snapshot()
+	if err := h.processor.Write(key, 1); err != nil {
+		t.Fatal(err)
+	}
+	resp, body = h.do(t, http.MethodPost, "/api/v1/demo/prepare", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second prepare=%d: %s", resp.StatusCode, body)
+	}
+	second := h.store.Snapshot()
+	if !reflect.DeepEqual(first, second) {
+		t.Fatal("two demo prepare calls produced different Store snapshots")
+	}
+}
+
+func TestV1EventsBootstrapsAndCoalescesTelemetry(t *testing.T) {
+	h := newHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.baseURL+"/api/v1/events?initial_state=true", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("SSE status=%d", resp.StatusCode)
+	}
+	reader := bufio.NewReader(resp.Body)
+	if typ, _ := readSSEEvent(t, reader); typ != "snapshot" {
+		t.Fatalf("first SSE event=%q, want snapshot", typ)
+	}
+	key := m261points.PointKey{Device: "EMS", Slug: "desired_active_power_kw"}
+	if !h.store.Set(key, 10) || !h.store.Set(key, 20) {
+		t.Fatal("Store.Set failed")
+	}
+	type received struct {
+		typ  string
+		data []byte
+	}
+	got := make(chan received, 1)
+	go func() { typ, data := readSSEEvent(t, reader); got <- received{typ, data} }()
+	select {
+	case event := <-got:
+		if event.typ != "telemetry" {
+			t.Fatalf("second SSE event=%q, want telemetry", event.typ)
+		}
+		var payload struct {
+			Payload struct {
+				Changes []struct {
+					Device string  `json:"device"`
+					Slug   string  `json:"slug"`
+					Value  float64 `json:"value"`
+				} `json:"changes"`
+			} `json:"payload"`
+			Revision uint64 `json:"revision"`
+		}
+		if err := json.Unmarshal(event.data, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Revision != h.store.CurrentRevision() || len(payload.Payload.Changes) != 1 || payload.Payload.Changes[0].Value != 20 {
+			t.Fatalf("coalesced telemetry=%s", event.data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for coalesced telemetry")
+	}
+}
+
+func readSSEEvent(t *testing.T, reader *bufio.Reader) (string, []byte) {
+	t.Helper()
+	typ := ""
+	var data []byte
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read SSE: %v", err)
+		}
+		line = strings.TrimSuffix(line, "\n")
+		if line == "" {
+			return typ, data
+		}
+		if strings.HasPrefix(line, "event: ") {
+			typ = strings.TrimPrefix(line, "event: ")
+		}
+		if strings.HasPrefix(line, "data: ") {
+			data = []byte(strings.TrimPrefix(line, "data: "))
+		}
 	}
 }
 

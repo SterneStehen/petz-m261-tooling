@@ -246,7 +246,7 @@ func main() {
 		NewEngine:       newEngine,
 		StartupInstant:  startupInstant,
 		PublicConfig:    publicConfigFrom(cfg),
-		Ready:           func() bool { return true }, // all three listeners are started before control API is constructed
+		Ready:           func() bool { return iec.Listening() && mb.Listening() },
 	})
 	if err := capi.Start(); err != nil {
 		log.Fatalf("control api: %v", err)

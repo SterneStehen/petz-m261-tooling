@@ -59,6 +59,7 @@ type Server struct {
 	// functions, both of which already hold it for their whole body), not
 	// a separate mutex.
 	heartbeatGenBoundaryRev uint64
+	listening               atomic.Bool
 }
 
 func New(st *store.Store, cfg Config) *Server {
@@ -104,6 +105,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("iec104: listen: %w", err)
 	}
 	s.ln = ln
+	s.listening.Store(true)
 
 	changes, unsubscribe := s.store.Subscribe()
 	s.unsubscribe = unsubscribe
@@ -115,7 +117,11 @@ func (s *Server) Start() error {
 
 func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 
+// Listening reports whether this server still owns its TCP listener.
+func (s *Server) Listening() bool { return s.listening.Load() }
+
 func (s *Server) Close() error {
+	s.listening.Store(false)
 	close(s.quit)
 	err := s.ln.Close()
 	s.unsubscribe()
