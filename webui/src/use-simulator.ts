@@ -16,6 +16,10 @@ export type ScenarioStepEvent = {
   result: string;
   error: string;
 };
+// A history point pairs the value with when it was actually observed --
+// charts plot real elapsed time, not an evenly-spaced fake index.
+export type Sample = { value: number; t: number };
+const RECENT_EVENTS_STORAGE_KEY = "m261-recent-events";
 
 // Task 10.1 item 4: bounded, most-recent-first log of rare events shown on
 // Overview -- distinct from `lastEvent` (still kept, drives toasts).
@@ -30,11 +34,21 @@ export function useSimulator() {
   const [status, setStatus] = useState<Status | null>(null);
   const [catalog, setCatalog] = useState<Point[]>([]);
   const [points, setPoints] = useState<Record<string, number>>({});
-  const [history, setHistory] = useState<Record<string, number[]>>({});
+  const [history, setHistory] = useState<Record<string, Sample[]>>({});
   const [modelTime, setModelTime] = useState("");
   const [stream, setStream] = useState<StreamState>("connecting");
   const [lastEvent, setLastEvent] = useState<RareEvent | null>(null);
-  const [events, setEvents] = useState<RareEvent[]>([]);
+  // Restored once at mount from a prior session -- this is a persisted
+  // historical log, not the "just happened" toast path (that stays gated
+  // on initialReplayComplete below and is never restored from storage).
+  const [events, setEvents] = useState<RareEvent[]>(() => {
+    try {
+      const stored = window.localStorage.getItem(RECENT_EVENTS_STORAGE_KEY);
+      return stored ? (JSON.parse(stored) as RareEvent[]) : [];
+    } catch {
+      return [];
+    }
+  });
   const [scenarioProgress, setScenarioProgress] = useState<ScenarioStepEvent[]>([]);
   const [heartbeatTick, setHeartbeatTick] = useState<number | null>(null);
   const revision = useRef<number | null>(null);
@@ -59,12 +73,26 @@ export function useSimulator() {
   }, []);
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        RECENT_EVENTS_STORAGE_KEY,
+        JSON.stringify(events),
+      );
+    } catch {
+      // Storage can legitimately be unavailable (private browsing, quota) --
+      // the in-memory list still works for the current session either way.
+    }
+  }, [events]);
+
+  useEffect(() => {
     if (Object.keys(points).length === 0) return;
     setHistory((current) => {
       const next = { ...current };
+      const now = Date.now();
       for (const [key, value] of Object.entries(points)) {
         const samples = next[key] ?? [];
-        if (samples.at(-1) !== value) next[key] = [...samples, value].slice(-36);
+        if (samples.at(-1)?.value !== value)
+          next[key] = [...samples, { value, t: now }].slice(-36);
       }
       return next;
     });

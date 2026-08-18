@@ -215,6 +215,9 @@ main {
   height: 170px;
   width: 100%;
 }
+.chart--dual {
+  height: 190px;
+}
 .chip {
   display: inline-flex;
   align-items: center;
@@ -348,6 +351,11 @@ select {
 .button--danger {
   color: #fff;
   background: #b42318;
+}
+.button--small {
+  min-height: 30px;
+  padding: 4px 10px;
+  font-size: 12px;
 }
 .button--danger:hover {
   background: #8e1d14;
@@ -510,6 +518,24 @@ select {
 .chart-value--dual {
   display: flex;
   gap: 14px;
+}
+.events-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.events-header h2 {
+  margin: 0;
+  font-size: 16px;
+  letter-spacing: -0.015em;
+}
+.config-note {
+  margin: 0 0 14px;
+  color: #a86500;
+  font-size: 13px;
+  line-height: 1.5;
 }
 .heartbeat {
   display: inline-flex;

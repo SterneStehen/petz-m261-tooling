@@ -12,6 +12,7 @@ import { api, type Point, type Status } from "./api";
 import {
   useSimulator,
   type RareEvent,
+  type Sample,
   type ScenarioStepEvent,
 } from "./use-simulator";
 
@@ -142,6 +143,9 @@ const en: Text = {
   heartbeatLastTick: "Last tick {seconds}s ago",
   scenarioProgressTitle: "Scenario progress",
   recentEventsTitle: "Recent events",
+  downloadLog: "Download log",
+  allConfigUnconfirmed:
+    "Unconfirmed: all parameters below are pending manufacturer confirmation.",
   eventTypeFault: "Fault",
   eventTypeReset: "Reset",
   eventTypeDiagnostic: "Diagnostic",
@@ -295,6 +299,9 @@ const uk: Text = {
   heartbeatLastTick: "Останній тік {seconds} с тому",
   scenarioProgressTitle: "Прогрес сценарію",
   recentEventsTitle: "Останні події",
+  downloadLog: "Скачати лог",
+  allConfigUnconfirmed:
+    "Непідтверджено: усі параметри нижче ще не підтверджені виробником.",
   eventTypeFault: "Аварія",
   eventTypeReset: "Скидання",
   eventTypeDiagnostic: "Діагностика",
@@ -557,6 +564,30 @@ function AboutDialog({
     </Modal>
   );
 }
+// Shared axis/grid/tooltip options so single- and dual-series charts read
+// the same way: a real time axis (actual elapsed wall-clock time between
+// observed samples, not an evenly-spaced fake index) with visible
+// gridlines, so the chart is readable on its own, not just decorative.
+function baseChartOption(locale: string) {
+  return {
+    animation: false,
+    grid: { left: 40, right: 12, top: 28, bottom: 22 },
+    tooltip: {
+      trigger: "axis" as const,
+      valueFormatter: (value: unknown) => number(Number(value), locale, 2),
+    },
+    xAxis: {
+      type: "time" as const,
+      axisLabel: {
+        color: "#626862",
+        fontSize: 10,
+        formatter: (value: number) => new Date(value).toLocaleTimeString(locale, { hour12: false }),
+      },
+      axisLine: { lineStyle: { color: "#dddcd5" } },
+      splitLine: { show: false },
+    },
+  };
+}
 function MiniChart({
   title,
   value,
@@ -566,7 +597,7 @@ function MiniChart({
 }: {
   title: string;
   value: number;
-  samples: number[];
+  samples: Sample[];
   unit: string;
   tone: string;
 }) {
@@ -576,15 +607,22 @@ function MiniChart({
     const node = chartNode;
     if (!node) return;
     const chart = echarts.init(node, undefined, { renderer: "svg" });
+    const data = samples.length
+      ? samples.map((s) => [s.t, s.value])
+      : [[Date.now(), value]];
     chart.setOption({
-      animation: false,
-      grid: { left: 4, right: 4, top: 10, bottom: 2 },
-      xAxis: { type: "category", show: false, data: samples.map(String) },
-      yAxis: { type: "value", show: false },
+      ...baseChartOption(locale),
+      yAxis: {
+        type: "value",
+        axisLabel: { color: "#626862", fontSize: 10 },
+        axisLine: { show: false },
+        splitLine: { lineStyle: { color: "#f0f0eb" } },
+      },
       series: [
         {
+          name: title,
           type: "line",
-          data: samples.length ? samples : [value],
+          data,
           smooth: true,
           symbol: "none",
           lineStyle: { width: 2, color: tone },
@@ -600,7 +638,7 @@ function MiniChart({
       observer.disconnect();
       chart.dispose();
     };
-  }, [chartNode, samples, tone, value]);
+  }, [chartNode, samples, tone, value, locale, title]);
   const display = number(value, locale);
   return (
     <Card title={title} className="chart-card">
@@ -636,12 +674,12 @@ function DualChart({
   title: string;
   primaryLabel: string;
   primaryValue: number;
-  primarySamples: number[];
+  primarySamples: Sample[];
   primaryUnit: string;
   primaryTone: string;
   secondaryLabel: string;
   secondaryValue: number;
-  secondarySamples: number[];
+  secondarySamples: Sample[];
   secondaryUnit: string;
   secondaryTone: string;
 }) {
@@ -651,25 +689,45 @@ function DualChart({
     const node = chartNode;
     if (!node) return;
     const chart = echarts.init(node, undefined, { renderer: "svg" });
-    const length = Math.max(primarySamples.length, secondarySamples.length, 1);
+    const now = Date.now();
+    const primaryData = primarySamples.length
+      ? primarySamples.map((s) => [s.t, s.value])
+      : [[now, primaryValue]];
+    const secondaryData = secondarySamples.length
+      ? secondarySamples.map((s) => [s.t, s.value])
+      : [[now, secondaryValue]];
     chart.setOption({
-      animation: false,
-      grid: { left: 4, right: 4, top: 10, bottom: 2 },
-      xAxis: {
-        type: "category",
-        show: false,
-        data: Array.from({ length }, (_, index) => String(index)),
+      ...baseChartOption(locale),
+      legend: {
+        data: [primaryLabel, secondaryLabel],
+        top: 0,
+        left: 0,
+        icon: "circle",
+        itemWidth: 8,
+        itemHeight: 8,
+        textStyle: { color: "#626862", fontSize: 11 },
       },
+      grid: { left: 40, right: 40, top: 48, bottom: 22 },
       yAxis: [
-        { type: "value", show: false },
-        { type: "value", show: false },
+        {
+          type: "value",
+          axisLabel: { color: primaryTone, fontSize: 10 },
+          axisLine: { show: false },
+          splitLine: { lineStyle: { color: "#f0f0eb" } },
+        },
+        {
+          type: "value",
+          axisLabel: { color: secondaryTone, fontSize: 10 },
+          axisLine: { show: false },
+          splitLine: { show: false },
+        },
       ],
       series: [
         {
           name: primaryLabel,
           type: "line",
           yAxisIndex: 0,
-          data: primarySamples.length ? primarySamples : [primaryValue],
+          data: primaryData,
           smooth: true,
           symbol: "none",
           lineStyle: { width: 2, color: primaryTone },
@@ -679,7 +737,7 @@ function DualChart({
           name: secondaryLabel,
           type: "line",
           yAxisIndex: 1,
-          data: secondarySamples.length ? secondarySamples : [secondaryValue],
+          data: secondaryData,
           smooth: true,
           symbol: "none",
           lineStyle: { width: 2, color: secondaryTone },
@@ -704,6 +762,7 @@ function DualChart({
     secondaryValue,
     primaryLabel,
     secondaryLabel,
+    locale,
   ]);
   const primaryDisplay = number(primaryValue, locale);
   const secondaryDisplay = number(secondaryValue, locale);
@@ -719,7 +778,7 @@ function DualChart({
       </div>
       <div
         ref={setChartNode}
-        className="chart"
+        className="chart chart--dual"
         role="img"
         aria-label={t("chartAriaDual", {
           primaryTitle: primaryLabel,
@@ -859,11 +918,35 @@ function ScenarioProgress({ steps }: { steps: ScenarioStepEvent[] }) {
 // gates this list on initial_replay_complete the same way toasts are
 // gated, so a fresh connection's history replay never shows up here as
 // something that just happened.
+// Client-side only: serialises exactly the events currently shown, no
+// backend involved.
+function downloadEventsLog(events: RareEvent[]) {
+  const blob = new Blob([JSON.stringify(events, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `m261-events-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
 function RecentEvents({ events }: { events: RareEvent[] }) {
   const { t, locale } = useLanguage();
   if (events.length === 0) return null;
   return (
-    <Card title={t("recentEventsTitle")}>
+    <section className="card">
+      <div className="events-header">
+        <h2>{t("recentEventsTitle")}</h2>
+        <button
+          className="button button--secondary button--small"
+          onClick={() => downloadEventsLog(events)}
+        >
+          {t("downloadLog")}
+        </button>
+      </div>
       <ul className="recent-events">
         {events.map((event) => (
           <li
@@ -880,7 +963,7 @@ function RecentEvents({ events }: { events: RareEvent[] }) {
           </li>
         ))}
       </ul>
-    </Card>
+    </section>
   );
 }
 
@@ -1139,17 +1222,37 @@ function Overview({
         </Card>
       </div>
       <Card title={t("simulatorConfiguration")}>
-        <div className="config-list">
-          {Object.entries(status?.configuration ?? {}).map(([key, setting]) => (
-            <div key={key}>
-              <span>{key}</span>
-              <span>{String(setting.value)}</span>
-              {setting.unconfirmed && (
-                <Chip tone="warning">{t("unconfirmed")}</Chip>
+        {(() => {
+          const configEntries = Object.entries(status?.configuration ?? {});
+          // Right now every listed parameter is unconfirmed (§7) -- an
+          // identical badge on every single row is noise, not information.
+          // A single explicit note carries the same meaning without
+          // repeating it. If a parameter is ever actually confirmed, this
+          // falls back to per-row badges automatically, so a genuinely
+          // mixed state is never silently flattened into "nothing is
+          // marked".
+          const allUnconfirmed =
+            configEntries.length > 0 &&
+            configEntries.every(([, setting]) => setting.unconfirmed);
+          return (
+            <>
+              {allUnconfirmed && (
+                <p className="config-note">{t("allConfigUnconfirmed")}</p>
               )}
-            </div>
-          ))}
-        </div>
+              <div className="config-list">
+                {configEntries.map(([key, setting]) => (
+                  <div key={key}>
+                    <span>{key}</span>
+                    <span>{String(setting.value)}</span>
+                    {!allUnconfirmed && setting.unconfirmed && (
+                      <Chip tone="warning">{t("unconfirmed")}</Chip>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </>
+          );
+        })()}
       </Card>
       <ScenarioProgress steps={scenarioProgress} />
       <RecentEvents events={events} />
