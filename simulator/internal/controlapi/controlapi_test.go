@@ -327,6 +327,36 @@ func TestV1StatusHealthAndReadEndpoints(t *testing.T) {
 	}
 }
 
+func TestV1StatusReportsAndClearsLinkFault(t *testing.T) {
+	h := newHarness(t)
+	resp, body := h.do(t, http.MethodPost, "/link", map[string]any{"protocol": "modbus", "mode": "drop"})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("link=%d: %s", resp.StatusCode, body)
+	}
+	_, body = h.do(t, http.MethodGet, "/api/v1/status", nil)
+	var active struct {
+		LinkFaults map[string]string `json:"link_faults"`
+	}
+	if err := json.Unmarshal(body, &active); err != nil {
+		t.Fatal(err)
+	}
+	if active.LinkFaults["modbus"] != "drop" {
+		t.Fatalf("link_faults=%v", active.LinkFaults)
+	}
+	resp, body = h.do(t, http.MethodPost, "/link/clear", map[string]any{"protocol": "modbus"})
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("clear=%d: %s", resp.StatusCode, body)
+	}
+	_, body = h.do(t, http.MethodGet, "/api/v1/status", nil)
+	active.LinkFaults = nil
+	if err := json.Unmarshal(body, &active); err != nil {
+		t.Fatal(err)
+	}
+	if len(active.LinkFaults) != 0 {
+		t.Fatalf("link_faults after clear=%v", active.LinkFaults)
+	}
+}
+
 func TestV1DemoPrepareIsDeterministic(t *testing.T) {
 	h := newHarness(t)
 	key := m261points.PointKey{Device: "EMS", Slug: "set_operating_mode"}
@@ -418,6 +448,9 @@ func readSSEEvent(t *testing.T, reader *bufio.Reader) (string, []byte) {
 		}
 		line = strings.TrimSuffix(line, "\n")
 		if line == "" {
+			if typ == "initial_replay_complete" {
+				return readSSEEvent(t, reader)
+			}
 			return typ, data
 		}
 		if strings.HasPrefix(line, "event: ") {

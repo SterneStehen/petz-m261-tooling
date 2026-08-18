@@ -169,6 +169,9 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err)
 		return
 	}
+	s.linkMu.Lock()
+	s.linkModes[req.Protocol] = req.Mode
+	s.linkMu.Unlock()
 	// Fifth-review-round fix: called *after* ApplyCoordinated has already
 	// released LinkCoordinator, never while still holding it — see
 	// linkfault.Target.FenceHeartbeat's own doc comment for why (a slow
@@ -202,6 +205,9 @@ func (s *Server) handleLinkClear(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err)
 		return
 	}
+	s.linkMu.Lock()
+	delete(s.linkModes, req.Protocol)
+	s.linkMu.Unlock()
 	// See handleLink's identical comment: fence outside LinkCoordinator's
 	// hold, after it has already been released by ApplyCoordinated.
 	s.cfg.IECServer.FenceHeartbeat()

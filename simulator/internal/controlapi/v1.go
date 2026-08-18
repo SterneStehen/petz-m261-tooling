@@ -3,6 +3,7 @@ package controlapi
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -168,7 +169,22 @@ func (s *Server) handleV1Status(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"model_time": s.cfg.Clock.Now(), "configuration": s.cfg.PublicConfig, "ready": s.ready()})
+	s.linkMu.RLock()
+	links := maps.Clone(s.linkModes)
+	s.linkMu.RUnlock()
+	snapshot := s.cfg.Store.Snapshot()
+	alarms := 0
+	for key, value := range snapshot {
+		if m261points.Points[key].Class == m261points.ClassAlarm && value != 0 {
+			alarms++
+		}
+	}
+	loaded := s.cfg.ScenarioRunner.Loaded()
+	name := ""
+	if loaded != nil {
+		name = loaded.Name
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"model_time": s.cfg.Clock.Now(), "configuration": s.cfg.PublicConfig, "ready": s.ready(), "link_faults": links, "active_alarm_count": alarms, "scenario": map[string]any{"running": s.cfg.ScenarioRunner.Running(), "name": name}})
 }
 func (s *Server) handleV1Live(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
@@ -245,6 +261,7 @@ func (s *Server) handleV1Events(w http.ResponseWriter, r *http.Request) {
 		for _, event := range replay {
 			s.writeSSE(w, event)
 		}
+		s.writeSSE(w, sseEvent{ID: id, Type: "initial_replay_complete", Timestamp: s.cfg.Clock.Now(), Payload: map[string]any{}})
 	}
 	flusher.Flush()
 	last := rev
