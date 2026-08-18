@@ -6,6 +6,8 @@ __pycache__/
 # Web UI dependencies are rebuilt from the committed package lock.
 /webui/node_modules/
 /webui/*.tsbuildinfo
+/webui/test-results/
+/webui/playwright-report/
 
 # Private project materials: official register maps, generated catalog data,
 # internal specifications, and agent instructions remain local only.
