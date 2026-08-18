@@ -37,6 +37,21 @@ test("surfaces accepted-but-unsupported danger diagnostics", async ({ page }) =>
   await expect(page.getByText("Trip was accepted, but has no modeled physical effect.")).toBeVisible();
 });
 
+test("switches every MVP screen to Ukrainian", async ({ page }) => {
+  await page.goto("/");
+  await page.locator(".language-switch").click();
+  await expect(page.getByRole("heading", { name: "Огляд / Демонстрація" })).toBeVisible();
+  await page.getByRole("button", { name: "Підготувати демонстрацію" }).click();
+  await expect(page.getByText("Середовище демонстрації підготовлено та підтверджено симулятором.")).toBeVisible();
+
+  await page.getByRole("button", { name: "Керування" }).click();
+  await expect(page.getByText("Небезпечна зона")).toBeVisible();
+  await expect(page.getByText("Робочий стан")).toBeVisible();
+
+  await page.getByRole("button", { name: "Тестова лабораторія" }).click();
+  await expect(page.getByText("Інʼєкція аварії")).toBeVisible();
+});
+
 type State = { points: Array<{ device: string; slug: string; value: number }> };
 type ScenarioStatus = { running: boolean; cursor: number; error: string };
 
