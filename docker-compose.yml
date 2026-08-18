@@ -1,9 +1,20 @@
 services:
   m261sim:
     build: .
+    restart: unless-stopped
     ports:
-      - "502:502"
-      - "2404:2404"
+      # Publication-review fix: these two were bare "502:502"/"2404:2404"
+      # — bound every host interface, not just loopback, unlike the
+      # control-API port right below (which was already fixed for exactly
+      # this reason). For a host that's ever reachable beyond a NAT
+      # router with no port-forward to these ports (a public VPS, for
+      # instance), that published Modbus/IEC-104 on every interface. The
+      # whole point of the Cloudflare Tunnel deployment (docs, "Задача
+      # 10" publication notes) is that inbound ports never need to be
+      # opened at all — Modbus/IEC-104 must never be reachable outside
+      # the host regardless of router/firewall configuration elsewhere.
+      - "127.0.0.1:502:502"
+      - "127.0.0.1:2404:2404"
       # Reviewed BLOCKER: the container listens on 0.0.0.0:8081 (see the
       # -control-addr override below — needed so the host can reach it at
       # all, since Docker's port forwarding doesn't arrive as a literal
@@ -23,9 +34,8 @@ services:
     # bind address, the documented escape hatch for exactly this
     # (AGENT-TASK §1.3: no hardcoded non-127.0.0.1 addresses in the
     # *code* — this is a runtime flag, not a code change) — the host-side
-    # publish above is what actually keeps this loopback-only end to end.
-    # Modbus/IEC-104 already bind every interface by default and need no
-    # override.
+    # publish above is what actually keeps this loopback-only end to end,
+    # for all three ports now, not just the control API.
     command:
       - -config=simulator/config/m261sim.yaml
       - -scenarios-dir=scenarios
