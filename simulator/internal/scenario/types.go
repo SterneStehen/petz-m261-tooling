@@ -48,6 +48,8 @@ type StepEvent struct {
 	Index    int
 	At       time.Duration
 	Action   string
+	Result   string
+	Error    string
 }
 
 // WriteAction and FaultAction share a shape (a target point plus one

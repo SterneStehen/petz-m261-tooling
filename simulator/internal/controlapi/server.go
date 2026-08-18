@@ -100,6 +100,8 @@ func New(cfg Config) *Server {
 				"index":    event.Index,
 				"at":       event.At.String(),
 				"action":   event.Action,
+				"result":   event.Result,
+				"error":    event.Error,
 			})
 		})
 	}

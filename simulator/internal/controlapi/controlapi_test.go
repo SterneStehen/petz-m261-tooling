@@ -275,9 +275,9 @@ func TestV1EventsPublishesScenarioSteps(t *testing.T) {
 	}
 	_, _ = h.do(t, http.MethodPost, "/scenario/load", map[string]any{"yaml": `
 name: SSE progress
-clock: {start: "2026-08-12T00:00:00Z", speed: 100}
+clock: {start: "2026-08-12T00:00:00Z", speed: 1000}
 steps:
-  - at: 0s
+  - at: 1m
     expect: {device: BMS, point: soc, min: 0}
 `})
 	start, startBody := h.do(t, http.MethodPost, "/scenario/start", nil)
@@ -297,7 +297,7 @@ steps:
 	}()
 	select {
 	case event := <-got:
-		if event.typ != "scenario_step" || !strings.Contains(string(event.data), `"action":"expect"`) {
+		if event.typ != "scenario_step" || !strings.Contains(string(event.data), `"action":"expect"`) || !strings.Contains(string(event.data), `"result":"passed"`) {
 			t.Fatalf("scenario SSE event=%q data=%s", event.typ, event.data)
 		}
 	case <-time.After(time.Second):

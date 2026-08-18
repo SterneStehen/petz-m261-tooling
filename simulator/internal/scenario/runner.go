@@ -508,13 +508,17 @@ func (r *Runner) run(done, stop chan struct{}) {
 			// under the lock, removes the window entirely rather than
 			// relying on nothing else ever running concurrently.
 			name, cursor := r.scenario.Name, r.cursor
+			observer := r.stepObserver
 			r.mu.Unlock()
+			if observer != nil {
+				observer(StepEvent{Scenario: name, Index: cursor, At: step.At, Action: stepAction(step), Result: "failed", Error: err.Error()})
+			}
 			log.Printf("scenario: %q step %d (at %s) failed, scenario stopped: %v", name, cursor, step.At, err)
 			return
 		}
 
 		r.mu.Lock()
-		event := StepEvent{Scenario: r.scenario.Name, Index: r.cursor, At: step.At, Action: stepAction(step)}
+		event := StepEvent{Scenario: r.scenario.Name, Index: r.cursor, At: step.At, Action: stepAction(step), Result: "passed"}
 		r.cursor++
 		observer := r.stepObserver
 		r.mu.Unlock()
