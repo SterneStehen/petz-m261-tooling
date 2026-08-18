@@ -100,7 +100,8 @@ nav button.is-active {
   font-size: 12px;
   white-space: nowrap;
 }
-.language-switch {
+.language-switch,
+.topbar-button {
   min-height: 30px;
   padding: 4px 8px;
   border: 1px solid #cfcfc7;
@@ -110,7 +111,8 @@ nav button.is-active {
   font-size: 12px;
   font-weight: 700;
 }
-.language-switch:hover {
+.language-switch:hover,
+.topbar-button:hover {
   background: #f0f0eb;
 }
 main {
@@ -503,6 +505,117 @@ select {
   .config-list > div span:nth-child(2) {
     margin-left: 0;
   }
+}
+/* Task 10.1 */
+.chart-value--dual {
+  display: flex;
+  gap: 14px;
+}
+.heartbeat {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #626862;
+}
+.heartbeat-pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #1c7c54;
+  animation: heartbeat-pulse 0.6s ease-out;
+}
+@keyframes heartbeat-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+.scenario-progress,
+.recent-events {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 10px;
+}
+.scenario-step {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 13px;
+  color: #626862;
+}
+.scenario-step-index {
+  min-width: 20px;
+  font-weight: 650;
+  color: #161817;
+}
+.scenario-step--latest .scenario-step-index {
+  color: #2367d1;
+}
+.scenario-step--failed .scenario-step-index {
+  color: #b42318;
+}
+.scenario-step-error {
+  color: #b42318;
+}
+.recent-event {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 13px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #f0f0eb;
+}
+.recent-event:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+.recent-event-time {
+  color: #626862;
+  min-width: 72px;
+}
+.recent-event-type {
+  font-weight: 650;
+}
+.recent-event--fault .recent-event-type {
+  color: #b42318;
+}
+.recent-event--reset .recent-event-type {
+  color: #2367d1;
+}
+.recent-event--diagnostic .recent-event-type {
+  color: #a86500;
+}
+.about-dialog {
+  width: min(560px, 100%);
+  max-height: min(80vh, 640px);
+  overflow-y: auto;
+}
+.about-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.about-section {
+  margin-top: 18px;
+}
+.about-section h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+.about-section ul {
+  margin: 0;
+  padding-left: 18px;
+  color: #626862;
+  font-size: 13px;
+  line-height: 1.6;
 }
 @media (prefers-reduced-motion: reduce) {
   *,

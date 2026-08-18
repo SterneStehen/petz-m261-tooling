@@ -26,7 +26,7 @@ watchdog:
     allowed: [hold, zero_after, safe_state_after]
     unconfirmed: true
   timeout_s:
-    value: 60
+    value: 600
     unconfirmed: true
 
 # Task 6 item 6: which mode wins when Remote, Demand Control, and Load

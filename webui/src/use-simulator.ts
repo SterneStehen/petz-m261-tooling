@@ -9,6 +9,22 @@ export type RareEvent = {
   timestamp: string;
   payload: Record<string, unknown>;
 };
+export type ScenarioStepEvent = {
+  scenario: string;
+  index: number;
+  action: string;
+  result: string;
+  error: string;
+};
+
+// Task 10.1 item 4: bounded, most-recent-first log of rare events shown on
+// Overview -- distinct from `lastEvent` (still kept, drives toasts).
+const RECENT_EVENTS_LIMIT = 20;
+
+// Task 10.1 item 3: the heartbeat point is identified by its catalog name,
+// never a hardcoded slug -- gen/go/m261points is the only source of truth
+// for device/slug, and the catalog endpoint already mirrors it verbatim.
+const HEARTBEAT_POINT_NAME = "EMS Periodic Heartbeat Indicator";
 
 export function useSimulator() {
   const [status, setStatus] = useState<Status | null>(null);
@@ -18,9 +34,13 @@ export function useSimulator() {
   const [modelTime, setModelTime] = useState("");
   const [stream, setStream] = useState<StreamState>("connecting");
   const [lastEvent, setLastEvent] = useState<RareEvent | null>(null);
+  const [events, setEvents] = useState<RareEvent[]>([]);
+  const [scenarioProgress, setScenarioProgress] = useState<ScenarioStepEvent[]>([]);
+  const [heartbeatTick, setHeartbeatTick] = useState<number | null>(null);
   const revision = useRef<number | null>(null);
   const retryTimer = useRef<number | null>(null);
   const initialReplayComplete = useRef(false);
+  const lastHeartbeatValue = useRef<number | null>(null);
 
   useEffect(() => {
     void Promise.all([api.status(), api.catalog()])
@@ -49,6 +69,29 @@ export function useSimulator() {
       return next;
     });
   }, [points]);
+
+  // Task 10.1 item 3: resolve the heartbeat point's device/slug from the
+  // already-fetched catalog, by its catalog name -- never a literal
+  // "ems_periodic_heartbeat_indicator" string anywhere in this file. If the
+  // catalog ever drops or renames this point, heartbeatKey silently becomes
+  // null and the indicator has nothing to watch, rather than watching the
+  // wrong (or a nonexistent) point.
+  const heartbeatKey = useMemo(() => {
+    const point = catalog.find(
+      (item) => item.device === "EMS" && item.name_raw === HEARTBEAT_POINT_NAME,
+    );
+    return point ? `${point.device}/${point.slug}` : null;
+  }, [catalog]);
+
+  useEffect(() => {
+    if (!heartbeatKey) return;
+    const value = points[heartbeatKey];
+    if (value === undefined) return;
+    if (lastHeartbeatValue.current !== null && value !== lastHeartbeatValue.current) {
+      setHeartbeatTick(Date.now());
+    }
+    lastHeartbeatValue.current = value;
+  }, [heartbeatKey, points[heartbeatKey ?? ""]]);
 
   useEffect(() => {
     let closed = false;
@@ -109,18 +152,44 @@ export function useSimulator() {
           setModelTime(message.timestamp);
         }
 
+        // Gated on initialReplayComplete exactly like the toast logic this
+        // was already built for: a fresh connection's history replay must
+        // never be presented as something that just happened (Task 10
+        // review round, S7). Task 10.1 items 1 and 4 reuse the same gate.
         if (
           initialReplayComplete.current &&
           ["fault", "reset", "diagnostic", "scenario_step"].includes(
             message.type,
           )
         ) {
-          setLastEvent({
+          const rare: RareEvent = {
             id: message.id,
             type: message.type as RareEvent["type"],
             timestamp: message.timestamp,
             payload: message.payload,
-          });
+          };
+          setLastEvent(rare);
+          setEvents((current) => [rare, ...current].slice(0, RECENT_EVENTS_LIMIT));
+          if (message.type === "reset") {
+            setScenarioProgress([]);
+          }
+          if (message.type === "scenario_step") {
+            const step: ScenarioStepEvent = {
+              scenario: String(message.payload.scenario ?? ""),
+              index: Number(message.payload.index ?? 0),
+              action: String(message.payload.action ?? ""),
+              result: String(message.payload.result ?? ""),
+              error: String(message.payload.error ?? ""),
+            };
+            // Only ever append -- this list represents what has actually
+            // executed since connecting, never a predicted future step
+            // (Task 10.1 item 1). A new scenario name starts a fresh list
+            // rather than appending to a previous run's steps.
+            setScenarioProgress((current) => {
+              const sameRun = current.length > 0 && current[0].scenario === step.scenario;
+              return sameRun ? [...current, step] : [step];
+            });
+          }
         }
       };
       [
@@ -155,7 +224,31 @@ export function useSimulator() {
   }, []);
 
   return useMemo(
-    () => ({ status, catalog, points, history, modelTime, stream, lastEvent }),
-    [status, catalog, points, history, modelTime, stream, lastEvent],
+    () => ({
+      status,
+      catalog,
+      points,
+      history,
+      modelTime,
+      stream,
+      lastEvent,
+      events,
+      scenarioProgress,
+      heartbeatKey,
+      heartbeatTick,
+    }),
+    [
+      status,
+      catalog,
+      points,
+      history,
+      modelTime,
+      stream,
+      lastEvent,
+      events,
+      scenarioProgress,
+      heartbeatKey,
+      heartbeatTick,
+    ],
   );
 }

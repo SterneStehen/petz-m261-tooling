@@ -8,8 +8,12 @@ import {
   useState,
 } from "react";
 import * as echarts from "echarts";
-import { api } from "./api";
-import { useSimulator } from "./use-simulator";
+import { api, type Point, type Status } from "./api";
+import {
+  useSimulator,
+  type RareEvent,
+  type ScenarioStepEvent,
+} from "./use-simulator";
 
 type Page = "overview" | "control" | "lab";
 type Toast = { tone: "success" | "error"; text: string } | null;
@@ -130,6 +134,44 @@ const en: Text = {
   linkRestored: "Link restored and confirmed.",
   resetConfirmed: "Simulator reset and confirmed.",
   chartAria: "{title}: current value {value} {unit}",
+  chartAriaDual:
+    "{primaryTitle}: {primaryValue} {primaryUnit}; {secondaryTitle}: {secondaryValue} {secondaryUnit}",
+  heartbeatTitle: "EMS Periodic Heartbeat Indicator",
+  heartbeatLive: "Heartbeat live",
+  heartbeatWaiting: "Awaiting first tick…",
+  heartbeatLastTick: "Last tick {seconds}s ago",
+  scenarioProgressTitle: "Scenario progress",
+  recentEventsTitle: "Recent events",
+  eventTypeFault: "Fault",
+  eventTypeReset: "Reset",
+  eventTypeDiagnostic: "Diagnostic",
+  eventTypeScenarioStep: "Scenario step",
+  aboutButton: "About",
+  aboutEyebrow: "M261 simulator console",
+  aboutTitle: "About this program",
+  close: "Close",
+  aboutOriginal:
+    "An original M261 simulator console. Its navigation and layout take only general organisational principles from public business-software examples — no third-party assets, copy, or code.",
+  aboutCapabilities: "Capabilities",
+  aboutPointCount: "{count} modeled data points",
+  aboutDeviceCount: "{count} simulated devices",
+  aboutProtocols:
+    "Three protocol servers over one shared state: IEC-104, Modbus TCP, and an HTTP control API",
+  aboutScenarioEngine:
+    "A deterministic scenario engine driven by a single injectable clock — no wall-clock time in simulator logic",
+  aboutLiveEvents:
+    "A live event stream (Server-Sent Events) for telemetry, alarms, scenario progress, and diagnostics",
+  aboutTechnical: "Technical data (manufacturer specification)",
+  aboutChemistry: "Chemistry: LFP",
+  aboutCapacity: "System capacity: 261 kWh, nominal DC voltage 832 V",
+  aboutDcRange: "DC voltage range: 676–936 V",
+  aboutAcPower: "Nominal AC power: 130.5 kW (1.1× overload rating)",
+  aboutCooling: "Cooling: liquid, 5 kW chiller",
+  aboutUnconfirmed: "Unconfirmed parameters",
+  aboutUnconfirmedPointer:
+    "{count} configuration parameters are not yet confirmed by the manufacturer — see the \"Unconfirmed\" markers on the Overview configuration list.",
+  aboutUnconfirmedNone:
+    "No unconfirmed configuration parameters are currently reported by the backend.",
 };
 const uk: Text = {
   overview: "Огляд / Демонстрація",
@@ -245,6 +287,44 @@ const uk: Text = {
   linkRestored: "Звʼязок відновлено та підтверджено.",
   resetConfirmed: "Симулятор скинуто та підтверджено.",
   chartAria: "{title}: поточне значення {value} {unit}",
+  chartAriaDual:
+    "{primaryTitle}: {primaryValue} {primaryUnit}; {secondaryTitle}: {secondaryValue} {secondaryUnit}",
+  heartbeatTitle: "Індикатор Periodic Heartbeat (EMS)",
+  heartbeatLive: "Heartbeat активний",
+  heartbeatWaiting: "Очікування першого тіку…",
+  heartbeatLastTick: "Останній тік {seconds} с тому",
+  scenarioProgressTitle: "Прогрес сценарію",
+  recentEventsTitle: "Останні події",
+  eventTypeFault: "Аварія",
+  eventTypeReset: "Скидання",
+  eventTypeDiagnostic: "Діагностика",
+  eventTypeScenarioStep: "Крок сценарію",
+  aboutButton: "Про програму",
+  aboutEyebrow: "Консоль симулятора M261",
+  aboutTitle: "Про цю програму",
+  close: "Закрити",
+  aboutOriginal:
+    "Оригінальна консоль симулятора M261. Навігація та структура запозичують лише загальні організаційні принципи публічних прикладів бізнес-ПЗ — без сторонніх ассетів, текстів чи коду.",
+  aboutCapabilities: "Можливості",
+  aboutPointCount: "{count} змодельованих точок даних",
+  aboutDeviceCount: "{count} симульованих пристроїв",
+  aboutProtocols:
+    "Три протокольні сервери над одним спільним станом: IEC-104, Modbus TCP та HTTP control API",
+  aboutScenarioEngine:
+    "Детермінований рушій сценаріїв на єдиному інжектованому годиннику — без реального часу в логіці симулятора",
+  aboutLiveEvents:
+    "Живий потік подій (Server-Sent Events) для телеметрії, аварій, прогресу сценарію та діагностики",
+  aboutTechnical: "Технічні дані (специфікація виробника)",
+  aboutChemistry: "Хімія: LFP",
+  aboutCapacity: "Ємність системи: 261 кВт·год, номінальна напруга DC 832 В",
+  aboutDcRange: "Діапазон напруги DC: 676–936 В",
+  aboutAcPower: "Номінальна потужність AC: 130,5 кВт (перевантаження 1,1×)",
+  aboutCooling: "Охолодження: рідинне, чиллер 5 кВт",
+  aboutUnconfirmed: "Непідтверджені параметри",
+  aboutUnconfirmedPointer:
+    "{count} параметрів конфігурації ще не підтверджені виробником — див. позначки «Непідтверджено» у списку конфігурації на Overview.",
+  aboutUnconfirmedNone:
+    "Наразі backend не повідомляє про непідтверджені параметри конфігурації.",
 };
 const uiText = { en, uk };
 type LanguageState = {
@@ -324,22 +404,28 @@ function Metric({
     </section>
   );
 }
-function ConfirmationDialog({
-  title,
-  detail,
-  onCancel,
-  onConfirm,
+// Task 10.1 item 5: shared modal shell -- both ConfirmationDialog and the
+// new AboutDialog use the same focus-management/Escape/backdrop logic
+// instead of duplicating it. Focus goes to the first focusable descendant
+// on mount (for ConfirmationDialog that's still exactly the Cancel button,
+// same as before this was extracted), Tab is trapped inside, Escape closes.
+function Modal({
+  labelId,
+  onClose,
+  className = "",
+  children,
 }: {
-  title: string;
-  detail: string;
-  onCancel: () => void;
-  onConfirm: () => void;
+  labelId: string;
+  onClose: () => void;
+  className?: string;
+  children: React.ReactNode;
 }) {
-  const { t } = useLanguage();
   const dialogRef = useRef<HTMLElement>(null);
-  const cancelRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
-    cancelRef.current?.focus();
+    const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    );
+    focusable?.[0]?.focus();
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => {
@@ -349,7 +435,7 @@ function ConfirmationDialog({
   const trapFocus = (event: React.KeyboardEvent<HTMLElement>) => {
     if (event.key === "Escape") {
       event.preventDefault();
-      onCancel();
+      onClose();
       return;
     }
     if (event.key !== "Tab") return;
@@ -371,25 +457,104 @@ function ConfirmationDialog({
     <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => event.preventDefault()}>
       <section
         ref={dialogRef}
-        className="dialog"
+        className={`dialog ${className}`}
         role="dialog"
         aria-modal="true"
-        aria-labelledby="dialog-title"
+        aria-labelledby={labelId}
         onKeyDown={trapFocus}
       >
-        <p className="eyebrow">{t("confirmationRequired")}</p>
-        <h2 id="dialog-title">{title}</h2>
-        <p>{detail}</p>
-        <div className="button-row">
-          <button ref={cancelRef} className="button button--secondary" onClick={onCancel}>
-            {t("cancel")}
-          </button>
-          <button className="button button--danger" onClick={onConfirm}>
-            {t("confirmAction")}
-          </button>
-        </div>
+        {children}
       </section>
     </div>
+  );
+}
+function ConfirmationDialog({
+  title,
+  detail,
+  onCancel,
+  onConfirm,
+}: {
+  title: string;
+  detail: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const { t } = useLanguage();
+  return (
+    <Modal labelId="dialog-title" onClose={onCancel}>
+      <p className="eyebrow">{t("confirmationRequired")}</p>
+      <h2 id="dialog-title">{title}</h2>
+      <p>{detail}</p>
+      <div className="button-row">
+        <button className="button button--secondary" onClick={onCancel}>
+          {t("cancel")}
+        </button>
+        <button className="button button--danger" onClick={onConfirm}>
+          {t("confirmAction")}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+function AboutDialog({
+  onClose,
+  catalog,
+  status,
+}: {
+  onClose: () => void;
+  catalog: Point[];
+  status: Status | null;
+}) {
+  const { t } = useLanguage();
+  const pointCount = catalog.length;
+  const deviceCount = useMemo(
+    () => new Set(catalog.map((item) => item.device)).size,
+    [catalog],
+  );
+  const unconfirmedCount = Object.values(status?.configuration ?? {}).filter(
+    (setting) => setting.unconfirmed,
+  ).length;
+  return (
+    <Modal labelId="about-title" onClose={onClose} className="about-dialog">
+      <div className="about-header">
+        <div>
+          <p className="eyebrow">{t("aboutEyebrow")}</p>
+          <h2 id="about-title">{t("aboutTitle")}</h2>
+        </div>
+        <button className="button button--secondary" onClick={onClose}>
+          {t("close")}
+        </button>
+      </div>
+      <p>{t("aboutOriginal")}</p>
+      <section className="about-section">
+        <h3>{t("aboutCapabilities")}</h3>
+        <ul>
+          <li>{t("aboutPointCount", { count: pointCount })}</li>
+          <li>{t("aboutDeviceCount", { count: deviceCount })}</li>
+          <li>{t("aboutProtocols")}</li>
+          <li>{t("aboutScenarioEngine")}</li>
+          <li>{t("aboutLiveEvents")}</li>
+        </ul>
+      </section>
+      <section className="about-section">
+        <h3>{t("aboutTechnical")}</h3>
+        <ul>
+          <li>{t("aboutChemistry")}</li>
+          <li>{t("aboutCapacity")}</li>
+          <li>{t("aboutDcRange")}</li>
+          <li>{t("aboutAcPower")}</li>
+          <li>{t("aboutCooling")}</li>
+        </ul>
+      </section>
+      <section className="about-section">
+        <h3>{t("aboutUnconfirmed")}</h3>
+        <p>
+          {unconfirmedCount > 0
+            ? t("aboutUnconfirmedPointer", { count: unconfirmedCount })
+            : t("aboutUnconfirmedNone")}
+        </p>
+      </section>
+    </Modal>
   );
 }
 function MiniChart({
@@ -452,6 +617,273 @@ function MiniChart({
   );
 }
 
+// Task 10.1 item 2: the "SoC and power" card's real second series -- both
+// samples arrays come from useSimulator's already-accumulated client-side
+// history of actually-received point values, never synthesised.
+function DualChart({
+  title,
+  primaryLabel,
+  primaryValue,
+  primarySamples,
+  primaryUnit,
+  primaryTone,
+  secondaryLabel,
+  secondaryValue,
+  secondarySamples,
+  secondaryUnit,
+  secondaryTone,
+}: {
+  title: string;
+  primaryLabel: string;
+  primaryValue: number;
+  primarySamples: number[];
+  primaryUnit: string;
+  primaryTone: string;
+  secondaryLabel: string;
+  secondaryValue: number;
+  secondarySamples: number[];
+  secondaryUnit: string;
+  secondaryTone: string;
+}) {
+  const { locale, t } = useLanguage();
+  const [chartNode, setChartNode] = useState<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const node = chartNode;
+    if (!node) return;
+    const chart = echarts.init(node, undefined, { renderer: "svg" });
+    const length = Math.max(primarySamples.length, secondarySamples.length, 1);
+    chart.setOption({
+      animation: false,
+      grid: { left: 4, right: 4, top: 10, bottom: 2 },
+      xAxis: {
+        type: "category",
+        show: false,
+        data: Array.from({ length }, (_, index) => String(index)),
+      },
+      yAxis: [
+        { type: "value", show: false },
+        { type: "value", show: false },
+      ],
+      series: [
+        {
+          name: primaryLabel,
+          type: "line",
+          yAxisIndex: 0,
+          data: primarySamples.length ? primarySamples : [primaryValue],
+          smooth: true,
+          symbol: "none",
+          lineStyle: { width: 2, color: primaryTone },
+          areaStyle: { color: `${primaryTone}22` },
+        },
+        {
+          name: secondaryLabel,
+          type: "line",
+          yAxisIndex: 1,
+          data: secondarySamples.length ? secondarySamples : [secondaryValue],
+          smooth: true,
+          symbol: "none",
+          lineStyle: { width: 2, color: secondaryTone },
+        },
+      ],
+    });
+    const observer = new ResizeObserver(() => chart.resize());
+    observer.observe(node);
+    const frame = requestAnimationFrame(() => chart.resize());
+    return () => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+      chart.dispose();
+    };
+  }, [
+    chartNode,
+    primarySamples,
+    secondarySamples,
+    primaryTone,
+    secondaryTone,
+    primaryValue,
+    secondaryValue,
+    primaryLabel,
+    secondaryLabel,
+  ]);
+  const primaryDisplay = number(primaryValue, locale);
+  const secondaryDisplay = number(secondaryValue, locale);
+  return (
+    <Card title={title} className="chart-card">
+      <div className="chart-value chart-value--dual">
+        <span style={{ color: primaryTone }}>
+          {primaryDisplay} <small>{primaryUnit}</small>
+        </span>
+        <span style={{ color: secondaryTone }}>
+          {secondaryDisplay} <small>{secondaryUnit}</small>
+        </span>
+      </div>
+      <div
+        ref={setChartNode}
+        className="chart"
+        role="img"
+        aria-label={t("chartAriaDual", {
+          primaryTitle: primaryLabel,
+          primaryValue: primaryDisplay,
+          primaryUnit,
+          secondaryTitle: secondaryLabel,
+          secondaryValue: secondaryDisplay,
+          secondaryUnit,
+        })}
+      />
+    </Card>
+  );
+}
+
+// Task 10.1 item 3: heartbeat is identified by useSimulator's catalog-driven
+// heartbeatKey (see HEARTBEAT_POINT_NAME there) -- this component only ever
+// receives a timestamp, never a point identifier of its own.
+function HeartbeatIndicator({ lastTickAt }: { lastTickAt: number | null }) {
+  const { t } = useLanguage();
+  const [prefersReducedMotion, setPrefersReducedMotion] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+  );
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const handler = () => setPrefersReducedMotion(media.matches);
+    media.addEventListener("change", handler);
+    return () => media.removeEventListener("change", handler);
+  }, []);
+  const [secondsAgo, setSecondsAgo] = useState<number | null>(null);
+  useEffect(() => {
+    if (lastTickAt === null) return;
+    const update = () =>
+      setSecondsAgo(Math.max(0, Math.round((Date.now() - lastTickAt) / 1000)));
+    update();
+    const timer = window.setInterval(update, 1000);
+    return () => window.clearInterval(timer);
+  }, [lastTickAt]);
+  // Always render the same element shape, whether or not a tick has been
+  // observed yet -- toggling between null and a real element shifts page
+  // layout depending purely on real-world timing of the first physics
+  // tick, which made this element source of nondeterministic screenshot
+  // diffs. The "awaiting" label is still honest: it never claims a tick
+  // happened before one actually did.
+  return (
+    <span className="heartbeat" title={t("heartbeatTitle")}>
+      {lastTickAt !== null && !prefersReducedMotion && (
+        <span key={lastTickAt} className="heartbeat-pulse" aria-hidden="true" />
+      )}
+      <span className="heartbeat-label">
+        {lastTickAt === null
+          ? t("heartbeatWaiting")
+          : prefersReducedMotion
+            ? t("heartbeatLastTick", { seconds: String(secondsAgo ?? 0) })
+            : t("heartbeatLive")}
+      </span>
+    </span>
+  );
+}
+
+// Reused by both the toast effect in App() and RecentEvents below, so the
+// two never describe the same event differently.
+function describeEvent(
+  event: RareEvent,
+  t: (key: string, values?: Record<string, string | number>) => string,
+) {
+  const p = event.payload;
+  switch (event.type) {
+    case "reset":
+      return t("eventReset");
+    case "diagnostic":
+      return t("eventDiagnostic");
+    case "scenario_step":
+      return t("eventScenarioStep", { index: String(p.index ?? "") });
+    case "fault":
+      return t("eventFault", {
+        device: String(p.device ?? ""),
+        slug: String(p.slug ?? ""),
+      });
+    default:
+      return "";
+  }
+}
+function eventTypeLabel(
+  type: RareEvent["type"],
+  t: (key: string, values?: Record<string, string | number>) => string,
+) {
+  switch (type) {
+    case "fault":
+      return t("eventTypeFault");
+    case "reset":
+      return t("eventTypeReset");
+    case "diagnostic":
+      return t("eventTypeDiagnostic");
+    case "scenario_step":
+      return t("eventTypeScenarioStep");
+  }
+}
+
+// Task 10.1 item 1: only ever renders steps that have already executed
+// (each entry arrives from a real scenario_step SSE event) -- never a
+// predicted/future step list. The most recent non-failed step is marked
+// "latest", not "current": the event stream only tells us a step finished,
+// never that a later one is currently in progress.
+function ScenarioProgress({ steps }: { steps: ScenarioStepEvent[] }) {
+  const { t } = useLanguage();
+  if (steps.length === 0) return null;
+  const lastIndex = steps.length - 1;
+  return (
+    <Card title={t("scenarioProgressTitle")}>
+      <ol className="scenario-progress">
+        {steps.map((step, index) => (
+          <li
+            key={`${step.scenario}-${step.index}`}
+            className={
+              step.result === "failed"
+                ? "scenario-step scenario-step--failed"
+                : index === lastIndex
+                  ? "scenario-step scenario-step--latest"
+                  : "scenario-step scenario-step--passed"
+            }
+          >
+            <span className="scenario-step-index">{step.index + 1}</span>
+            <span className="scenario-step-action">{step.action}</span>
+            {step.result === "failed" && step.error && (
+              <span className="scenario-step-error">{step.error}</span>
+            )}
+          </li>
+        ))}
+      </ol>
+    </Card>
+  );
+}
+
+// Task 10.1 item 4: capped, most-recent-first log -- useSimulator already
+// gates this list on initial_replay_complete the same way toasts are
+// gated, so a fresh connection's history replay never shows up here as
+// something that just happened.
+function RecentEvents({ events }: { events: RareEvent[] }) {
+  const { t, locale } = useLanguage();
+  if (events.length === 0) return null;
+  return (
+    <Card title={t("recentEventsTitle")}>
+      <ul className="recent-events">
+        {events.map((event) => (
+          <li
+            key={event.id}
+            className={`recent-event recent-event--${event.type}`}
+          >
+            <span className="recent-event-time">
+              {new Date(event.timestamp).toLocaleTimeString(locale)}
+            </span>
+            <span className="recent-event-type">
+              {eventTypeLabel(event.type, t)}
+            </span>
+            <span className="recent-event-detail">{describeEvent(event, t)}</span>
+          </li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
 export function App() {
   const simulator = useSimulator();
   const [page, setPage] = useState<Page>("overview");
@@ -474,21 +906,12 @@ export function App() {
     setToast(next);
     if (next) window.setTimeout(() => setToast(null), 5000);
   };
+  const [aboutOpen, setAboutOpen] = useState(false);
   useEffect(() => {
     if (!simulator.lastEvent) return;
-    const p = simulator.lastEvent.payload;
-    const messages: Record<string, string> = {
-      reset: t("eventReset"),
-      diagnostic: t("eventDiagnostic"),
-      scenario_step: t("eventScenarioStep", { index: String(p.index ?? "") }),
-      fault: t("eventFault", {
-        device: String(p.device ?? ""),
-        slug: String(p.slug ?? ""),
-      }),
-    };
     notify({
       tone: simulator.lastEvent.type === "fault" ? "error" : "success",
-      text: messages[simulator.lastEvent.type],
+      text: describeEvent(simulator.lastEvent, t),
     });
   }, [simulator.lastEvent?.id, language]);
   const props = { ...simulator, notify };
@@ -525,6 +948,7 @@ export function App() {
                 ? new Date(simulator.modelTime).toLocaleString(locale)
                 : t("loadingTime")}
             </span>
+            <HeartbeatIndicator lastTickAt={simulator.heartbeatTick} />
             <Chip
               tone={
                 simulator.stream === "connected"
@@ -549,6 +973,12 @@ export function App() {
             >
               {t("language")}
             </button>
+            <button
+              className="topbar-button"
+              onClick={() => setAboutOpen(true)}
+            >
+              {t("aboutButton")}
+            </button>
           </div>
         </header>
         <main>
@@ -560,6 +990,13 @@ export function App() {
           <div className={`toast toast--${toast.tone}`} role="status">
             {toast.text}
           </div>
+        )}
+        {aboutOpen && (
+          <AboutDialog
+            onClose={() => setAboutOpen(false)}
+            catalog={simulator.catalog}
+            status={simulator.status}
+          />
         )}
       </div>
     </LanguageContext.Provider>
@@ -574,6 +1011,8 @@ function Overview({
   modelTime,
   notify,
   lastEvent,
+  events,
+  scenarioProgress,
 }: ReturnType<typeof useSimulator> & { notify: (toast: Toast) => void }) {
   const { locale, t } = useLanguage();
   const soc = point(points, "BMS", "soc"),
@@ -646,12 +1085,18 @@ function Overview({
         </div>
       ))}
       <div className="dashboard-grid">
-        <MiniChart
-          title={t("stateOfCharge")}
-          value={soc}
-          samples={history["BMS/soc"] ?? []}
-          unit="%"
-          tone="#2367D1"
+        <DualChart
+          title={t("socAndPower")}
+          primaryLabel={t("stateOfCharge")}
+          primaryValue={soc}
+          primarySamples={history["BMS/soc"] ?? []}
+          primaryUnit="%"
+          primaryTone="#2367D1"
+          secondaryLabel={t("actualPower")}
+          secondaryValue={power}
+          secondarySamples={history["EMS/last_charge_discharge_power_kw"] ?? []}
+          secondaryUnit="kW"
+          secondaryTone="#1C7C54"
         />
         <MiniChart
           title={t("batteryTemperature")}
@@ -706,6 +1151,8 @@ function Overview({
           ))}
         </div>
       </Card>
+      <ScenarioProgress steps={scenarioProgress} />
+      <RecentEvents events={events} />
     </>
   );
 }

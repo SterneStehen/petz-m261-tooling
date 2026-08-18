@@ -118,6 +118,97 @@ test("keeps the connection status visible on mobile", async ({ page }, testInfo)
   await expect(page.locator(".topbar-status .chip")).toBeVisible();
 });
 
+// Task 10.1 item 5: the About dialog's numbers must come from the live
+// catalog, never a hardcoded literal -- fetch the same catalog the UI
+// fetches and assert the displayed counts match it exactly, so this test
+// would fail if the UI ever drifted to a stale hardcoded number instead.
+test("About dialog is accessible, catalog-sourced, and screenshot-covered", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const catalogResponse = await page.request.get("/api/v1/catalog");
+  expect(catalogResponse.ok()).toBeTruthy();
+  const catalog = (await catalogResponse.json()) as {
+    points: Array<{ device: string }>;
+  };
+  const expectedPointCount = catalog.points.length;
+  const expectedDeviceCount = new Set(catalog.points.map((p) => p.device))
+    .size;
+
+  await page.getByRole("button", { name: "About", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "About this program" });
+  await expect(dialog).toBeVisible();
+  await expect(page.getByRole("button", { name: "Close" })).toBeFocused();
+
+  await expect(
+    dialog.getByText(`${expectedPointCount} modeled data points`),
+  ).toBeVisible();
+  await expect(
+    dialog.getByText(`${expectedDeviceCount} simulated devices`),
+  ).toBeVisible();
+
+  await expect(page).toHaveScreenshot("about-dialog.png", {
+    fullPage: true,
+    mask: dynamicValues(page),
+    maxDiffPixels: 100,
+  });
+
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+});
+
+test("heartbeat indicator moves from awaiting to live once a tick is observed", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const heartbeat = page.locator(".heartbeat");
+  // Always rendered, in the same shape, regardless of tick timing --
+  // otherwise this element's presence/absence would itself be a source of
+  // flaky, timing-dependent layout shifts (see Task 10.1 fix notes).
+  await expect(heartbeat).toBeVisible();
+  await expect(heartbeat).toContainText("Awaiting first tick");
+  await expect(heartbeat).toContainText("Heartbeat live", { timeout: 10_000 });
+});
+
+test("SoC and power chart shows two real series, not one", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const chart = page.locator(".dashboard-grid .chart-card").first();
+  const img = chart.locator("[role='img']");
+  await expect(img).toHaveAttribute("aria-label", /State of charge/);
+  await expect(img).toHaveAttribute("aria-label", /Actual power/);
+});
+
+// Task 10.1 item 1: the progress card must not exist before any step has
+// actually run (never predict steps that haven't happened yet), then must
+// show exactly the steps a real scenario run produced, in order.
+test("shows scenario progress and recent events only as they actually happen", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: "Overview / Demo" }),
+  ).toBeVisible();
+  await expect(page.getByText("Scenario progress")).toHaveCount(0);
+
+  await post(page, "/scenario/load", { name: "72_hour_monitoring.yaml" });
+  await post(page, "/scenario/start");
+  await expect
+    .poll(() => scenarioStatus(page), { timeout: 60_000 })
+    .toMatchObject({ running: false, cursor: 3, error: "" });
+
+  await expect(
+    page.getByRole("heading", { name: "Scenario progress" }),
+  ).toBeVisible();
+  await expect(page.locator(".scenario-step")).toHaveCount(3);
+
+  await expect(
+    page.getByRole("heading", { name: "Recent events" }),
+  ).toBeVisible();
+  await expect(page.locator(".recent-event").first()).toBeVisible();
+});
+
 type State = { points: Array<{ device: string; slug: string; value: number }> };
 type ScenarioStatus = { running: boolean; cursor: number; error: string };
 
