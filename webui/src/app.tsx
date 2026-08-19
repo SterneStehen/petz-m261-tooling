@@ -165,6 +165,54 @@ const en: Text = {
     "A deterministic scenario engine driven by a single injectable clock — no wall-clock time in simulator logic",
   aboutLiveEvents:
     "A live event stream (Server-Sent Events) for telemetry, alarms, scenario progress, and diagnostics",
+  aboutProtocolsHeading: "Protocols & interfaces",
+  aboutProtocolModbus:
+    "Modbus TCP on port 502 — read/write against the shared point store (functions 02/03/04/06/16)",
+  aboutProtocolIec104:
+    "IEC-104 on port 2404 — station/general interrogation, spontaneous transmission, single and setpoint commands",
+  aboutProtocolControlApi:
+    "HTTP control API on port 8081 (loopback-only by default) — fault injection, link-fault simulation, scenario playback, clock control, reset; no equivalent on the real M261",
+  aboutAlarmsHeading: "Alarms & fault injection",
+  aboutAlarmsCatalogDriven:
+    "Every catalog point classified as an alarm can be injected or cleared individually, not just a fixed hand-picked list",
+  aboutAlarmsSeverity:
+    "Severity is shown only where the manufacturer catalog documents one; alarms with no documented severity are shown without an assumed level",
+  aboutAlarmsControlApi:
+    "Alarms can be triggered or cleared from the Test Lab, or directly via POST /faults and DELETE /faults/{device}/{point}",
+  aboutAlarmsSearch: "Full-text search/filter across the alarm catalog for fast lookup during testing",
+  aboutLinkFaultHeading: "Link fault simulation",
+  aboutLinkFaultModes:
+    "Four independent fault modes per protocol: connection drop, hang, delay, and EMS periodic-heartbeat pause",
+  aboutLinkFaultPerProtocol:
+    "IEC-104 and Modbus TCP links can be faulted independently, and cleared one at a time or all at once",
+  aboutLinkFaultStatus:
+    "The simulator reports back the authoritative link-fault status it actually applied, not just the request it received",
+  aboutDangerHeading: "Danger zone commands",
+  aboutDangerTripClear:
+    "Trip and Clear Protection are modeled but gated behind a backend allow_dangerous configuration flag — rejected outright when it is disabled",
+  aboutDangerConfirm:
+    "The console requires an explicit confirmation step before dispatching either command",
+  aboutScenarioHeading: "Scenario engine & guided demo",
+  aboutScenarioLibrary:
+    "Eight bundled scenarios covering restart, SoC/power limit violations, EMS link loss, alarm activation, repeated commands, and a 72-hour monitoring run",
+  aboutScenarioProgress:
+    "Scenario progress and individual step outcomes are reported live over the event stream",
+  aboutGuidedDemo:
+    "A one-click \"Prepare demo\" action drives the simulator into a ready, presentable state and waits for backend confirmation before the operator continues",
+  aboutOpsHeading: "Diagnostics & operations",
+  aboutDeterministicReset:
+    "POST /reset restores the exact deterministic state right after process start, without restarting the process",
+  aboutDiagnosticsReporting:
+    "Commands the backend accepts but does not model an effect for are reported back as diagnostics rather than silently dropped",
+  aboutHealthEndpoints:
+    "Liveness and readiness endpoints (/health/live, /health/ready) for orchestration and monitoring",
+  aboutEventLogPersisted:
+    "The recent-events log is persisted across page reloads and can be downloaded as a file for offline analysis",
+  aboutDeploymentHeading: "Deployment",
+  aboutDeploymentDocker:
+    "Ships as a single Docker Compose service; the control API stays loopback-only end to end, even behind Docker's port forwarding",
+  aboutDeploymentLocalization:
+    "Bilingual operator interface (English / Ukrainian) with a live language switch, no reload required",
   aboutTechnical: "Technical data (manufacturer specification)",
   aboutChemistry: "Chemistry: LFP",
   aboutCapacity: "System capacity: 261 kWh, nominal DC voltage 832 V",
@@ -321,6 +369,54 @@ const uk: Text = {
     "Детермінований рушій сценаріїв на єдиному інжектованому годиннику — без реального часу в логіці симулятора",
   aboutLiveEvents:
     "Живий потік подій (Server-Sent Events) для телеметрії, аварій, прогресу сценарію та діагностики",
+  aboutProtocolsHeading: "Протоколи та інтерфейси",
+  aboutProtocolModbus:
+    "Modbus TCP на порту 502 — читання/запис у спільне сховище точок (функції 02/03/04/06/16)",
+  aboutProtocolIec104:
+    "IEC-104 на порту 2404 — станційний/загальний опит, спонтанна передача, поодинокі команди та команди уставок",
+  aboutProtocolControlApi:
+    "HTTP control API на порту 8081 (лише loopback за замовчуванням) — активація аварій, імітація збою звʼязку, відтворення сценаріїв, керування годинником, скидання; аналога на реальному M261 немає",
+  aboutAlarmsHeading: "Аварії та активація несправностей",
+  aboutAlarmsCatalogDriven:
+    "Активувати чи очистити можна будь-яку точку каталогу класу «аварія» — це не фіксований обмежений список",
+  aboutAlarmsSeverity:
+    "Рівень серйозності показується лише там, де він задокументований виробником у каталозі; аварії без задокументованого рівня показуються без припущення про нього",
+  aboutAlarmsControlApi:
+    "Аварії можна активувати чи очищати зі Стенду або напряму через POST /faults та DELETE /faults/{device}/{point}",
+  aboutAlarmsSearch: "Повнотекстовий пошук/фільтр по каталогу аварій для швидкого пошуку під час тестування",
+  aboutLinkFaultHeading: "Імітація збою звʼязку",
+  aboutLinkFaultModes:
+    "Чотири незалежні режими несправності на кожен протокол: відключення, зависання, затримка та пауза періодичного heartbeat EMS",
+  aboutLinkFaultPerProtocol:
+    "Звʼязок IEC-104 та Modbus TCP можна псувати незалежно, а очищати — по одному або всі одразу",
+  aboutLinkFaultStatus:
+    "Симулятор повідомляє авторитетний стан збою звʼязку, який він фактично застосував, а не лише отриманий запит",
+  aboutDangerHeading: "Небезпечні команди",
+  aboutDangerTripClear:
+    "Trip та Clear Protection змодельовані, але приховані за прапорцем конфігурації backend allow_dangerous — за його вимкнення вони відхиляються повністю",
+  aboutDangerConfirm:
+    "Консоль вимагає явного підтвердження перед надсиланням будь-якої з цих команд",
+  aboutScenarioHeading: "Рушій сценаріїв і супроводжувана демонстрація",
+  aboutScenarioLibrary:
+    "Вісім вбудованих сценаріїв: перезапуск, порушення лімітів SoC/потужності, втрата звʼязку з EMS, активація аварії, повторювані команди та 72-годинний моніторинг",
+  aboutScenarioProgress:
+    "Прогрес сценарію та результат кожного кроку повідомляються наживо через потік подій",
+  aboutGuidedDemo:
+    "Дія «Підготувати демонстрацію» одним кліком переводить симулятор у готовий, презентабельний стан і чекає на підтвердження backend, перш ніж оператор продовжить",
+  aboutOpsHeading: "Діагностика та експлуатація",
+  aboutDeterministicReset:
+    "POST /reset повертає точний детермінований стан одразу після старту процесу — без перезапуску самого процесу",
+  aboutDiagnosticsReporting:
+    "Команди, які backend приймає, але не моделює для них ефекту, повідомляються як діагностика, а не тихо відкидаються",
+  aboutHealthEndpoints:
+    "Ендпоінти живучості та готовності (/health/live, /health/ready) для оркестрації та моніторингу",
+  aboutEventLogPersisted:
+    "Лог останніх подій зберігається між перезавантаженнями сторінки і може бути скачаний як файл для офлайн-аналізу",
+  aboutDeploymentHeading: "Розгортання",
+  aboutDeploymentDocker:
+    "Постачається як єдиний сервіс Docker Compose; control API лишається доступним лише через loopback наскрізно, навіть за перенаправленням портів Docker",
+  aboutDeploymentLocalization:
+    "Двомовний інтерфейс оператора (англійська / українська) з живим перемиканням мови без перезавантаження",
   aboutTechnical: "Технічні дані (специфікація виробника)",
   aboutChemistry: "Хімія: LFP",
   aboutCapacity: "Ємність системи: 261 кВт·год, номінальна напруга DC 832 В",
@@ -541,6 +637,62 @@ function AboutDialog({
           <li>{t("aboutProtocols")}</li>
           <li>{t("aboutScenarioEngine")}</li>
           <li>{t("aboutLiveEvents")}</li>
+        </ul>
+      </section>
+      <section className="about-section">
+        <h3>{t("aboutProtocolsHeading")}</h3>
+        <ul>
+          <li>{t("aboutProtocolModbus")}</li>
+          <li>{t("aboutProtocolIec104")}</li>
+          <li>{t("aboutProtocolControlApi")}</li>
+        </ul>
+      </section>
+      <section className="about-section">
+        <h3>{t("aboutAlarmsHeading")}</h3>
+        <ul>
+          <li>{t("aboutAlarmsCatalogDriven")}</li>
+          <li>{t("aboutAlarmsSeverity")}</li>
+          <li>{t("aboutAlarmsControlApi")}</li>
+          <li>{t("aboutAlarmsSearch")}</li>
+        </ul>
+      </section>
+      <section className="about-section">
+        <h3>{t("aboutLinkFaultHeading")}</h3>
+        <ul>
+          <li>{t("aboutLinkFaultModes")}</li>
+          <li>{t("aboutLinkFaultPerProtocol")}</li>
+          <li>{t("aboutLinkFaultStatus")}</li>
+        </ul>
+      </section>
+      <section className="about-section">
+        <h3>{t("aboutDangerHeading")}</h3>
+        <ul>
+          <li>{t("aboutDangerTripClear")}</li>
+          <li>{t("aboutDangerConfirm")}</li>
+        </ul>
+      </section>
+      <section className="about-section">
+        <h3>{t("aboutScenarioHeading")}</h3>
+        <ul>
+          <li>{t("aboutScenarioLibrary")}</li>
+          <li>{t("aboutScenarioProgress")}</li>
+          <li>{t("aboutGuidedDemo")}</li>
+        </ul>
+      </section>
+      <section className="about-section">
+        <h3>{t("aboutOpsHeading")}</h3>
+        <ul>
+          <li>{t("aboutDeterministicReset")}</li>
+          <li>{t("aboutDiagnosticsReporting")}</li>
+          <li>{t("aboutHealthEndpoints")}</li>
+          <li>{t("aboutEventLogPersisted")}</li>
+        </ul>
+      </section>
+      <section className="about-section">
+        <h3>{t("aboutDeploymentHeading")}</h3>
+        <ul>
+          <li>{t("aboutDeploymentDocker")}</li>
+          <li>{t("aboutDeploymentLocalization")}</li>
         </ul>
       </section>
       <section className="about-section">

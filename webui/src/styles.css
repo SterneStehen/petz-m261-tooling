@@ -619,8 +619,8 @@ select {
   color: #a86500;
 }
 .about-dialog {
-  width: min(560px, 100%);
-  max-height: min(80vh, 640px);
+  width: min(640px, 100%);
+  max-height: min(85vh, 760px);
   overflow-y: auto;
 }
 .about-header {
