@@ -58,12 +58,6 @@ validate: generate webui
 	fi
 	@echo "generated catalog and web UI: no diff"
 
-# go vet/gofmt are always enforced; mypy is informational only for now —
-# catalog/ has a small number of pre-existing findings (missing type
-# stubs for openpyxl/PyYAML, one real pre-existing issue in normalize.py)
-# outside this task's own scope to clean up, so a failure here doesn't
-# fail the target. See docs/README.md.
-#
 # gofmt is scoped to tracked *.go files (git ls-files), not a bare
 # "gofmt -l ." over the whole working tree — a plain "." walk also
 # reaches any local, un-added .go scratch file or (in principle) build
@@ -78,7 +72,7 @@ lint:
 		echo "$$out"; \
 		exit 1; \
 	fi
-	-$(PYTHON) -m mypy catalog codegen
+	$(PYTHON) -m mypy catalog codegen
 
 clean:
 	rm -rf $(BIN_DIR)

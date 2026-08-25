@@ -109,25 +109,9 @@ jobs:
       # against synthetic fixtures) always runs.
       - run: python -m pytest tests/ -q -rs
 
-  # mypy is deliberately its own job, not a step swallowed by "|| true"
-  # inside `python` above: `|| true` throws away the real exit code, so a
-  # totally broken mypy invocation (bad config, crashed import) would look
-  # identical to a clean pass. continue-on-error here keeps this job's own
-  # reported status honest — it still shows failed (with full output) when
-  # mypy finds something — while never blocking the workflow or any
-  # branch-protection check that depends on it, which is the explicit,
-  # visible way to mark a check informational rather than hiding it.
-  #
-  # Why it's non-blocking at all: catalog/ has a small number of
-  # pre-existing findings (missing type stubs for openpyxl/PyYAML, one
-  # real pre-existing issue in normalize.py) outside this CI/CD change's
-  # own scope to fix — see the Makefile's `lint` target for the same
-  # rationale. Fixing those and promoting this to a required check is a
-  # follow-up, not part of this change.
   mypy:
-    name: mypy (informational)
+    name: mypy
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

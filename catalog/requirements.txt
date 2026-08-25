@@ -3,3 +3,5 @@ PyYAML>=6.0
 pypinyin>=0.51
 pytest>=8.0
 mypy>=1.10
+types-openpyxl
+types-PyYAML

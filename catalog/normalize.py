@@ -46,10 +46,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-try:
-    from pypinyin import Style, pinyin
-except ImportError:  # pragma: no cover - dependency declared in requirements.txt
-    pinyin = None
+from pypinyin import Style, pinyin
 
 # Safe, evidence-based phrase/word-order foldings (see module docstring,
 # kind 1 and 2). Applied case-insensitively before casefolding.
@@ -148,7 +145,7 @@ def slugify(name: str) -> str:
     """
     s = name.replace("\xa0", " ").strip()
 
-    if pinyin is not None and any("一" <= ch <= "鿿" for ch in s):
+    if any("一" <= ch <= "鿿" for ch in s):
         syllables = pinyin(s, style=Style.NORMAL, errors="default")
         s = " ".join(part for group in syllables for part in group)
     else:
