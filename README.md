@@ -83,10 +83,14 @@ Three workflows under `.github/workflows/`:
   Compose. The only input is `image_tag`, and the workflow rejects
   anything except `sha-<40 lowercase hex>` or a stable release tag
   `X.Y.Z`; it refuses `latest`, prereleases, arbitrary refs, and malformed
-  tags. Before touching deployment state it verifies that
-  `ghcr.io/<owner>/<repo>:<image_tag>` actually exists in public GHCR.
+  tags. Before touching deployment state it resolves
+  `ghcr.io/<owner>/<repo>:<image_tag>` to its exact OCI digest and verifies
+  both that digest's existence in public GHCR and its signed SLSA provenance.
+  Verification accepts only an attestation from this repository's
+  `release.yml`; the GitHub CLI used for it is downloaded with a pinned SHA-256
+  into the runner's temporary directory, not installed on the deployment host.
   Deployment happens locally in `/opt/m261sim`: it writes
-  `M261SIM_IMAGE=ghcr.io/...:<image_tag>` into `.env`, runs `docker
+  `M261SIM_IMAGE=ghcr.io/...@sha256:...` into `.env`, runs `docker
   compose pull`, then `docker compose up -d --remove-orphans`, and calls
   the repository's `simulator/cmd/deploy-probe` checker.
 
@@ -98,8 +102,8 @@ Three workflows under `.github/workflows/`:
   non-exception response, and a real IEC-104 session to `127.0.0.1:2404`
   completes `STARTDT_ACT`/`STARTDT_CON` plus a `C_IC_NA_1` general
   interrogation with valid activation, data, and termination frames. A
-  successful deploy then updates `/opt/m261sim/.deploy-state` with the
-  deployed image reference as the new previous known-good state. On any
+  successful deploy then updates `/opt/m261sim/.deploy-state` with the exact
+  deployed digest reference as the new previous known-good state. On any
   verification failure, the workflow restores the image recorded in
   `.deploy-state`, reruns Compose, rechecks with the same full probe, and
   still fails the workflow even if rollback succeeds.
