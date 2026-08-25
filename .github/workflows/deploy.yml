@@ -1,0 +1,177 @@
+name: Deploy
+
+# Manual only, by design: this rolls a specific already-published image
+# tag out to a real host, so it's a deliberate human action, never a side
+# effect of a push. Guarding *which* commits can reach an environment at
+# all is a repo-settings concern, not something re-implemented here — see
+# the "Deployment branches and tags" rule on each GitHub Environment,
+# documented in README.md's CI/CD section. This workflow additionally
+# refuses to run at all against a tag that was never actually published
+# (see "Verify image exists", below), so a typo'd image_tag fails fast
+# before anything touches the remote host.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [staging, production]
+        required: true
+      image_tag:
+        description: >-
+          Immutable image tag to deploy (a release semver tag like "1.2.3",
+          or "sha-<commit>" from a workflow_dispatch release build) — see
+          the Packages page for what's actually been published.
+        type: string
+        required: true
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # One deploy at a time *per environment* -- staging and production never
+  # block each other, but two people (or two accidental re-runs) targeting
+  # the same environment queue instead of racing the same remote host.
+  group: deploy-${{ inputs.environment }}
+
+jobs:
+  deploy:
+    name: Deploy (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    # Binding the job to the GitHub Environment is what actually gets us
+    # environment-scoped secrets, optional required reviewers, and the
+    # deployment-branch/tag restriction mentioned above -- all configured
+    # on the Environment itself (Settings -> Environments), not here.
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      packages: read # only to read GHCR image metadata below, never pushed to
+    steps:
+      - name: Validate inputs
+        run: |
+          if [ -z "${{ inputs.image_tag }}" ]; then
+            echo "::error::image_tag is required (got an empty string)"
+            exit 1
+          fi
+
+      # GHCR requires a lowercase image path; github.repository preserves
+      # the repository's actual casing, so it can't be used directly
+      # (matches release.yml's own image-name computation).
+      - name: Compute image name
+        id: image
+        run: |
+          echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # Only needed if the package is private -- a public repository's
+      # GHCR packages are typically public too, but this costs nothing
+      # and makes the next step work either way. The *remote host* needs
+      # its own separate `docker login ghcr.io` if its pull in the SSH
+      # step below hits a private package; that's outside this workflow's
+      # four documented secrets and is a one-time manual setup step on
+      # the host if it's ever needed (see README.md).
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify image exists
+        run: |
+          docker buildx imagetools inspect "${{ steps.image.outputs.name }}:${{ inputs.image_tag }}"
+
+      - name: Write deploy key
+        id: key
+        run: |
+          key_file="$RUNNER_TEMP/deploy_key"
+          umask 077
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > "$key_file"
+          echo "path=$key_file" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy over SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          KEY_FILE: ${{ steps.key.outputs.path }}
+          IMAGE_REF: ${{ steps.image.outputs.name }}:${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          known_hosts="$RUNNER_TEMP/known_hosts"
+          # Trust-on-first-connect for this run: there's no known_hosts
+          # secret in the documented set (DEPLOY_HOST/USER/SSH_KEY/PATH),
+          # so this pins the host key freshly every run rather than
+          # skipping verification outright (no StrictHostKeyChecking=no).
+          # A maintainer wanting strict pinning across runs can add a
+          # DEPLOY_KNOWN_HOSTS secret and swap this line for writing it
+          # verbatim instead.
+          ssh-keyscan -H "$DEPLOY_HOST" > "$known_hosts" 2>/dev/null
+
+          ssh_cmd() {
+            ssh -i "$KEY_FILE" -o UserKnownHostsFile="$known_hosts" \
+              -o BatchMode=yes -o ConnectTimeout=10 \
+              "$DEPLOY_USER@$DEPLOY_HOST" "$@"
+          }
+
+          # Single remote script: update the compose env file, pull, redeploy,
+          # then poll the *existing* container healthcheck (docker-compose.yml
+          # already defines one for this service) and roll back to whatever
+          # was running before on failure. Runs as one ssh invocation so the
+          # whole sequence is atomic from this job's point of view -- either
+          # it ends healthy on the new tag, or it ends healthy on the old one,
+          # never left mid-transition.
+          ssh_cmd bash -s <<REMOTE
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+
+          old_ref="\$(grep -o '^M261SIM_IMAGE=.*' .env 2>/dev/null | cut -d= -f2- || true)"
+
+          set_image() {
+            if [ -f .env ] && grep -q '^M261SIM_IMAGE=' .env; then
+              sed -i "s#^M261SIM_IMAGE=.*#M261SIM_IMAGE=\$1#" .env
+            else
+              echo "M261SIM_IMAGE=\$1" >> .env
+            fi
+          }
+
+          wait_healthy() {
+            for _ in \$(seq 1 30); do
+              cid="\$(docker compose ps -q m261sim)"
+              if [ -n "\$cid" ] && [ "\$(docker inspect -f '{{.State.Health.Status}}' "\$cid" 2>/dev/null)" = "healthy" ]; then
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
+
+          set_image "$IMAGE_REF"
+          docker compose pull
+          docker compose up -d --remove-orphans
+
+          if wait_healthy; then
+            echo "deploy healthy on $IMAGE_REF"
+            exit 0
+          fi
+
+          echo "::error::$IMAGE_REF did not become healthy within 60s" >&2
+          if [ -n "\$old_ref" ] && [ "\$old_ref" != "$IMAGE_REF" ]; then
+            echo "rolling back to \$old_ref" >&2
+            set_image "\$old_ref"
+            docker compose pull
+            docker compose up -d --remove-orphans
+            if wait_healthy; then
+              echo "rollback to \$old_ref healthy" >&2
+            else
+              echo "::error::rollback to \$old_ref also failed to become healthy" >&2
+            fi
+          else
+            echo "::error::no previous image tag recorded in .env -- nothing to roll back to" >&2
+          fi
+          exit 1
+          REMOTE
+
+      - name: Remove deploy key
+        if: always()
+        run: rm -f "${{ steps.key.outputs.path }}"

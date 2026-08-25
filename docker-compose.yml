@@ -1,5 +1,16 @@
 services:
   m261sim:
+    # Both `image:` and `build:` are deliberate: local development runs
+    # `docker compose build`/`up --build`, which builds from ./Dockerfile
+    # and tags the result as `image:` below (M261SIM_IMAGE unset ->
+    # m261sim:local). Production instead sets M261SIM_IMAGE (in .env; see
+    # .env.example) to a published `ghcr.io/.../petz-m261-tooling:<tag>`
+    # and runs `docker compose pull && docker compose up -d` — Compose
+    # only falls back to building when the named image isn't already
+    # present locally, so a plain `up -d` after a successful `pull` uses
+    # the published image as-is, never rebuilds it. See deploy.yml and
+    # README.md's CI/CD section.
+    image: ${M261SIM_IMAGE:-m261sim:local}
     build: .
     restart: unless-stopped
     ports:

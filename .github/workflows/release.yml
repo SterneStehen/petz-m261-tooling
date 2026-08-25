@@ -1,0 +1,99 @@
+name: Release
+
+# Tag pushes are the normal release path: `git tag vX.Y.Z && git push --tags`
+# drives docker/metadata-action's semver tagging below. workflow_dispatch is
+# the escape hatch for rebuilding/republishing an image without cutting a
+# new tag (e.g. to pick up a base-image security fix) — run from whichever
+# branch/ref you select in the dispatch dropdown; without a tag ref, only
+# the commit-sha tag is produced (see the tagging rules below).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+# No blanket top-level grant beyond the read every job needs for checkout;
+# the elevated permissions publishing actually requires (packages,
+# attestations, OIDC token) are declared only on the one job that uses
+# them, below.
+permissions:
+  contents: read
+
+# Never cancel a publish that's already in flight — a half-pushed image
+# under a reused tag is worse than a slightly delayed second run. Same-ref
+# triggers still queue behind each other via the group.
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  # Reuses ci.yml's own jobs (gofmt/vet/build/test, pytest, webui build +
+  # Playwright e2e, docker build) as the test gate instead of duplicating
+  # them here — see ci.yml's `workflow_call:` trigger. A release only
+  # publishes once every one of those passes.
+  test:
+    name: Test gate
+    uses: ./.github/workflows/ci.yml
+
+  build-and-push:
+    name: Build and push image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      attestations: write # publish the provenance attestation
+      id-token: write # OIDC token the attestation is signed with
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # GHCR requires a lowercase image path; github.repository preserves
+      # the repository's actual casing (SterneStehen/petz-m261-tooling),
+      # so it can't be used for the image ref directly.
+      - name: Compute image name
+        id: image
+        run: |
+          echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        id: meta
+        with:
+          images: ${{ steps.image.outputs.name }}
+          # Every build gets an immutable commit-sha tag regardless of
+          # trigger type. The semver tags only materialize on a `v*` tag
+          # push (docker/metadata-action reads github.ref); a
+          # workflow_dispatch run on a branch produces just the sha tag.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long,prefix=sha-
+          # latest=auto: only set "latest" for a stable (non-prerelease,
+          # e.g. not v1.2.3-rc1) semver tag -- never for a plain commit-sha
+          # build. This is the exact "latest only for stable non-
+          # prerelease releases" rule, implemented by the action itself
+          # rather than hand-rolled here.
+          flavor: |
+            latest=auto
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: build
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=release-build
+          cache-to: type=gha,mode=max,scope=release-build
+
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
