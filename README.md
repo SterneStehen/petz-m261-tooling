@@ -47,8 +47,7 @@ Three workflows under `.github/workflows/`:
 - **`ci.yml`** — runs on every push to `main` and every pull request:
   `gofmt`/`go vet`/`go build`/`go test -race`, the Python test suite, the
   Web UI build plus its Playwright browser tests, and a Docker build
-  smoke test. `mypy` runs as its own explicitly non-blocking
-  (`continue-on-error: true`) job — see that job's own comment for why.
+  smoke test, and a blocking `mypy` type check.
   A fifth job, `make generate (no diff)`, stays skipped unless a
   maintainer with access to the private manufacturer register maps sets
   the repository variable `HAS_REGISTERMAP` to `true` and adds their own
