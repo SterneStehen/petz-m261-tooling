@@ -242,6 +242,20 @@ test("recent events log can be downloaded and persists across a reload", async (
   page,
 }) => {
   await page.goto("/");
+  // The fault below is injected out-of-band via page.request.post, which
+  // bypasses the page's own JS entirely and can complete before its SSE
+  // EventSource has finished connecting -- on a loaded CI runner that race
+  // made the event arrive with nobody subscribed yet, so .recent-event
+  // never appeared (flaked in CI, see Task 10.1 About-dialog PR). Wait for
+  // the connected chip first, exactly the signal simulator.stream ===
+  // "connected" that gates it, so the fault fires only once a live
+  // listener is actually attached. Matched by class, scoped to the topbar,
+  // not text: the chip's rendered text is "Connected" sharing its parent
+  // <span> with a sibling aria-hidden status-dot element (an exact
+  // getByText("Connected") match on that combined text node is unreliable),
+  // and chip--good is reused by the per-device "Online" chips further down
+  // the page, so an unscoped class match is ambiguous too.
+  await expect(page.locator(".topbar-status .chip--good")).toBeVisible();
   await post(page, "/faults", {
     device: "BMS",
     point: "cell_temperature_too_high",
