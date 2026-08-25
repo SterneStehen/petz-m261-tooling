@@ -3,7 +3,7 @@ name: Deploy
 # Manual only, by design: this rolls a specific, already-published image to
 # the one current GitHub Environment (`dev`) on the self-hosted runner that
 # lives on the Docker Compose host itself. The workflow refuses malformed,
-# mutable, or unpublished tags before touching /opt/m261sim.
+# mutable, unpublished, or unattested tags before touching /opt/m261sim.
 on:
   workflow_dispatch:
     inputs:
@@ -66,15 +66,53 @@ jobs:
           echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Verify image exists
+        id: image-manifest
         env:
           IMAGE_REF: ${{ steps.image.outputs.name }}:${{ inputs.image_tag }}
         run: |
           set -euo pipefail
-          docker buildx imagetools inspect "$IMAGE_REF"
+          image_digest="$(docker buildx imagetools inspect "$IMAGE_REF" --format '{{.Manifest.Digest}}')"
+          if [[ ! "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::GHCR returned an invalid OCI digest for $IMAGE_REF: $image_digest"
+            exit 1
+          fi
+          echo "ref=${{ steps.image.outputs.name }}@$image_digest" >> "$GITHUB_OUTPUT"
+
+      # The self-hosted host's system GitHub CLI can be older than the
+      # attestation command. Download a fixed release into RUNNER_TEMP and
+      # verify the archive before using it; nothing is installed on the host.
+      - name: Install verified GitHub CLI for provenance verification
+        id: gh
+        env:
+          GH_VERSION: 2.93.0
+          GH_ARCHIVE_SHA256: 02d1290eba130e0b896f3709ffff22e1c75a51475ddb70476a85abc6b5807af0
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          tool_dir="$RUNNER_TEMP/gh-${GH_VERSION}"
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$GH_ARCHIVE_SHA256" "$archive" | sha256sum --check --status
+          mkdir -p "$tool_dir"
+          tar -xzf "$archive" --strip-components=1 -C "$tool_dir"
+          "$tool_dir/bin/gh" attestation verify --help >/dev/null
+          echo "path=$tool_dir/bin/gh" >> "$GITHUB_OUTPUT"
+
+      - name: Verify build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_PATH: ${{ steps.gh.outputs.path }}
+          IMAGE_REF: ${{ steps.image-manifest.outputs.ref }}
+        run: |
+          set -euo pipefail
+          "$GH_PATH" attestation verify "oci://$IMAGE_REF" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
 
       - name: Deploy locally on the self-hosted host
         env:
-          IMAGE_REF: ${{ steps.image.outputs.name }}:${{ inputs.image_tag }}
+          IMAGE_REF: ${{ steps.image-manifest.outputs.ref }}
           DEPLOY_DIR: /opt/m261sim
           STATE_FILE: /opt/m261sim/.deploy-state
         run: |
@@ -96,6 +134,22 @@ jobs:
             go -C "$GITHUB_WORKSPACE" run ./simulator/cmd/deploy-probe -compose-dir "$DEPLOY_DIR" || return
           }
 
+          resolve_to_digest_ref() {
+            local image_ref="$1"
+            if [[ "$image_ref" =~ ^.+@sha256:[0-9a-f]{64}$ ]]; then
+              printf '%s\n' "$image_ref"
+              return
+            fi
+            local image_name="${image_ref%:*}"
+            local image_digest
+            image_digest="$(docker buildx imagetools inspect "$image_ref" --format '{{.Manifest.Digest}}')" || return
+            if [[ ! "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "invalid OCI digest for previous image $image_ref: $image_digest" >&2
+              return 1
+            fi
+            printf '%s@%s\n' "$image_name" "$image_digest"
+          }
+
           cd "$GITHUB_WORKSPACE"
           previous_ref="$(cat "$STATE_FILE" 2>/dev/null || true)"
 
@@ -104,6 +158,13 @@ jobs:
           # was active in .env so a first workflow-run can still roll back.
           if [ -z "$previous_ref" ] && [ -f .env ]; then
             previous_ref="$(sed -n 's/^M261SIM_IMAGE=//p' .env | head -n 1)"
+          fi
+          if [ -n "$previous_ref" ]; then
+            previous_ref="$(resolve_to_digest_ref "$previous_ref")" || {
+              echo "::error::cannot resolve previous deployment image to an OCI digest" >&2
+              popd >/dev/null
+              exit 1
+            }
           fi
 
           set +e
@@ -125,6 +186,7 @@ jobs:
             rollback_status=$?
             set -e
             if [ "$rollback_status" -eq 0 ]; then
+              printf '%s\n' "$previous_ref" > "$STATE_FILE"
               echo "::error::rollback to $previous_ref succeeded, but this workflow still fails to surface the bad deploy" >&2
             else
               echo "::error::rollback verification failed for $previous_ref" >&2
