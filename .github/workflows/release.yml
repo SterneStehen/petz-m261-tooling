@@ -1,16 +1,25 @@
 name: Release
 
-# Tag pushes are the normal release path: `git tag vX.Y.Z && git push --tags`
-# drives docker/metadata-action's semver tagging below. workflow_dispatch is
-# the escape hatch for rebuilding/republishing an image without cutting a
-# new tag (e.g. to pick up a base-image security fix) — run from whichever
-# branch/ref you select in the dispatch dropdown; without a tag ref, only
-# the commit-sha tag is produced (see the tagging rules below).
+# main pushes publish a CI-vetted immutable commit image for deploy.yml to
+# consume; `v*` tags are the release path that adds semver tags and, for
+# stable releases only, `latest`. workflow_dispatch is the explicit rebuild
+# path for an immutable tag from an immutable source ref.
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Immutable source ref to build (40-char commit SHA or refs/tags/vX.Y.Z)
+        type: string
+        required: true
+      image_tag:
+        description: Explicit immutable image tag to publish (sha-<40 hex> or full semver)
+        type: string
+        required: true
 
 # No blanket top-level grant beyond the read every job needs for checkout;
 # the elevated permissions publishing actually requires (packages,
@@ -33,6 +42,10 @@ jobs:
   test:
     name: Test gate
     uses: ./.github/workflows/ci.yml
+    with:
+      # On manual dispatch, test exactly the immutable ref that will be
+      # checked out and published below.
+      checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.sha }}
 
   build-and-push:
     name: Build and push image
@@ -44,7 +57,25 @@ jobs:
       attestations: write # publish the provenance attestation
       id-token: write # OIDC token the attestation is signed with
     steps:
+      - name: Validate manual publish inputs
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_REF" =~ ^[0-9a-f]{40}$ && ! "$SOURCE_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::source_ref must be a 40-character commit SHA or refs/tags/vX.Y.Z[-prerelease]"
+            exit 1
+          fi
+          if [[ ! "$IMAGE_TAG" =~ ^sha-[0-9a-f]{40}$ && ! "$IMAGE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::image_tag must be sha-<40 lowercase hex> or a full semver tag like 1.2.3 or 1.2.3-rc1"
+            exit 1
+          fi
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
 
       # GHCR requires a lowercase image path; github.repository preserves
       # the repository's actual casing (SterneStehen/petz-m261-tooling),
@@ -62,25 +93,56 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Select publish tags
+        id: tags
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            {
+              echo "tags<<EOF"
+              echo "type=raw,value=$IMAGE_TAG"
+              echo "EOF"
+              echo "flavor=latest=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$REF_TYPE" == "branch" && "$REF_NAME" == "main" ]]; then
+            {
+              echo "tags<<EOF"
+              echo "type=sha,format=long,prefix=sha-"
+              echo "EOF"
+              echo "flavor=latest=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "tags<<EOF"
+            echo "type=semver,pattern={{version}}"
+            echo "type=semver,pattern={{major}}.{{minor}}"
+            echo "type=sha,format=long,prefix=sha-"
+            echo "EOF"
+            echo "flavor<<EOF"
+            echo "latest=auto"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
           images: ${{ steps.image.outputs.name }}
-          # Every build gets an immutable commit-sha tag regardless of
-          # trigger type. The semver tags only materialize on a `v*` tag
-          # push (docker/metadata-action reads github.ref); a
-          # workflow_dispatch run on a branch produces just the sha tag.
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=long,prefix=sha-
-          # latest=auto: only set "latest" for a stable (non-prerelease,
-          # e.g. not v1.2.3-rc1) semver tag -- never for a plain commit-sha
-          # build. This is the exact "latest only for stable non-
-          # prerelease releases" rule, implemented by the action itself
-          # rather than hand-rolled here.
-          flavor: |
-            latest=auto
+          # main pushes publish only the immutable commit tag. `v*` tag
+          # pushes add semver tags and latest=auto. workflow_dispatch
+          # publishes only the explicit immutable tag the caller provided,
+          # even if source_ref points at a stable release tag.
+          tags: ${{ steps.tags.outputs.tags }}
+          flavor: ${{ steps.tags.outputs.flavor }}
 
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         id: build

@@ -62,66 +62,87 @@ Three workflows under `.github/workflows/`:
 
 - **`release.yml`** — publishes a container image to GitHub Container
   Registry (GHCR) as `ghcr.io/<owner>/<repo>` (lowercased; GHCR requires
-  it). Triggers on pushing a tag matching `v*` (`git tag v1.2.3 && git
-  push --tags`) or manual dispatch (Actions tab → Release → Run
-  workflow), and only runs `build-and-push` after the `ci.yml` test gate
-  passes. Every build gets an immutable `sha-<commit>` tag; a `v*` tag
-  push additionally gets semver tags (`1.2.3`, `1.2`) and, only for a
-  stable (non-prerelease, e.g. not `1.2.3-rc1`) tag, `latest`. The pushed
-  image carries OCI labels and a signed build-provenance attestation
-  (viewable via `gh attestation verify` or the Packages page).
+  it). Triggers on every push to `main`, every pushed `v*` tag (`git tag
+  v1.2.3 && git push --tags`), or manual dispatch (Actions tab → Release
+  → Run workflow), and only runs `build-and-push` after the `ci.yml` test
+  gate passes. A successful `main` push publishes exactly one immutable
+  test image tag: `sha-<full-commit-sha>`. A pushed `v*` tag publishes
+  the immutable release tag (`1.2.3`), the existing semver companion tag
+  (`1.2`), and `latest` only for a stable non-prerelease tag. Manual
+  dispatch requires both an immutable source ref (40-character commit SHA
+  or `refs/tags/vX.Y.Z`) and an explicit immutable image tag; it never
+  auto-publishes `latest`. The pushed image carries OCI labels, Buildx GHA
+  cache metadata, and a signed build-provenance attestation (viewable via
+  `gh attestation verify` or the Packages page). The GHCR package is
+  public.
 
-- **`deploy.yml`** — manual-only (`workflow_dispatch`), with two inputs:
-  `environment` (`staging` or `production`) and `image_tag` (an
-  already-published tag from the list above — check the Packages page).
-  It verifies that tag actually exists in GHCR, then rolls it out over
-  SSH: writes `M261SIM_IMAGE=ghcr.io/.../<tag>` into `.env` at
-  `DEPLOY_PATH` on the target host, runs `docker compose pull` and
-  `docker compose up -d --remove-orphans`, and polls the service's
-  existing Compose healthcheck for up to 60s. If it never reports
-  healthy, the workflow automatically rewrites `.env` back to whichever
-  tag was running before, redeploys that, and still fails the job — so a
-  bad deploy self-heals but is never silently swallowed.
+- **`deploy.yml`** — manual-only (`workflow_dispatch`) and bound only to
+  the GitHub Environment named **`dev`**. It runs exclusively on the
+  self-hosted runner labels `[self-hosted, linux, m261-dev]`, which is
+  installed directly on the Linux server that already hosts Docker
+  Compose. The only input is `image_tag`, and the workflow rejects
+  anything except `sha-<40 lowercase hex>` or a stable release tag
+  `X.Y.Z`; it refuses `latest`, prereleases, arbitrary refs, and malformed
+  tags. Before touching deployment state it verifies that
+  `ghcr.io/<owner>/<repo>:<image_tag>` actually exists in public GHCR.
+  Deployment happens locally in `/opt/m261sim`: it writes
+  `M261SIM_IMAGE=ghcr.io/...:<image_tag>` into `.env`, runs `docker
+  compose pull`, then `docker compose up -d --remove-orphans`, and calls
+  the repository's `simulator/cmd/deploy-probe` checker.
+
+  That probe must pass all of the following before the deploy is accepted:
+  the existing Docker Compose container healthcheck, `GET
+  http://127.0.0.1:8081/api/v1/health/ready` returns `200` with
+  `{"status":"ready"}`, a real read-only Modbus TCP FC04 request to
+  `127.0.0.1:502` (unit 34, address 2, count 2) returns a valid
+  non-exception response, and a real IEC-104 session to `127.0.0.1:2404`
+  completes `STARTDT_ACT`/`STARTDT_CON` plus a `C_IC_NA_1` general
+  interrogation with valid activation, data, and termination frames. A
+  successful deploy then updates `/opt/m261sim/.deploy-state` with the
+  deployed image reference as the new previous known-good state. On any
+  verification failure, the workflow restores the image recorded in
+  `.deploy-state`, reruns Compose, rechecks with the same full probe, and
+  still fails the workflow even if rollback succeeds.
 
 ### Required repository settings
 
-- **GitHub Environments** named exactly `staging` and `production`
-  (Settings → Environments → New environment) — `deploy.yml` targets
-  these by name. Creating them is what makes environment-scoped secrets
-  and (optionally) required reviewers available; this repository's
-  workflow files don't and can't create Environments themselves. On each
-  one:
-  - Add secrets `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY` (the
-    private key matching a `authorized_keys` entry on the host for
-    `DEPLOY_USER`), and `DEPLOY_PATH` (an absolute path on the host
-    containing a `docker-compose.yml` derived from this repository's own
-    — with the `image:`/`M261SIM_IMAGE` pair from this change — and
-    already reachable over SSH).
-  - Set that environment's **Deployment branches and tags** rule (in the
-    same environment settings page) to whatever this project considers
-    safe to deploy from — e.g. tags matching `v*` for `production`. This
-    is the actual guardrail against deploying an arbitrary branch commit;
-    `deploy.yml` itself only checks that the requested image tag was
-    genuinely published, not which ref triggered the run.
-  - A required-reviewers rule on `production` (same page) gets you a
-    manual approval gate before the job runs, for free.
-- **GHCR package visibility**: the first `release.yml` run creates the
-  `ghcr.io/<owner>/<repo>` package, defaulting to the parent repository's
-  own visibility. If it ends up private and the deploy target needs to
-  pull it without the workaround `deploy.yml` already does for its own
-  pre-flight check, run `docker login ghcr.io` on the host once with a
-  token that has `read:packages`.
+- **GitHub Environment** named exactly `dev` (Settings → Environments →
+  New environment) — `deploy.yml` targets it by name. Creating it is what
+  makes environment-scoped rules and optional required reviewers
+  available; the workflow file itself cannot create Environments. Any
+  repository writer may manually run the deploy workflow against `dev`.
+- **Self-hosted runner** installed on the Docker Compose server itself,
+  with labels exactly `self-hosted`, `linux`, and `m261-dev`.
+- **Deployment directory** `/opt/m261sim` already present on that host,
+  containing this project's `docker-compose.yml` (or an equivalent using
+  the same `M261SIM_IMAGE` variable).
+- **GHCR package visibility**: `ghcr.io/<owner>/<repo>` is public, so the
+  deployment host can pull images without deployment credentials or a
+  private-package workaround.
 - **Dependency Graph** must be enabled (Settings → Code security → Dependency graph) for `dependency-review.yml` to have anything to diff — on by default for a public repository like this one.
 
 ### Manual deploy
 
 ```sh
-gh workflow run deploy.yml -f environment=staging -f image_tag=1.2.3
+gh workflow run deploy.yml -f image_tag=sha-0451d99c00000000000000000000000000000000
 ```
 
-CD needs a real, reachable target host reachable over SSH with Docker and
-Compose already installed and this project's `docker-compose.yml` (or an
-equivalent using the same `M261SIM_IMAGE` variable) already in place at
-`DEPLOY_PATH` — provisioning that host itself is outside this repository's
-scope; no Kubernetes, cloud-provider, or Terraform/Helm tooling is assumed
-or included here.
+Or, for a stable release tag already published by `release.yml`:
+
+```sh
+gh workflow run deploy.yml -f image_tag=1.2.3
+```
+
+CD assumes the self-hosted runner is already on the Docker Compose host,
+with Docker and Compose installed and `/opt/m261sim` already provisioned.
+Provisioning that host itself is outside this repository's scope; no
+Kubernetes, cloud-provider, Terraform, or Helm bootstrap automation is
+included here.
+
+### Private register-map CI note
+
+`ci.yml` intentionally does **not** implement any secret-based retrieval
+of the private `m261-registermap` input. The generate/validate gate stays
+opt-in behind `HAS_REGISTERMAP == true`, and the secret name plus encoding
+contract for any future CI provisioning step still needs to be defined
+separately before that can be automated safely.
